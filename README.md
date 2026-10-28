@@ -22,6 +22,24 @@ The project is under active development. Compatibility and performance vary betw
 - Hardware-accelerated graphics.
 - Sound and volume settings.
 
+## Screenshots
+
+<!-- screenshots:start -->
+
+| Racing · D-Pad controls | Assassin's Creed II 3D | Action · D-Pad controls |
+| :---: | :---: | :---: |
+| [<img src="Screenshots/Screenshot_20261023_173814.jpg" height="360" alt="BREW racing gameplay in Brew2Droid with D-Pad controls">](Screenshots/Screenshot_20261023_173814.jpg) | [<img src="Screenshots/Screenshot_20261023_183119.jpg" height="360" alt="Assassin's Creed II 3D in Brew2Droid with the cellphone keypad">](Screenshots/Screenshot_20261023_183119.jpg) | [<img src="Screenshots/Screenshot_20261023_183646.jpg" height="360" alt="BREW action gameplay in Brew2Droid with D-Pad controls">](Screenshots/Screenshot_20261023_183646.jpg) |
+
+| Touchscreen racing | Hunting · NumPad controls |
+| :---: | :---: |
+| [<img src="Screenshots/Screenshot_20261023_185648.jpg" height="360" alt="BREW racing gameplay in Brew2Droid using the game's touchscreen controls">](Screenshots/Screenshot_20261023_185648.jpg) | [<img src="Screenshots/Screenshot_20261023_190452.jpg" height="360" alt="BREW hunting gameplay in Brew2Droid with NumPad controls">](Screenshots/Screenshot_20261023_190452.jpg) |
+
+| Tekken · Zeebo controls | Crash Bandicoot · Zeebo controls |
+| :---: | :---: |
+| [<img src="Screenshots/Screenshot_20261028_230943.jpg" width="390" alt="Tekken gameplay in Brew2Droid with Zeebo controls in landscape">](Screenshots/Screenshot_20261028_230943.jpg) | [<img src="Screenshots/Screenshot_20261028_231341.jpg" width="390" alt="Crash Bandicoot kart racing in Brew2Droid with Zeebo controls in landscape">](Screenshots/Screenshot_20261028_231341.jpg) |
+
+<!-- screenshots:end -->
+
 ## Requirements
 
 - Android 8.0 or newer.
