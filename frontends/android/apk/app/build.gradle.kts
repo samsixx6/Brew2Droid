@@ -8,12 +8,13 @@ android {
     compileSdk { version = release(37) }
 
     defaultConfig {
-        applicationId = "io.github.brew.handset"
+        // O ID de instalação é independente do namespace usado pelas classes e pelo JNI.
+        applicationId = "com.samsixx.brew2droid"
         // O AAudio, que é a saída de som do `cpal` no Android, chega no 26.
         minSdk = 26
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0-dev1"
+        versionCode = 2
+        versionName = "1.0"
         testInstrumentationRunner = "io.github.brew.handset.NativeUiTests"
         ndk {
             abiFilters += "arm64-v8a"

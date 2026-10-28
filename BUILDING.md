@@ -61,6 +61,8 @@ The commands mirror the tested native build flags and packaging steps. The suppl
 
 `tools/build_android.ps1 -Configuration Release` builds optimized native code and a debug-signed APK. It uses `tools/environment.ps1`, an isolated `.tools` installation and a `Q:` alias to avoid paths with spaces. A fresh clone needs those tools installed; they are deliberately excluded from Git. The lockfile lists the exact tool versions. Do not replace an existing `Q:` mapping for another project. This script is retained as the exact build procedure used by the maintainer, rather than a one-click SDK installer.
 
+The installed Android application ID is `com.samsixx.brew2droid`. Its Java namespace and JNI class names remain `io.github.brew.handset`; keeping those internal names preserves the native bridge. Android uses `applicationId` for the installed package identity.
+
 ## Tests
 
 With a C/C++ host compiler, CMake and Ninja available:

@@ -18,7 +18,7 @@
     "gradle": "9.6.0",
     "gradle_distribution_sha256": "bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01",
     "jdk_major": 17,
-    "application_id": "io.github.brew.handset"
+    "application_id": "com.samsixx.brew2droid"
   },
   "dynarmic": {
     "crate_version": "0.1.3",

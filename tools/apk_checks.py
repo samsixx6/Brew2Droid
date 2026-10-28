@@ -47,7 +47,7 @@ def inspect_apk(path, badging):
     min_sdk = sdk(r"minSdkVersion:'(\d+)'")
     if compile_sdk != 37 or target_sdk != 37 or min_sdk != 26:
         raise ValueError("APK SDK contract requires compile/target 37 and minimum 26")
-    if "name='io.github.brew.handset'" not in badging:
+    if "name='com.samsixx.brew2droid'" not in badging:
         raise ValueError("Unexpected Android application ID")
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()

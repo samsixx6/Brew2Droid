@@ -21,8 +21,8 @@ The prepared local repository tracks `https://github.com/samsixx6/Brew2Droid` on
 ## 3. Add the APK as a development release
 
 1. Open **Releases** on your repository page and choose **Draft a new release**.
-2. Create the tag `v0.1.0-dev1` on `main`.
-3. Use `Brew2Droid 0.1.0-dev1 — Development Preview` as the title. Copy the supplied release notes into the description.
+2. Create the tag `v1.0` on `main`.
+3. Use `Brew2Droid 1.0 — Development Preview` as the title. Copy the supplied release notes into the description.
 4. Attach the prepared APK and checksum file. You may also attach the prepared source ZIP; GitHub additionally creates source archives from the tagged commit.
 5. Select **This is a pre-release**, because this build is an early development APK with a debug-signed wrapper.
 6. Review the files, then choose **Publish release**. Use the save-draft option if you want to finish later.

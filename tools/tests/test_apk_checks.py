@@ -10,7 +10,7 @@ SPEC = importlib.util.spec_from_file_location("apk_checks", Path(__file__).paren
 checks = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checks)
 
-BADGING = """package: name='io.github.brew.handset' compileSdkVersion='37'
+BADGING = """package: name='com.samsixx.brew2droid' compileSdkVersion='37'
 minSdkVersion:'26'
 targetSdkVersion:'37'
 native-code: 'arm64-v8a'
@@ -50,6 +50,10 @@ class ApkChecks(unittest.TestCase):
         result = self.inspect()
         self.assertEqual(result["native_libraries"], ["lib/arm64-v8a/libzeebx_android.so"])
         self.assertEqual(result["target_sdk"], 37)
+
+    def test_rejects_previous_application_id(self):
+        with self.assertRaisesRegex(ValueError, "application ID"):
+            self.inspect(badging=BADGING.replace("com.samsixx.brew2droid", "io.github.brew.handset"))
 
     def test_rejects_4k_library_in_modern_apk(self):
         with self.assertRaisesRegex(ValueError, "16 KB"):

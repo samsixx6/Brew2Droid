@@ -14,6 +14,12 @@ public final class SettingsActivity extends NativeUi {
     static final int FOLDER=10,BANK=11;
     LinearLayout body;boolean closeAfterWrites,rebuildAfterWrites;
     @Override public void onCreate(Bundle saved){super.onCreate(saved);load(this::build);}
+    // O núcleo tem sua própria versão; o APK define a versão mostrada pelo aplicativo.
+    String appVersion(){
+        try{String version=getPackageManager().getPackageInfo(getPackageName(),0).versionName;if(version!=null&&!version.isEmpty())return version;}
+        catch(android.content.pm.PackageManager.NameNotFoundException ignored){}
+        return data.optString("version");
+    }
     Object value(String path){String[] parts=path.split("\\.");JSONObject at=settings;for(int i=0;i<parts.length-1;i++){at=at.optJSONObject(parts[i]);if(at==null)return null;}return at.opt(parts[parts.length-1]);}
     boolean checked(String path){return path.equals("controles_na_tela.modo")?!"nunca".equals(value(path)):Boolean.TRUE.equals(value(path));}
     void edit(String path,Object value,boolean rebuild){try{rebuildAfterWrites|=rebuild;JSONObject patch=new JSONObject(),at=patch;String[] parts=path.split("\\.");for(int i=0;i<parts.length-1;i++){JSONObject child=new JSONObject();at.put(parts[i],child);at=child;}at.put(parts[parts.length-1],path.equals("controles_na_tela.modo")?(Boolean.TRUE.equals(value)?"automatico":"nunca"):value==null?JSONObject.NULL:value);
@@ -59,7 +65,7 @@ public final class SettingsActivity extends NativeUi {
         if(!bank.isEmpty())row(body,tr("audio.soundfont.clear"),null,()->edit("audio.soundfont",null,true));
         toggle("audio.midi_effects",tr("audio.midi_effects"),tr("handset.audio.midi_effects.hint"),true,false);
         section(body,tr("native.performance"));toggle("debug.fps_counter",tr("debug.fps_counter"),null,true,false);
-        section(body,tr("settings.tab.about"));hint(body,"Brew2Droid\n"+tr("about.version").replace("{version}",data.optString("version")));
+        section(body,tr("settings.tab.about"));hint(body,"Brew2Droid\n"+tr("about.version").replace("{version}",appVersion()));
         row(body,tr("about.discord"),null,()->startActivity(new Intent(Intent.ACTION_VIEW,android.net.Uri.parse("https://discord.gg/Bv8znZ626"))));
         final int y=scrollY;scroll.post(()->scroll.scrollTo(0,y));
     }

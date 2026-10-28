@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'environment.ps1')
 Initialize-BrewEnvironment
 $brewAdb = "$env:ANDROID_HOME\platform-tools\adb.exe"
-$brewPackage = 'io.github.brew.handset'
+$brewPackage = 'com.samsixx.brew2droid'
 $brewBundle = Join-Path $env:BREW_PROJECT_ROOT ('local-tests\imports\' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'))
 & $PythonExecutable -B (Join-Path $PSScriptRoot 'handset_fixtures.py') --source $Source --destination $brewBundle
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the private fixtures.' }

@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'environment.ps1')
 Initialize-BrewEnvironment
 $brewAdb = "$env:ANDROID_HOME\platform-tools\adb.exe"
-$brewPackage = 'io.github.brew.handset'
+$brewPackage = 'com.samsixx.brew2droid'
 $brewDeviceState = & $brewAdb -s $Serial get-state
 if ($LASTEXITCODE -ne 0 -or $brewDeviceState -ne 'device') { throw 'The selected device is not authorized.' }
 $brewApk = (Resolve-Path -LiteralPath $ApkPath).Path

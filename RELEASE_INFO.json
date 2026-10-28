@@ -1,10 +1,10 @@
 {
-  "snapshot_date": "2026-10-28",
-  "android_version_name": "0.1.0-dev1",
-  "android_version_code": 1,
-  "suggested_tag": "v0.1.0-dev1",
-  "apk_sha256": "6435370a0419a4dd55b2c2eeb2d2dc164e7606cf24de1bacb992a9d8fa63456e",
-  "apk_bytes": 18337511,
+  "snapshot_date": "2026-10-29",
+  "android_version_name": "1.0",
+  "android_version_code": 2,
+  "suggested_tag": "v1.0",
+  "apk_sha256": "d72d06c8e2667088d3f587d7bb08ef24896e8596ce2fe81b13ff0441ed22c44d",
+  "apk_bytes": 18337523,
   "apk_type": "optimized ARM64 native code; debug-signed development wrapper",
   "host_tests": {
     "passed": 1179,
@@ -42,5 +42,29 @@
     "instrumentation_build": "success",
     "native_libraries_unchanged": true,
     "phone_visual_verification": false
+  },
+  "apk_filename": "Brew2Droid-1.0-arm64.apk",
+  "version_build_validation": {
+    "date": "2026-10-29",
+    "optimized_native_build": "success",
+    "android_packaging": "success",
+    "apk_version_verified": true,
+    "signature_verified": true,
+    "signing_identity_unchanged": true,
+    "alignment_16k_verified": true,
+    "runtime_assets_and_native_libraries_unchanged": true,
+    "phone_runtime_tested": false
+  },
+  "application_id": "com.samsixx.brew2droid",
+  "package_identity_validation": {
+    "date": "2026-10-29",
+    "application_id": "com.samsixx.brew2droid",
+    "version_name": "1.0",
+    "version_code": 2,
+    "launcher_class_verified": true,
+    "instrumentation_target_verified": true,
+    "native_bindings_unchanged": true,
+    "packaging_tool_tests_passed": 21,
+    "phone_runtime_tested": false
   }
 }
