@@ -1,0 +1,5 @@
+# Os hashes dos patches devem sobreviver a checkouts no Windows e no Linux.
+third-party/dynarmic/** text=auto eol=lf
+# A procedência inclui hashes das fontes e suas linhas finais vazias originais.
+third-party/qcelp/** text=auto eol=lf whitespace=-blank-at-eof
+frontends/android/apk/gradlew text eol=lf

@@ -1,0 +1,3 @@
+[submodule "dynarmic"]
+	path = dynarmic
+	url = https://github.com/exverge-0/dynarmic

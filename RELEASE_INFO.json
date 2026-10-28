@@ -1,0 +1,46 @@
+{
+  "snapshot_date": "2026-10-28",
+  "android_version_name": "0.1.0-dev1",
+  "android_version_code": 1,
+  "suggested_tag": "v0.1.0-dev1",
+  "apk_sha256": "6435370a0419a4dd55b2c2eeb2d2dc164e7606cf24de1bacb992a9d8fa63456e",
+  "apk_bytes": 18337511,
+  "apk_type": "optimized ARM64 native code; debug-signed development wrapper",
+  "host_tests": {
+    "passed": 1179,
+    "failed": 0,
+    "ignored": 5
+  },
+  "s25_raging_thunder_2_measured_fps": 30.29412894371405,
+  "fallback_covers_included": false,
+  "source_workspace_packages": [
+    "zeebx",
+    "zeebx-android",
+    "brew-probe"
+  ],
+  "source_export_tests": {
+    "passed": 1179,
+    "failed": 0,
+    "ignored": 5,
+    "test_programs": 63,
+    "verification_profile_overrides": {
+      "lto": "off",
+      "codegen_units": 16
+    }
+  },
+  "host_tests_date": "2026-10-27",
+  "source_export_tests_date": "2026-10-27",
+  "android_editor_validation": {
+    "date": "2026-10-28",
+    "java_contract_suites": [
+      "ButtonLayoutModelTest",
+      "ButtonLayoutPresetTest",
+      "ButtonLayoutResetTest",
+      "ButtonLayoutRevertTest"
+    ],
+    "apk_build": "success",
+    "instrumentation_build": "success",
+    "native_libraries_unchanged": true,
+    "phone_visual_verification": false
+  }
+}

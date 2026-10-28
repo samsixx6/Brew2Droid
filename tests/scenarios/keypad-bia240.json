@@ -1,0 +1,62 @@
+[
+  {
+    "step": 1250,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 1251,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 1700,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 1701,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 2100,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 2101,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 2400,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 2401,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 2800,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 2801,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 3100,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 3101,
+    "key": "select",
+    "down": false
+  }
+]

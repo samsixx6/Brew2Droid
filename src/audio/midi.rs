@@ -1,0 +1,1505 @@
+//! MIDI: a música dos ports de arcade, sintetizada aqui.
+//!
+//! Onze jogos entregam a trilha como MIDI — Double Dragon, Bad Dudes, Caveman Ninja, Dark Seal,
+//! Heavy Barrel, Karnov's Revenge, Magical Drop 3, Spin Master, Street Hoop, Super BurgerTime e
+//! Wizard Fire. Cada um traz **um** `.wav`, que é o efeito, e a música chega pelo `IMedia` como
+//! `audio/mid`.
+//!
+//! **MIDI não é som, é partitura.** Não há amostra dentro do arquivo: há "toque a nota 69 no
+//! instrumento 25 com força 100". Quem transformava isso em som era o sintetizador do firmware do
+//! console, com o banco de instrumentos dele — e esse banco não está na partição que temos. Então
+//! o que este módulo faz é uma **aproximação declarada**: lê a partitura certa e a toca com
+//! timbres nossos.
+//!
+//! Dizer isso na cara importa mais que o de costume, porque aqui o erro é silencioso: uma música
+//! sintetizada errado *toca*, e soa como se fosse assim mesmo. Por isso o que este módulo cobra
+//! de si é o que dá para verificar sem ouvir — **a nota certa, na hora certa, pelo tempo certo**:
+//!
+//! - a partitura é lida do jeito que a especificação manda, inclusive o status corrente;
+//! - a conversão de pulso para segundo honra a divisão do cabeçalho e as mudanças de tempo;
+//! - a nota 69 sai em 440 Hz, medido por correlação — e não por parecer certo.
+//!
+//! O timbre é o que **não** dá para verificar assim, e é justamente a parte que é palpite. Fica
+//! registrado como hipótese em uso no relatório.
+
+/// Taxa em que a música é sintetizada.
+///
+/// 22.050 Hz é a taxa das próprias trilhas dos jogos e metade da placa: o misturador reamostra
+/// de qualquer jeito, e sintetizar em 44.100 dobraria o custo e a memória para agudo que não
+/// existe na partitura.
+///
+/// É a **mesma** taxa para a tabela de timbres e para o banco de amostras: o misturador reamostra
+/// para a taxa da placa de qualquer forma, e manter as duas no mesmo número faz a comparação entre
+/// elas ser de timbre, e não de taxa.
+pub const RATE: u32 = 22_050;
+
+/// Teto de duração sintetizada, em segundos.
+///
+/// Uma trilha de jogo tem um ou dois minutos e repete — quem repete é o misturador, pelo
+/// `MM_PARM_PLAY_REPEAT`. O teto existe para um arquivo estragado, cujo último evento pode cair
+/// a horas de distância, não virar um pedido de gigabytes de memória.
+pub(super) const MAX_SEGUNDOS: f64 = 300.0;
+
+/// Quantas notas podem soar ao mesmo tempo.
+///
+/// Passar disso não é música, é arquivo estragado ou nota que nunca foi solta. O corte evita que
+/// um `Note On` sem `Note Off` empilhe voz até o fim da síntese.
+const MAX_VOZES: usize = 48;
+
+/// O canal da percussão no General MIDI. É o décimo, contado de zero.
+const CANAL_PERCUSSAO: u8 = 9;
+
+/// Microssegundos por batida antes de qualquer `Set Tempo`: 120 batidas por minuto, o padrão da
+/// especificação.
+const TEMPO_PADRAO: u32 = 500_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evento {
+    Toca {
+        canal: u8,
+        nota: u8,
+        forca: u8,
+    },
+    Solta {
+        canal: u8,
+        nota: u8,
+    },
+    Programa {
+        canal: u8,
+        programa: u8,
+    },
+    /// Volume (7) do canal, e expressão (11), que é um segundo fator sobre ele. O resto do
+    /// `Control Change` é ignorado.
+    Volume {
+        canal: u8,
+        valor: u8,
+    },
+    Expressao {
+        canal: u8,
+        valor: u8,
+    },
+    /// Todas as notas do canal soltas de uma vez — `All Notes Off` e `All Sound Off`.
+    SoltaTudo {
+        canal: u8,
+    },
+    Tempo {
+        us_por_batida: u32,
+    },
+}
+
+/// A partitura lida, em pulsos.
+#[derive(Debug, Clone)]
+struct Partitura {
+    /// O campo `division` do cabeçalho, como está: positivo é pulso por batida, negativo é SMPTE.
+    divisao: i16,
+    /// Os eventos de todas as trilhas, juntos e em ordem de pulso.
+    eventos: Vec<(u64, Evento)>,
+}
+
+/// Lê um número de tamanho variável: sete bits por byte, o bit alto dizendo que continua.
+fn varlen(bytes: &[u8], pos: &mut usize) -> Option<u32> {
+    let mut valor = 0u32;
+    // Quatro bytes é o máximo que a especificação permite, e o limite impede que lixo com o bit
+    // alto sempre ligado leve a leitura até o fim do arquivo.
+    for _ in 0..4 {
+        let byte = *bytes.get(*pos)?;
+        *pos += 1;
+        valor = (valor << 7) | u32::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            return Some(valor);
+        }
+    }
+    None
+}
+
+/// Lê uma trilha `MTrk` inteira, devolvendo os eventos com o pulso absoluto de cada um.
+///
+/// **O status corrente é obrigatório, não otimização.** Um arquivo real omite o byte de status
+/// quando ele repete o anterior, e uma trilha de notas seguidas é quase toda assim: ignorar isso
+/// não perde um evento, perde a trilha inteira a partir do primeiro.
+fn le_trilha(bytes: &[u8]) -> Vec<(u64, Evento)> {
+    let mut eventos = Vec::new();
+    let mut pos = 0usize;
+    let mut pulso = 0u64;
+    let mut status = 0u8;
+    while pos < bytes.len() {
+        let Some(delta) = varlen(bytes, &mut pos) else {
+            break;
+        };
+        pulso += u64::from(delta);
+        let Some(&primeiro) = bytes.get(pos) else {
+            break;
+        };
+        // Byte de dados no lugar do status: vale o status anterior, e o byte é o primeiro dado.
+        if primeiro & 0x80 != 0 {
+            status = primeiro;
+            pos += 1;
+        }
+        let canal = status & 0x0f;
+        let dado = |pos: &mut usize| -> Option<u8> {
+            let byte = *bytes.get(*pos)?;
+            *pos += 1;
+            Some(byte & 0x7f)
+        };
+        match status & 0xf0 {
+            // `Note On` com força zero **é** um `Note Off`, e é assim que a maioria dos
+            // sequenciadores solta nota. Tratar como toque deixaria a nota presa para sempre.
+            0x90 => {
+                let (Some(nota), Some(forca)) = (dado(&mut pos), dado(&mut pos)) else {
+                    break;
+                };
+                eventos.push((
+                    pulso,
+                    match forca {
+                        0 => Evento::Solta { canal, nota },
+                        forca => Evento::Toca { canal, nota, forca },
+                    },
+                ));
+            }
+            0x80 => {
+                let (Some(nota), Some(_)) = (dado(&mut pos), dado(&mut pos)) else {
+                    break;
+                };
+                eventos.push((pulso, Evento::Solta { canal, nota }));
+            }
+            0xb0 => {
+                let (Some(controle), Some(valor)) = (dado(&mut pos), dado(&mut pos)) else {
+                    break;
+                };
+                match controle {
+                    // Volume e expressão **multiplicam**, não se sobrescrevem: tratar os dois
+                    // como a mesma coisa faz um `crescendo` de expressão apagar o volume do
+                    // canal, e o instrumento volta com o dobro do que devia.
+                    7 => eventos.push((pulso, Evento::Volume { canal, valor })),
+                    11 => eventos.push((pulso, Evento::Expressao { canal, valor })),
+                    120 | 123 => eventos.push((pulso, Evento::SoltaTudo { canal })),
+                    _ => {}
+                }
+            }
+            0xc0 => match dado(&mut pos) {
+                Some(programa) => eventos.push((pulso, Evento::Programa { canal, programa })),
+                None => break,
+            },
+            // Pressão de canal: um byte. Pressão de nota, afinação e controle: dois.
+            0xd0 => {
+                if dado(&mut pos).is_none() {
+                    break;
+                }
+            }
+            0xa0 | 0xe0 => {
+                if dado(&mut pos).is_none() || dado(&mut pos).is_none() {
+                    break;
+                }
+            }
+            0xf0 => match status {
+                // Meta evento: tipo, tamanho, dados.
+                0xff => {
+                    let Some(&tipo) = bytes.get(pos) else { break };
+                    pos += 1;
+                    let Some(tamanho) = varlen(bytes, &mut pos) else {
+                        break;
+                    };
+                    let fim = pos + tamanho as usize;
+                    if tipo == 0x51
+                        && tamanho == 3
+                        && let Some(t) = bytes.get(pos..pos + 3)
+                    {
+                        let us = u32::from_be_bytes([0, t[0], t[1], t[2]]);
+                        if us > 0 {
+                            eventos.push((pulso, Evento::Tempo { us_por_batida: us }));
+                        }
+                    }
+                    // Fim de trilha (0x2f) e o resto dos metas: pular pelo tamanho declarado.
+                    if tipo == 0x2f {
+                        break;
+                    }
+                    pos = fim;
+                }
+                // SysEx, com tamanho declarado. O status corrente **não** vale depois dele.
+                0xf0 | 0xf7 => {
+                    let Some(tamanho) = varlen(bytes, &mut pos) else {
+                        break;
+                    };
+                    pos += tamanho as usize;
+                    status = 0;
+                }
+                _ => break,
+            },
+            // Status que não existe: sem saber o tamanho, não há como pular com segurança.
+            _ => break,
+        }
+    }
+    eventos
+}
+
+/// Lê um Standard MIDI File. `None` quando não é um.
+fn le(data: &[u8]) -> Option<Partitura> {
+    if data.get(..4)? != b"MThd" {
+        return None;
+    }
+    let cabecalho = u32::from_be_bytes(data.get(4..8)?.try_into().ok()?) as usize;
+    let corpo = data.get(8..8 + cabecalho.max(6))?;
+    let formato = u16::from_be_bytes(corpo.get(..2)?.try_into().ok()?);
+    let divisao = i16::from_be_bytes(corpo.get(4..6)?.try_into().ok()?);
+    // Formato 2 é uma coleção de padrões independentes, não uma música; tocar as trilhas dele
+    // juntas daria uma sobreposição que ninguém compôs.
+    if formato > 1 || divisao == 0 {
+        return None;
+    }
+
+    // **O número de trilhas é o que o cabeçalho declara, e a leitura para nele.** Sem isto, dois
+    // SMF colados no mesmo buffer viram uma música só: medido, um membro extraído de um `.ggz`
+    // mal recortado rendeu 168 s de música onde o jogo toca 47,5 s, porque os `MTrk` do arquivo
+    // seguinte entravam como se fossem trilhas deste. O jogo entrega um SMF por `Play`, então o
+    // defeito não aparece em jogo — mas apareceria em qualquer arquivo com duas músicas
+    // concatenadas, e a duração errada é o sintoma que menos se nota.
+    let trilhas = u16::from_be_bytes(corpo.get(2..4)?.try_into().ok()?) as usize;
+    let mut eventos = Vec::new();
+    let mut pos = 8 + cabecalho;
+    let mut lidas = 0usize;
+    while pos + 8 <= data.len() && lidas < trilhas.max(1) {
+        let tamanho = u32::from_be_bytes(data[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let corpo = data.get(pos + 8..(pos + 8 + tamanho).min(data.len()))?;
+        // Um bloco que não é `MTrk` é pulado pelo tamanho: a especificação manda ignorar bloco
+        // desconhecido, e há arquivo com bloco de autoria antes das trilhas.
+        if &data[pos..pos + 4] == b"MTrk" {
+            eventos.extend(le_trilha(corpo));
+            lidas += 1;
+        }
+        pos += 8 + tamanho;
+    }
+    if eventos.is_empty() {
+        return None;
+    }
+    // Ordem estável por pulso: eventos no mesmo pulso mantêm a ordem em que apareceram, que é o
+    // que faz um `Programa` antes do `Toca` no mesmo instante continuar valendo para ele.
+    eventos.sort_by_key(|(pulso, _)| *pulso);
+    Some(Partitura { divisao, eventos })
+}
+
+impl Partitura {
+    /// Os eventos com o instante em segundos, aplicando a divisão e as mudanças de tempo.
+    ///
+    /// A conta não pode ser feita uma vez para todo o arquivo: o `Set Tempo` muda o tamanho do
+    /// pulso no meio da música, e um `accelerando` recalculado do zero colocaria tudo o que vem
+    /// depois no lugar errado. Então o instante é acumulado trecho a trecho.
+    fn no_tempo(&self) -> Vec<(f64, Evento)> {
+        let smpte = self.divisao < 0;
+        // SMPTE: o byte alto é quadros por segundo (com 29 significando 29,97) e o baixo é
+        // pulsos por quadro. Aqui o tempo não depende de batida, e o `Set Tempo` não vale.
+        let por_pulso_smpte = match smpte {
+            false => 0.0,
+            true => {
+                // O byte alto é o número de quadros **em complemento de dois** — 0xe7 é -25 —, e
+                // não o campo inteiro negado: negar os dezesseis bits juntos dá 24 onde deveria
+                // dar 25, e a música toca 4% fora do tempo.
+                let bits = self.divisao as u16;
+                let quadros = match -((bits >> 8) as u8 as i8) as i32 {
+                    // 29 quadros quer dizer 29,97: é o vídeo NTSC, e a especificação diz isso.
+                    29 => 29.97,
+                    outros => f64::from(outros),
+                };
+                let subquadros = f64::from(bits & 0xff);
+                1.0 / (quadros.max(1.0) * subquadros.max(1.0))
+            }
+        };
+        let por_batida = f64::from(self.divisao.max(1) as u32);
+        let mut us_por_batida = f64::from(TEMPO_PADRAO);
+        let mut segundos = 0.0;
+        let mut ultimo = 0u64;
+        let mut saida = Vec::with_capacity(self.eventos.len());
+        for &(pulso, evento) in &self.eventos {
+            let passo = (pulso - ultimo) as f64;
+            segundos += match smpte {
+                true => passo * por_pulso_smpte,
+                false => passo * us_por_batida / 1_000_000.0 / por_batida,
+            };
+            ultimo = pulso;
+            if let Evento::Tempo { us_por_batida: us } = evento {
+                us_por_batida = f64::from(us);
+                continue;
+            }
+            saida.push((segundos, evento));
+        }
+        saida
+    }
+}
+
+/// A forma de onda de uma voz.
+///
+/// As formas de "todos os harmônicos" são **parametrizadas pelo expoente da queda** — `1/k^e` —
+/// em vez de serem casos fixos. A razão é medida: com quatro formas fixas (dente = `1/k`, e os
+/// outros três degraus) os alvos do soundfont caíam **entre** elas, e o erro de centroide ficava
+/// em 1379 Hz para guitarra, 1706 Hz para cordas, 1926 Hz para metais e 2195 Hz para distorção —
+/// quatro instrumentos que passavam a ter o mesmo timbre. Com o expoente contínuo, cada família
+/// recebe o ponto que a medição pediu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Forma {
+    Senoide,
+    /// Só harmônicos ímpares, caindo com `1/k`.
+    Quadrada,
+    /// **Todos** os harmônicos, caindo com `1/k^expoente`.
+    ///
+    /// O expoente grande é o que dá o harmônico par forte que nenhuma das formas de ímpares tem —
+    /// e é justamente isso que o baixo do Double Dragon precisava: a amostra real tem H2/H1 = 1,1,
+    /// e o triângulo que estava lá dava **zero**.
+    Parcial {
+        expoente: f32,
+    },
+    /// Percussão: ruído com decaimento, sem altura definida.
+    Ruido,
+}
+
+impl Forma {
+    /// A amostra da forma na fase `fase` (uma volta é 1,0).
+    ///
+    /// As formas de harmônicos são **somadas**, e não geradas pela forma crua. Uma quadrada crua a
+    /// 22 kHz **rebate**: os harmônicos acima da metade da taxa voltam como frequências que não
+    /// existem na partitura, e o resultado é uma nota acompanhada de um assobio que sobe quando
+    /// ela desce.
+    fn amostra(self, fase: f32, harmonicos: u32, ruido: &mut u32) -> f32 {
+        use std::f32::consts::TAU;
+        match self {
+            Self::Senoide => (fase * TAU).sin(),
+            Self::Quadrada => {
+                let mut soma = 0.0;
+                let mut k = 1;
+                while k <= harmonicos.min(9) {
+                    soma += (fase * TAU * k as f32).sin() / k as f32;
+                    k += 2;
+                }
+                soma * 4.0 / std::f32::consts::PI
+            }
+            Self::Parcial { expoente } => {
+                // O teto é o de Nyquist, e não um número fixo: com `1/k^e` pequeno o bastante os
+                // harmônicos altos **são** o timbre, e cortá-los em 24 deixava o lead de dente de
+                // serra em 2823 Hz quando a amostra real mede 3497 Hz. Nos expoentes grandes os
+                // harmônicos altos já não pesam, então o custo extra só aparece onde ele é o som.
+                let mut soma = 0.0;
+                for k in 1..=harmonicos.min(48) {
+                    soma += (fase * TAU * k as f32).sin() / (k as f32).powf(expoente);
+                }
+                soma
+            }
+            Self::Ruido => {
+                // Congruência linear: barato, determinístico e suficiente para percussão. Ruído
+                // que muda de execução para execução faria o teste do misturador tremer.
+                *ruido = ruido.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (*ruido >> 8) as f32 / 8_388_608.0 - 1.0
+            }
+        }
+    }
+}
+
+/// Uma volta da série harmônica `1/k^expoente`, pré-calculada.
+///
+/// **Existe por medição, não por elegância.** Somar `sin()` por harmônico **em cada amostra** custa
+/// caro: medido em `--release`, uma música de 47,5 s levava **6,25 s** para ser sintetizada — e
+/// essa conta acontece dentro do despacho de API, na chamada `Play` do jogo, então cada música que
+/// começa travava o jogo por seis segundos nesta máquina. O aparelho é bem mais lento.
+///
+/// O truque é o clássico da síntese aditiva: uma volta de seno é calculada **uma vez**, e cada
+/// harmônico é lido dessa mesma volta a `k` vezes a velocidade. Assim cada harmônico custa uma
+/// leitura, e não um `sin()`.
+struct Tabela {
+    amostras: Vec<f32>,
+}
+
+/// Tamanho da volta pré-calculada, em amostras.
+///
+/// Precisa acomodar o harmônico mais alto: com 48 harmônicos, 1024 pontos dão 21 amostras por
+/// ciclo do mais agudo, o que com interpolação linear reproduz a onda sem degrau audível.
+const PONTOS_DA_TABELA: usize = 1024;
+
+impl Tabela {
+    /// Monta a volta de `1/k^expoente` com `harmonicos` termos, com o pico em 1.
+    ///
+    /// Normalizar aqui **substitui** a normalização por nota: o pico da série depende do expoente,
+    /// e uma tabela por expoente já resolve isso sem varrer fases a cada nota.
+    fn nova(expoente: f32, harmonicos: u32) -> Self {
+        use std::f32::consts::TAU;
+        let pontos = PONTOS_DA_TABELA;
+        let base: Vec<f32> = (0..pontos)
+            .map(|i| (TAU * i as f32 / pontos as f32).sin())
+            .collect();
+        let mut soma = vec![0.0f32; pontos];
+        for k in 1..=harmonicos.clamp(1, 48) {
+            let peso = 1.0 / (k as f32).powf(expoente);
+            for (i, valor) in soma.iter_mut().enumerate() {
+                *valor += base[(i * k as usize) % pontos] * peso;
+            }
+        }
+        let maior = soma.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        if maior > 0.0 {
+            for valor in &mut soma {
+                *valor /= maior;
+            }
+        }
+        Self { amostras: soma }
+    }
+
+    /// A amostra na fase `fase` (uma volta é 1,0), interpolada entre os dois pontos vizinhos.
+    ///
+    /// A interpolação não é enfeite: sem ela, uma nota aguda lida a 1024 pontos por volta chia,
+    /// que é o mesmo defeito que a soma por harmônicos evitava.
+    fn amostra(&self, fase: f32) -> f32 {
+        let pontos = self.amostras.len();
+        let x = fase * pontos as f32;
+        let i = x as usize % pontos;
+        let fracao = x - x.floor();
+        let a = self.amostras[i];
+        let b = self.amostras[(i + 1) % pontos];
+        a + (b - a) * fracao
+    }
+}
+
+/// Como um instrumento soa: forma, envoltória e ganho.
+#[derive(Debug, Clone, Copy)]
+struct Timbre {
+    forma: Forma,
+    ataque: f32,
+    decaimento: f32,
+    sustentacao: f32,
+    liberacao: f32,
+    ganho: f32,
+}
+
+/// O timbre de um programa do General MIDI.
+///
+/// **Isto continua sendo aproximação**, e por falta de dado, não por preguiça: o banco de
+/// instrumentos do console está no firmware que ainda não lemos. Mas a aproximação era **por
+/// família de oito**, e isso custava caro de um jeito medido: 29 (guitarra *overdrive*), 30
+/// (distorcida), 42 (violoncelo) e 48 (cordas) saíam com a **mesma onda**, e o 81 (*lead* de dente
+/// de serra) saía quadrado. No Double Dragon essas três primeiras famílias são 23,2% das notas.
+///
+/// Agora cada programa que a partitura usa é atendido em separado quando ele difere do vizinho, e
+/// as famílias ficam para o resto. O alvo da correção é o que a comparação com o soundfont mediu,
+/// não o gosto:
+///
+/// | programa | medido no soundfont | o que a tabela fazia |
+/// |---|---|---|
+/// | 0 piano | H2/H1 = 0,59, decai até 0,49 em 1,2 s | triângulo (H2 = 0) e parava em 0,29 |
+/// | 33 baixo | H2/H1 = 1,10, decai até 0,42 em 1,2 s | H2 = 0 e **plano** em 0,65 |
+/// | 29 guitarra | H2/H1 = 0,82, sustenta em 0,75 | decaía para 0,36 e travava |
+/// | 30 distorcida | H2/H1 = 4,58, centroide 2195 Hz | idêntica à 29 |
+/// | 48 cordas | H2/H1 = 8,37, centroide 1706 Hz | idêntica à 29 |
+/// | 42 violoncelo | H2/H1 = 0,69, sobe e sustenta | idêntica à 29 |
+///
+/// Sustentação e decaimento têm de ser lidos junto com o tempo da nota: numa linha de baixo as
+/// notas são curtas, e um `sustentacao` alto vira um zumbido plano em vez de nota.
+fn timbre(programa: u8) -> Timbre {
+    let (forma, ataque, decaimento, sustentacao, liberacao, ganho) = match programa {
+        // Piano: todos os harmônicos, ataque seco e cauda longa. O decaimento longo, com
+        // sustentação baixa, é o que faz a nota **continuar caindo** em vez de travar.
+        0..=3 => (Forma::Parcial { expoente: 2.00 }, 0.002, 1.60, 0.22, 0.18, 0.9),
+        // Piano elétrico e cravo: mais brilhante e mais curto.
+        4..=7 => (Forma::Parcial { expoente: 1.70 }, 0.002, 0.90, 0.20, 0.15, 0.85),
+        // Percussão cromática (sino, marimba, xilofone): brilho com cauda média.
+        8..=15 => (Forma::Parcial { expoente: 1.00 }, 0.002, 0.80, 0.15, 0.14, 0.8),
+        // Órgão e acordeão: soam enquanto a tecla está apertada.
+        16..=20 => (Forma::Quadrada, 0.010, 0.05, 0.90, 0.08, 0.6),
+        // Órgão de palheta e gaita: quadrada com corpo em cima.
+        21..=23 => (Forma::Parcial { expoente: 1.20 }, 0.015, 0.08, 0.88, 0.09, 0.55),
+        // Violão de nylon e de aço: palheta, decai.
+        24 | 25 => (Forma::Parcial { expoente: 1.80 }, 0.004, 0.90, 0.20, 0.12, 0.75),
+        // Guitarra elétrica limpa e *jazz*: ataque macio, sustenta.
+        26..=28 => (Forma::Parcial { expoente: 1.50 }, 0.008, 0.35, 0.62, 0.14, 0.7),
+        // *Overdrive*: sustenta, e é 10,8% do Double Dragon.
+        29 => (Forma::Parcial { expoente: 1.45 }, 0.006, 0.30, 0.76, 0.16, 0.68),
+        // Distorcida e harmônicos: mais brilhante que a *overdrive* — medido no soundfont,
+        // H2/H1 = 4,6 e centroide de 2195 Hz contra 1379 Hz da 29. Era a **mesma onda**.
+        30..=31 => (Forma::Parcial { expoente: 1.10 }, 0.005, 0.30, 0.78, 0.16, 0.6),
+        // Baixo: harmônico par forte (a amostra real tem H2 acima da fundamental) e cauda longa.
+        32..=35 => (Forma::Parcial { expoente: 2.45 }, 0.005, 2.00, 0.30, 0.12, 1.0),
+        // Baixo *pick*, *slap* e sintetizado: mais curto e mais brilhante.
+        36..=39 => (Forma::Parcial { expoente: 1.80 }, 0.004, 0.80, 0.32, 0.10, 0.95),
+        // Violino, viola e violoncelo: arco, ataque médio, sustenta com ondulação.
+        40..=42 => (Forma::Parcial { expoente: 1.40 }, 0.090, 0.30, 0.80, 0.22, 0.7),
+        // Contrabasso dos conjuntos: mais grave e mais escuro.
+        43 => (Forma::Parcial { expoente: 2.20 }, 0.080, 0.40, 0.72, 0.22, 0.85),
+        // *Tremolo*, *pizzicato* e harpa: palhetados curtos.
+        44 | 45 | 46 => (Forma::Parcial { expoente: 1.60 }, 0.004, 0.60, 0.25, 0.14, 0.75),
+        // Tímpano: ruído com cauda, tratado como percussão sem altura definida.
+        47 => (Forma::Parcial { expoente: 1.20 }, 0.003, 0.70, 0.20, 0.20, 0.9),
+        // Naipe de cordas: a família mais brilhante do soundfont (H2/H1 = 8,4), ataque lento.
+        48..=55 => (Forma::Parcial { expoente: 1.30 }, 0.075, 0.35, 0.78, 0.28, 0.62),
+        // Metais: ricos, com ataque médio e boa sustentação.
+        56..=60 => (Forma::Parcial { expoente: 1.19 }, 0.035, 0.25, 0.78, 0.14, 0.62),
+        // Metais abafados e sintetizados: mais escuros.
+        61..=63 => (Forma::Parcial { expoente: 1.19 }, 0.030, 0.30, 0.75, 0.13, 0.62),
+        // Palheta (sax, clarinete): quadrada com corpo.
+        64..=71 => (Forma::Parcial { expoente: 1.50 }, 0.025, 0.25, 0.78, 0.12, 0.7),
+        // Flauta e sopro: quase senoide, ataque médio.
+        72..=79 => (Forma::Senoide, 0.035, 0.20, 0.82, 0.14, 0.8),
+        // *Lead*: 80 é quadrada e **81 é dente de serra** — era o defeito mais audível da tabela.
+        80 => (Forma::Quadrada, 0.006, 0.20, 0.78, 0.11, 0.6),
+        81 => (Forma::Parcial { expoente: 0.70 }, 0.006, 0.20, 0.78, 0.11, 0.55),
+        82 | 83 => (Forma::Parcial { expoente: 1.80 }, 0.010, 0.25, 0.75, 0.12, 0.7),
+        84..=87 => (Forma::Parcial { expoente: 1.40 }, 0.008, 0.25, 0.76, 0.12, 0.62),
+        // Pad e efeito: entrada e saída longas.
+        88..=95 => (Forma::Parcial { expoente: 1.20 }, 0.150, 0.40, 0.75, 0.40, 0.6),
+        96..=103 => (Forma::Parcial { expoente: 1.60 }, 0.100, 0.40, 0.70, 0.40, 0.6),
+        // Étnico: palhetado, como o violão.
+        104..=111 => (Forma::Parcial { expoente: 1.80 }, 0.006, 0.70, 0.25, 0.14, 0.75),
+        // Percussivo com altura (sino, tambor afinado): decai rápido.
+        112..=119 => (Forma::Parcial { expoente: 1.00 }, 0.002, 0.40, 0.10, 0.12, 0.7),
+        // Efeitos sonoros.
+        _ => (Forma::Parcial { expoente: 1.60 }, 0.005, 0.50, 0.30, 0.15, 0.7),
+    };
+    Timbre {
+        forma,
+        ataque,
+        decaimento,
+        sustentacao,
+        liberacao,
+        ganho,
+    }
+}
+
+/// O que fazer com o ruído da percussão: nada, cortar o agudo, ou cortar o grave.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Filtro {
+    Nenhum,
+    /// Passa-baixa na frequência dada. É o que faz bombo e surdo.
+    Baixa(f32),
+    /// Passa-alta na frequência dada. É o que faz chimbau e prato.
+    Alta(f32),
+}
+
+/// O timbre de uma nota da percussão, pelo número dela.
+///
+/// Não há altura: o que muda entre um bombo e um prato é quanto o ruído dura e **em que faixa
+/// ele mora**.
+///
+/// A faixa é o que estava errado antes, e o sintoma foi ouvido antes de ser explicado: no Double
+/// Dragon o chimbau desaparecia justamente nos trechos de baixo contínuo. A causa é
+/// **mascaramento**: chimbau e prato levavam passa-baixa, ficavam com o grave e sem o brilho, e
+/// passavam a morar na mesma faixa do baixo — dois sons na mesma faixa, e o mais forte come o
+/// mais fraco. Chimbau é agudo: o filtro dele é passa-**alta**, e aí ele senta acima do baixo e
+/// se ouve sem precisar de volume nenhum a mais.
+fn percussao(nota: u8) -> (Timbre, Filtro) {
+    let (decaimento, filtro, ganho) = match nota {
+        // Bombo e surdo: só o grave.
+        35 | 36 | 41 | 43 | 45 | 47 | 48 | 50 => (0.18, Filtro::Baixa(120.0), 1.0),
+        // Caixa e palmas: corpo no meio, com o estalo em cima. É o tambor mais forte da caixa,
+        // medido no soundfont (0,90 do pico, contra 0,32 do chimbau).
+        37..=40 => (0.14, Filtro::Alta(700.0), 0.9),
+        // Condução (ride) e pratos de ataque: longos e agudos, e **mais altos** que o chimbau —
+        // era o inverso, e o efeito medido era a condução sumir atrás do chimbau fechado.
+        49 | 51 | 52 | 53 | 55 | 57 | 59 => (0.45, Filtro::Alta(4_000.0), 0.75),
+        // Chimbau fechado e o resto: curtos, agudos e **fracos**. No soundfont ele é 0,32 do
+        // pico; aqui era 0,60, e é o que fazia a bateria soar "tss-tss" por cima de tudo.
+        _ => (0.07, Filtro::Alta(5_000.0), 0.35),
+    };
+    (
+        Timbre {
+            forma: Forma::Ruido,
+            ataque: 0.001,
+            decaimento,
+            sustentacao: 0.0,
+            liberacao: 0.02,
+            ganho,
+        },
+        filtro,
+    )
+}
+
+/// Uma nota soando, do `Note On` até a envoltória zerar.
+#[derive(Debug, Clone, Copy)]
+struct Voz {
+    canal: u8,
+    nota: u8,
+    /// Índice da onda pré-calculada desta voz, quando ela usa uma. Ver [`Tabela`].
+    ///
+    /// É índice, e não `Arc`, para a `Voz` continuar `Copy`: o laço de mixagem copia vozes ao
+    /// soltá-las, e trocar isso por posse espalharia mudança por todo o arquivo.
+    tabela: Option<usize>,
+    /// Amostra em que a nota começou e em que ela foi solta.
+    inicio: usize,
+    solta: Option<usize>,
+    frequencia: f32,
+    timbre: Timbre,
+    /// O filtro da percussão. Nota com altura não leva filtro.
+    filtro: Filtro,
+    amplitude: f32,
+}
+
+impl Voz {
+    /// A envoltória em `t` segundos desde o começo, com a nota solta em `solta` segundos.
+    fn envoltoria(&self, t: f32, solta: Option<f32>) -> f32 {
+        let Timbre {
+            ataque,
+            decaimento,
+            sustentacao,
+            liberacao,
+            ..
+        } = self.timbre;
+        if t < 0.0 {
+            return 0.0;
+        }
+        let mantida = match t < ataque {
+            true => t / ataque.max(1e-6),
+            false => {
+                let desde = t - ataque;
+                match desde < decaimento {
+                    true => 1.0 - (1.0 - sustentacao) * (desde / decaimento.max(1e-6)),
+                    false => sustentacao,
+                }
+            }
+        };
+        match solta {
+            Some(solta) if t > solta => {
+                let desde = t - solta;
+                match desde < liberacao {
+                    true => mantida * (1.0 - desde / liberacao.max(1e-6)),
+                    false => 0.0,
+                }
+            }
+            _ => mantida,
+        }
+    }
+
+    /// Quantas amostras esta voz ainda produz som depois de solta.
+    fn cauda(&self) -> usize {
+        (self.timbre.liberacao * RATE as f32) as usize + 1
+    }
+}
+
+/// Sintetiza um MIDI. `None` quando não é um MIDI legível.
+///
+/// Devolve o mesmo [`Sound`](crate::audio::wav::Sound) que o WAVE e o MP3 produzem — o misturador não
+/// precisa saber que aqui não havia som nenhum, só partitura.
+pub fn decode(data: &[u8]) -> Option<crate::audio::wav::Sound> {
+    let partitura = le(data)?;
+    let eventos = partitura.no_tempo();
+    let fim = eventos.last()?.0.min(MAX_SEGUNDOS);
+    // Meio segundo de sobra para a última nota terminar de soltar.
+    let total = ((fim + 0.5) * f64::from(RATE)) as usize + 1;
+    let mut samples = vec![0.0f32; total];
+
+    let mut programa = [0u8; 16];
+    let mut volume = [1.0f32; 16];
+    let mut expressao = [1.0f32; 16];
+    // As ondas pré-calculadas, uma por (expoente, número de harmônicos). Várias vozes
+    // compartilham a mesma: numa música de 1788 notas os pares distintos são algumas centenas, e
+    // cada tabela custa uma volta de seno mais uma leitura por harmônico.
+    let mut tabelas: Vec<Tabela> = Vec::new();
+    let mut indice_das_tabelas: std::collections::HashMap<(u32, u32), usize> =
+        std::collections::HashMap::new();
+    let mut soando: Vec<Voz> = Vec::new();
+    let mut mortas: Vec<Voz> = Vec::new();
+
+    let amostra_de = |segundos: f64| (segundos * f64::from(RATE)) as usize;
+    for &(segundos, evento) in &eventos {
+        if segundos > MAX_SEGUNDOS {
+            break;
+        }
+        let agora = amostra_de(segundos);
+        match evento {
+            Evento::Programa { canal, programa: p } => programa[canal as usize & 15] = p,
+            Evento::Volume { canal, valor } => {
+                volume[canal as usize & 15] = f32::from(valor) / 127.0
+            }
+            Evento::Expressao { canal, valor } => {
+                expressao[canal as usize & 15] = f32::from(valor) / 127.0
+            }
+            Evento::Tempo { .. } => {}
+            Evento::SoltaTudo { canal } => {
+                for voz in soando.iter_mut().filter(|v| v.canal == canal) {
+                    voz.solta.get_or_insert(agora);
+                }
+                mortas.extend(soando.iter().copied().filter(|v| v.canal == canal));
+                soando.retain(|v| v.canal != canal);
+            }
+            Evento::Solta { canal, nota } => {
+                // Só a nota mais antiga é solta, e não todas as iguais: a mesma nota tocada duas
+                // vezes antes de ser solta são duas vozes, e soltar as duas de uma vez corta a
+                // segunda antes da hora.
+                if let Some(i) = soando
+                    .iter()
+                    .position(|v| v.canal == canal && v.nota == nota)
+                {
+                    let mut voz = soando.remove(i);
+                    voz.solta = Some(agora);
+                    mortas.push(voz);
+                }
+            }
+            Evento::Toca { canal, nota, forca } => {
+                // Cheio: **solta a voz mais antiga** em vez de recusar a nova. Recusar parece
+                // inofensivo e é uma regra de prioridade disfarçada — e a pior possível: quem
+                // fica é a nota comprida que já está soando, quem perde é a nota curta que
+                // acabou de chegar. Numa música com baixo contínuo, isso engole exatamente a
+                // percussão, que é o que dá o ritmo.
+                if soando.len() >= MAX_VOZES {
+                    let mut voz = soando.remove(0);
+                    voz.solta = Some(agora);
+                    mortas.push(voz);
+                }
+                let canal_idx = canal as usize & 15;
+                let (timbre, filtro, frequencia, tabela) = match canal == CANAL_PERCUSSAO {
+                    true => {
+                        let (timbre, filtro) = percussao(nota);
+                        (timbre, filtro, 0.0, None)
+                    }
+                    false => {
+                        let timbre = timbre(programa[canal_idx]);
+                        // A afinação do MIDI: a nota 69 é o lá de 440 Hz, e cada semitom é a raiz
+                        // duodécima de dois.
+                        let frequencia = 440.0 * 2.0f32.powf((f32::from(nota) - 69.0) / 12.0);
+                        // Quantos harmônicos cabem abaixo de Nyquist nesta altura. É o mesmo
+                        // número que a síntese vai usar, e é o que a normalização precisa saber.
+                        let harmonicos = match frequencia > 0.0 {
+                            true => (RATE as f32 / 2.0 / frequencia) as u32,
+                            false => 1,
+                        };
+                        let mut indice = None;
+                        if let Forma::Parcial { expoente } = timbre.forma {
+                            let chave = (expoente.to_bits(), harmonicos.max(1));
+                            indice = match indice_das_tabelas.get(&chave) {
+                                Some(&i) => Some(i),
+                                None => {
+                                    let i = tabelas.len();
+                                    tabelas.push(Tabela::nova(expoente, harmonicos.max(1)));
+                                    indice_das_tabelas.insert(chave, i);
+                                    Some(i)
+                                }
+                            };
+                        }
+                        (timbre, Filtro::Nenhum, frequencia, indice)
+                    }
+                };
+                soando.push(Voz {
+                    canal,
+                    nota,
+                    tabela,
+                    inicio: agora,
+                    solta: None,
+                    frequencia,
+                    timbre,
+                    filtro,
+                    amplitude: f32::from(forca) / 127.0
+                        * volume[canal_idx]
+                        * expressao[canal_idx]
+                        * timbre.ganho,
+                });
+            }
+        }
+    }
+    // Nota que a música nunca soltou: solta no fim, para ela não ficar em sustentação eterna.
+    let fim_amostra = amostra_de(fim);
+    for mut voz in soando {
+        voz.solta = Some(fim_amostra);
+        mortas.push(voz);
+    }
+
+    for voz in &mortas {
+        toca_voz(voz, &mut samples, &tabelas);
+    }
+    // CC7=0 é silêncio válido. DMC usa esse MIDI de inicialização e repete Play no
+    // callback de erro se o decoder o recusa; duração e término continuam necessários.
+    aplica_ganho_fixo(&mut samples);
+    Some(crate::audio::wav::Sound {
+        rate: RATE,
+        channels: 1,
+        samples,
+    })
+}
+
+/// Soma uma voz no buffer, do começo dela até a envoltória zerar.
+fn toca_voz(voz: &Voz, samples: &mut [f32], tabelas: &[Tabela]) {
+    let taxa = RATE as f32;
+    let solta = voz
+        .solta
+        .map(|s| (s.saturating_sub(voz.inicio)) as f32 / taxa);
+    let fim = match voz.solta {
+        Some(s) => (s + voz.cauda()).min(samples.len()),
+        None => samples.len(),
+    };
+    // Quantos harmônicos cabem abaixo de Nyquist. Um a mais e a nota ganha um assobio que não
+    // está na partitura.
+    let harmonicos = match voz.frequencia > 0.0 {
+        true => (taxa / 2.0 / voz.frequencia) as u32,
+        false => 1,
+    };
+    let mut ruido = 0x1234_5678u32 ^ ((voz.nota as u32) << 16) ^ voz.inicio as u32;
+    // Filtro RC de um polo: `alpha = fc / (fc + fs/2π)`. O passa-alta usa **dois** em cascata,
+    // porque um só cai 6 dB por oitava e deixa grave demais passar — com um polo o chimbau ainda
+    // disputava a faixa do baixo, que é o defeito que se queria consertar.
+    let corte = match voz.filtro {
+        Filtro::Nenhum => 0.0,
+        Filtro::Baixa(hz) | Filtro::Alta(hz) => hz,
+    };
+    let alpha = match corte > 0.0 {
+        true => (corte / (corte + taxa / std::f32::consts::TAU)).clamp(0.01, 1.0),
+        false => 1.0,
+    };
+    let mut polo = [0.0f32; 2];
+    let mut fase = 0.0f32;
+    let passo = voz.frequencia / taxa;
+    let Some(trecho) = samples.get_mut(voz.inicio..fim) else {
+        return;
+    };
+
+    // Voz sem filtro entra direto no buffer. Voz filtrada é montada à parte e depois escalada,
+    // porque filtrar tira energia — um passa-baixa em 120 Hz devolve um vinte avos do ruído — e
+    // sem corrigir isso o número da tabela não quer dizer nada. Percussão é curta, então o
+    // buffer extra é pequeno.
+    let mut voz_filtrada = match voz.filtro {
+        Filtro::Nenhum => Vec::new(),
+        _ => Vec::with_capacity(trecho.len()),
+    };
+    for (i, destino) in trecho.iter_mut().enumerate() {
+        let t = i as f32 / taxa;
+        let envoltoria = voz.envoltoria(t, solta);
+        if envoltoria <= 0.0 && solta.is_some_and(|s| t > s) {
+            break;
+        }
+        let crua = match voz.tabela.and_then(|i| tabelas.get(i)) {
+            // Onda pré-calculada: uma leitura interpolada por amostra, em vez de uma soma de
+            // harmônicos. É o que tirou os seis segundos de travamento por música.
+            Some(tabela) => tabela.amostra(fase),
+            // As formas que não têm onda pré-calculada são as de poucos harmônicos (senoide,
+            // quadrada, ruído), e para elas somar por amostra é barato.
+            None => voz.timbre.forma.amostra(fase, harmonicos.max(1), &mut ruido),
+        };
+        fase = (fase + passo).fract();
+        polo[0] += alpha * (crua - polo[0]);
+        let valor = match voz.filtro {
+            Filtro::Nenhum => crua,
+            Filtro::Baixa(_) => polo[0],
+            // O que sobra depois de tirar o grave é o agudo, e o segundo polo tira o que sobrou
+            // dele: é o passa-alta complementar, montado do mesmo estado.
+            Filtro::Alta(_) => {
+                let primeiro = crua - polo[0];
+                polo[1] += alpha * (primeiro - polo[1]);
+                primeiro - polo[1]
+            }
+        };
+        match voz.filtro {
+            Filtro::Nenhum => *destino += valor * envoltoria * voz.amplitude,
+            _ => voz_filtrada.push(valor * envoltoria),
+        }
+    }
+    if voz_filtrada.is_empty() {
+        return;
+    }
+    // **Iguala energia, não pico.** Igualar pico foi a primeira tentativa e ela erra por um
+    // motivo que dá para ouvir: um estalo de ruído tem pico alto e energia baixa, enquanto um
+    // baixo sustentado tem os dois parecidos. Com o pico igualado, a percussão fica muitas
+    // vezes mais fraca que uma nota melódica de mesmo ganho — e num arranjo como o do Double
+    // Dragon, com nove canais soando, o chimbau simplesmente não se ouve.
+    //
+    // O alvo é a energia de uma nota melódica de mesma amplitude, que é cerca de 0,7 dela.
+    let energia = (voz_filtrada.iter().map(|s| f64::from(s * s)).sum::<f64>()
+        / voz_filtrada.len() as f64)
+        .sqrt() as f32;
+    if energia <= 0.0 {
+        return;
+    }
+    let fator = voz.amplitude * 0.7 / energia;
+    for (destino, valor) in trecho.iter_mut().zip(&voz_filtrada) {
+        *destino += valor * fator;
+    }
+}
+
+/// O ganho fixo da tabela de timbres, aplicado à soma crua das vozes.
+///
+/// A função que o aplica chamava-se `normaliza`, e o nome passou a mentir quando a política mudou:
+/// ela não normaliza mais nada. Agora é `aplica_ganho_fixo`, que é o que ela faz.
+///
+/// **É o número que a medição pediu, e substitui a normalização por pico.** A soma crua das vozes
+/// desta tabela sai bem acima de 1,0 — medido nas doze trilhas reais do Double Dragon, o pico
+/// bruto vai de 3,09 (o jingle curto) a 8,75 (a música mais densa). Escalar cada música pelo
+/// **próprio** pico, como se fazia antes, punha todas em 0,8 e com isso apagava exatamente essa
+/// diferença: o jingle de quatro segundos saía do misturador tão alto quanto a trilha de combate,
+/// e mais alto que ela em energia média (RMS 0,220 contra 0,158).
+///
+/// Com ganho fixo os picos passam a 0,28–0,79 e a diferença volta. O número é 0,09 porque é o que
+/// iguala a **energia média** dos dois caminhos: a 0,09 a tabela mede RMS médio 0,101 nas doze
+/// trilhas, e o banco de amostras mede 0,101 nas mesmas doze. Assim trocar o sintetizador no menu
+/// muda o timbre, e não o volume.
+const GANHO_TABELA: f32 = 0.09;
+
+/// O teto do pico depois da soma, igual ao do caminho do banco.
+const TETO: f32 = 0.95;
+
+/// Aplica o ganho fixo e, só se ainda assim passar do teto, desce o excesso.
+///
+/// **Ganho fixo, e não normalização — essa é a correção.** Normalizar iguala o pico de toda
+/// música e apaga a diferença de intensidade entre elas; aqui uma música baixa continua baixa.
+/// O limitador existe só para o caso extremo: o que passa de 1,0 **corta**, e corte é distorção no
+/// misturador — o defeito mais fácil de confundir com "o sintetizador é ruim". Quando ele atua,
+/// escala a música inteira, o que preserva a proporção entre as vozes dela.
+pub(crate) fn aplica_ganho_fixo(samples: &mut [f32]) {
+    for amostra in samples.iter_mut() {
+        *amostra *= GANHO_TABELA;
+    }
+    let pico = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+    if pico > TETO {
+        let fator = TETO / pico;
+        for amostra in samples.iter_mut() {
+            *amostra *= fator;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Monta um SMF de formato 0 com uma trilha só, para os testes não dependerem de arquivo.
+    fn smf(divisao: i16, trilha: &[u8]) -> Vec<u8> {
+        let mut out = b"MThd".to_vec();
+        out.extend(6u32.to_be_bytes());
+        out.extend(0u16.to_be_bytes()); // formato 0
+        out.extend(1u16.to_be_bytes()); // uma trilha
+        out.extend(divisao.to_be_bytes());
+        out.extend(b"MTrk");
+        out.extend((trilha.len() as u32).to_be_bytes());
+        out.extend(trilha);
+        out
+    }
+
+    /// Um delta de tempo em tamanho variável, como o arquivo o escreve.
+    ///
+    /// Escrever 250 num byte só é o erro que dá para cometer aqui: o bit alto ligado quer dizer
+    /// "continua", e o leitor engoliria o byte de status seguinte como parte do número.
+    fn delta(mut valor: u32) -> Vec<u8> {
+        let mut bytes = vec![(valor & 0x7f) as u8];
+        valor >>= 7;
+        while valor > 0 {
+            bytes.push((valor & 0x7f) as u8 | 0x80);
+            valor >>= 7;
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    /// Uma nota que começa no pulso zero e é solta em `duracao` pulsos.
+    fn uma_nota(nota: u8, duracao: u32) -> Vec<u8> {
+        let mut out = vec![0x00, 0x90, nota, 100];
+        out.extend(delta(duracao));
+        out.extend([0x80, nota, 0x40]);
+        out.extend([0x00, 0xff, 0x2f, 0x00]);
+        out
+    }
+
+    /// Uma nota longa num programa, para medir o comportamento do timbre.
+    fn nota_de(programa: u8, nota: u8, duracao: u32) -> Vec<u8> {
+        let mut trilha = vec![0x00, 0xc0, programa];
+        trilha.extend([0x00, 0x90, nota, 100]);
+        trilha.extend(delta(duracao));
+        trilha.extend([0x80, nota, 0x40]);
+        trilha.extend([0x00, 0xff, 0x2f, 0x00]);
+        smf(96, &trilha)
+    }
+
+    /// A energia de uma janela de 200 ms do som, pelo índice da janela.
+    fn energia_da_janela(som: &crate::audio::wav::Sound, janela: usize) -> f32 {
+        let amostras = &som.samples[janela * 4410..(janela + 1) * 4410];
+        (amostras.iter().map(|s| s * s).sum::<f32>() / amostras.len() as f32).sqrt()
+    }
+
+    /// A amplitude de um harmônico, em **quadratura**.
+    ///
+    /// A primeira versão disto correlacionava com um seno de fase fixa, e o resultado não dizia
+    /// nada: a fase do som não começa em zero na amostra escolhida, então a correlação podia cair
+    /// perto de zero para um harmônico que estava lá. Medido: a distorcida e a *overdrive* davam
+    /// 0,123 e 0,122 — indistinguíveis. Com seno **e** cosseno, a magnitude não depende de fase, e
+    /// é a mesma conta que a análise de fora do repositório faz por FFT.
+    fn harmonico(som: &crate::audio::wav::Sound, f0: f32, k: u32) -> f32 {
+        let trecho = &som.samples[4410..4410 * 3];
+        let taxa = RATE as f32;
+        let (mut re, mut im) = (0.0f32, 0.0f32);
+        for (i, amostra) in trecho.iter().enumerate() {
+            let angulo = (i as f32 / taxa) * f0 * k as f32 * std::f32::consts::TAU;
+            re += amostra * angulo.cos();
+            im += amostra * angulo.sin();
+        }
+        (re * re + im * im).sqrt() * 2.0 / trecho.len() as f32
+    }
+
+    /// A razão entre um harmônico e a fundamental.
+    fn harmonico_sobre_fundamental(som: &crate::audio::wav::Sound, f0: f32, k: u32) -> f32 {
+        let base = harmonico(som, f0, 1).max(1e-6);
+        harmonico(som, f0, k) / base
+    }
+
+    /// **A guitarra distorcida não pode ser a mesma onda da *overdrive*.**
+    ///
+    /// Era: as duas caíam na mesma faixa `24..=31` da tabela, com a mesma forma e a mesma
+    /// envoltória. Medido no Double Dragon, são 11,6% e 10,8% das notas — e soavam como um
+    /// instrumento só. O soundfont distingue as duas por 816 Hz de centroide e por um H2/H1 de
+    /// 4,58 contra 0,82.
+    #[test]
+    fn a_distorcida_nao_e_a_mesma_onda_da_overdrive() {
+        let overdrive = decode(&nota_de(29, 60, 192)).expect("overdrive");
+        let distorcida = decode(&nota_de(30, 60, 192)).expect("distorcida");
+        let a = harmonico_sobre_fundamental(&overdrive, 261.63, 2);
+        let b = harmonico_sobre_fundamental(&distorcida, 261.63, 2);
+        assert!(
+            b > a * 1.15,
+            "a distorcida tinha de ser mais rica em harmônicos que a overdrive: {b:.3} contra {a:.3}"
+        );
+    }
+
+    /// **O lead de dente de serra tem harmônicos pares; a quadrada não.**
+    ///
+    /// O programa 81 (Lead 1, *square*) é quadrado, e o 80 é o de dente de serra. A tabela dava
+    /// quadrada para os dois — medido no soundfont, o 81 tem H2/H1 = 1,02, e uma quadrada tem
+    /// **zero** de harmônico par. Era o defeito mais audível da tabela.
+    #[test]
+    fn o_lead_de_dente_de_serra_nao_e_quadrado() {
+        let quadrado = decode(&nota_de(80, 60, 192)).expect("80");
+        let serra = decode(&nota_de(81, 60, 192)).expect("81");
+        let h2_quadrado = harmonico_sobre_fundamental(&quadrado, 261.63, 2);
+        let h2_serra = harmonico_sobre_fundamental(&serra, 261.63, 2);
+        assert!(
+            h2_quadrado < 0.05,
+            "quadrada não tem harmônico par: {h2_quadrado:.3}"
+        );
+        assert!(
+            h2_serra > 0.3,
+            "o dente de serra tem harmônico par forte: {h2_serra:.3}"
+        );
+    }
+
+    /// **O baixo decai; não fica plano como um órgão.**
+    ///
+    /// Medido no soundfont: a nota de baixo cai para 0,42 da energia inicial em 1,2 s. A tabela
+    /// antiga tinha `sustentacao` de 0,55 com decaimento de 0,3 s e **travava** ali — o baixo
+    /// sustentava como órgão, e num jogo com baixo contínuo isso é o fundo inteiro errado.
+    #[test]
+    fn o_baixo_decai_em_vez_de_ficar_plano() {
+        let som = decode(&nota_de(33, 48, 384)).expect("baixo");
+        let segunda = energia_da_janela(&som, 1);
+        let ultima = energia_da_janela(&som, 4);
+        assert!(
+            ultima < segunda * 0.85,
+            "o baixo tinha de decair: janela 2 vale {segunda:.4} e a 5 vale {ultima:.4}"
+        );
+    }
+
+    /// **Duas músicas coladas não viram uma.** O cabeçalho declara quantas trilhas o arquivo tem,
+    /// e a leitura para ali: sem isso, os `MTrk` do arquivo seguinte entravam como trilhas deste.
+    ///
+    /// Medido num membro extraído de um `.ggz`: 168 s de música onde o jogo toca 47,5 s. O jogo
+    /// entrega um SMF por `Play`, então o defeito não aparece em jogo — mas um arquivo com duas
+    /// músicas concatenadas dava duração errada, que é o sintoma que menos se nota.
+    #[test]
+    fn duas_musicas_coladas_nao_viram_uma() {
+        let primeira = smf(96, &uma_nota(69, 96));
+        let segunda = smf(96, &uma_nota(60, 384));
+        let mut colado = primeira.clone();
+        colado.extend(segunda);
+        let sozinha = decode(&primeira).expect("uma música");
+        let junto = decode(&colado).expect("duas coladas");
+        assert_eq!(
+            junto.samples.len(),
+            sozinha.samples.len(),
+            "a segunda música não pode entrar na primeira"
+        );
+    }
+
+    #[test]
+    fn o_tamanho_variavel_vai_e_volta() {
+        for valor in [0, 1, 127, 128, 250, 8192, 0x0fff_ffff] {
+            let bytes = delta(valor);
+            let mut pos = 0;
+            assert_eq!(varlen(&bytes, &mut pos), Some(valor), "{valor}");
+            assert_eq!(pos, bytes.len());
+        }
+    }
+
+    #[test]
+    fn o_cabecalho_e_a_trilha_saem_com_pulso_e_evento() {
+        let partitura = le(&smf(96, &uma_nota(69, 96))).expect("é um SMF");
+        assert_eq!(partitura.divisao, 96);
+        assert_eq!(
+            partitura.eventos,
+            [
+                (
+                    0,
+                    Evento::Toca {
+                        canal: 0,
+                        nota: 69,
+                        forca: 100
+                    }
+                ),
+                (96, Evento::Solta { canal: 0, nota: 69 }),
+            ]
+        );
+    }
+
+    /// 96 pulsos por batida a 120 por minuto é meio segundo por batida.
+    #[test]
+    fn o_pulso_vira_segundo_pela_divisao_e_pelo_tempo() {
+        let partitura = le(&smf(96, &uma_nota(69, 96))).unwrap();
+        let eventos = partitura.no_tempo();
+        assert_eq!(eventos[0].0, 0.0);
+        assert!((eventos[1].0 - 0.5).abs() < 1e-9, "{:?}", eventos[1].0);
+    }
+
+    /// O `Set Tempo` no meio vale só do ponto dele para a frente.
+    ///
+    /// Recalcular a música inteira com o tempo novo é o erro fácil aqui, e ele coloca tudo o que
+    /// vem depois de um `accelerando` no lugar errado sem que nada pareça quebrado.
+    #[test]
+    fn a_mudanca_de_tempo_vale_a_partir_dela() {
+        // Uma batida a 120, depois o dobro de velocidade, depois outra batida.
+        let trilha = [
+            &[0x00u8, 0x90, 60, 100][..],
+            &[96, 0x80, 60, 0x40][..],
+            // Set Tempo = 250.000 us por batida, ou seja 240 por minuto.
+            &[0x00, 0xff, 0x51, 0x03, 0x03, 0xd0, 0x90][..],
+            &[0x00, 0x90, 62, 100][..],
+            &[96, 0x80, 62, 0x40][..],
+            &[0x00, 0xff, 0x2f, 0x00][..],
+        ]
+        .concat();
+        let eventos = le(&smf(96, &trilha)).unwrap().no_tempo();
+        let instantes: Vec<f64> = eventos.iter().map(|(t, _)| (t * 1000.0).round()).collect();
+        // 0 ms, 500 ms (uma batida a 120), e a segunda nota dura 250 ms.
+        assert_eq!(instantes, [0.0, 500.0, 500.0, 750.0]);
+    }
+
+    /// O status corrente: o segundo evento vem sem o byte de status.
+    #[test]
+    fn o_status_corrente_vale_para_o_evento_seguinte() {
+        let trilha = [
+            0x00, 0x90, 60, 100, // toca 60
+            0x10, 62, 100, // e aqui só os dados: é outro Note On
+            0x10, 60, 0, // força zero é soltar
+            0x00, 0xff, 0x2f, 0x00,
+        ];
+        let partitura = le(&smf(96, &trilha)).unwrap();
+        assert_eq!(
+            partitura.eventos,
+            [
+                (
+                    0,
+                    Evento::Toca {
+                        canal: 0,
+                        nota: 60,
+                        forca: 100
+                    }
+                ),
+                (
+                    16,
+                    Evento::Toca {
+                        canal: 0,
+                        nota: 62,
+                        forca: 100
+                    }
+                ),
+                (32, Evento::Solta { canal: 0, nota: 60 }),
+            ]
+        );
+    }
+
+    /// Meta evento e SysEx são pulados pelo tamanho declarado, sem perder o que vem depois.
+    #[test]
+    fn meta_e_sysex_nao_engolem_a_trilha() {
+        let trilha = [
+            0x00, 0xff, 0x03, 0x04, b'n', b'o', b'm', b'e', // nome da trilha
+            0x00, 0xf0, 0x03, 0x41, 0x42, 0xf7, // SysEx
+            0x00, 0x90, 69, 100, //
+            0x30, 0x80, 69, 0x40, //
+            0x00, 0xff, 0x2f, 0x00,
+        ];
+        let partitura = le(&smf(96, &trilha)).unwrap();
+        assert_eq!(partitura.eventos.len(), 2);
+        assert_eq!(
+            partitura.eventos[0].1,
+            Evento::Toca {
+                canal: 0,
+                nota: 69,
+                forca: 100
+            }
+        );
+    }
+
+    /// **A nota 69 sai em 440 Hz.**
+    ///
+    /// Medido por correlação com dois senos, o certo e o semitom vizinho: contar cruzamento de
+    /// zero depende da forma da onda, e correlação não. Errar a afinação é o defeito que mais
+    /// facilmente passa por "o sintetizador é assim" — a música toca inteira, no tom errado.
+    #[test]
+    fn a_nota_69_soa_em_440_hz() {
+        // Programa 64 é palheta, que na nossa tabela é senoide: forma simples para medir.
+        let trilha = [
+            0x00, 0xc0, 64, // programa
+            0x00, 0x90, 69, 127, //
+            96, 0x80, 69, 0x40, //
+            0x00, 0xff, 0x2f, 0x00,
+        ];
+        let som = decode(&smf(96, &trilha)).expect("uma nota é música o bastante");
+        assert_eq!((som.rate, som.channels), (RATE, 1));
+
+        let correlacao = |hz: f32| -> f32 {
+            // Do meio do sustentado, longe do ataque e da soltura.
+            let inicio = (0.1 * RATE as f32) as usize;
+            let n = (0.2 * RATE as f32) as usize;
+            let mut soma = 0.0;
+            for i in 0..n {
+                let t = i as f32 / RATE as f32;
+                soma += som.samples[inicio + i] * (t * hz * std::f32::consts::TAU).sin();
+            }
+            (soma / n as f32).abs()
+        };
+        let certo = correlacao(440.0);
+        // O limiar acompanha [`GANHO_TABELA`]: com ganho fixo uma nota sozinha não é mais
+        // esticada até o teto, então o que se cobra aqui é que ela **exista**, e a prova de que
+        // ela é a nota certa continua sendo a comparação com os semitons vizinhos, logo abaixo.
+        assert!(certo > 0.01, "nota quase muda: {certo}");
+        assert!(
+            certo > correlacao(466.16) * 3.0,
+            "440 Hz ({certo}) não se destacou do semitom vizinho ({})",
+            correlacao(466.16)
+        );
+        assert!(
+            certo > correlacao(415.30) * 3.0,
+            "440 Hz não se destacou do semitom de baixo"
+        );
+    }
+
+    /// Uma oitava acima dobra a frequência — é a conta que mais dói errar, porque afina a
+    /// música inteira meio tom torta sem nada parecer quebrado.
+    #[test]
+    fn cada_oitava_dobra_a_frequencia() {
+        let de = |nota: u8| 440.0 * 2.0f32.powf((f32::from(nota) - 69.0) / 12.0);
+        assert!((de(69) - 440.0).abs() < 0.01);
+        assert!((de(81) - 880.0).abs() < 0.01);
+        assert!((de(57) - 220.0).abs() < 0.01);
+        // Dó central, o valor tabelado.
+        assert!((de(60) - 261.63).abs() < 0.01, "{}", de(60));
+    }
+
+    /// Música baixa continua baixa: o ganho é fixo, e o limitador **não** sobe nada.
+    ///
+    /// É a prova do defeito que a política antiga tinha. Normalizando pelo pico, duas músicas de
+    /// intensidades diferentes saíam com o mesmo pico, e o jogo perdia a diferença entre elas —
+    /// medido nas trilhas reais do Double Dragon, o jingle curto saía com mais energia média que a
+    /// música de combate. Aqui a de força 40 tem de continuar mais baixa que a de força 127.
+    #[test]
+    fn o_ganho_e_fixo_e_nao_iguala_musicas_de_intensidades_diferentes() {
+        let musica = |forca: u8| {
+            let trilha = [
+                0x00, 0x90, 60, forca, //
+                96, 0x80, 60, 0x40, //
+                0x00, 0xff, 0x2f, 0x00,
+            ];
+            let som = decode(&smf(96, &trilha)).expect("é música");
+            som.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()))
+        };
+        let fraca = musica(40);
+        let forte = musica(127);
+        assert!(fraca < forte * 0.6, "fraca {fraca} não ficou abaixo da forte {forte}");
+        assert!(fraca > 0.0, "a fraca sumiu: {fraca}");
+        assert!(forte <= TETO, "a forte estourou: {forte}");
+    }
+
+    /// A percussão sai como ruído: som de verdade, e sem altura definida.
+    #[test]
+    fn a_percussao_soa_sem_altura() {
+        // Canal 9, nota 36: bombo.
+        let trilha = [
+            0x00, 0x99, 36, 127, //
+            96, 0x89, 36, 0x40, //
+            0x00, 0xff, 0x2f, 0x00,
+        ];
+        let som = decode(&smf(96, &trilha)).expect("percussão é música");
+        let pico = som.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        // O limiar acompanha [`GANHO_TABELA`]: desde que o ganho é fixo, e não normalização por
+        // pico, uma batida sozinha **não** sobe até o teto — ela vale o que vale.
+        assert!(pico > 0.03, "percussão quase muda: {pico}");
+    }
+
+    /// Nota sem `Note Off` não fica soando para sempre.
+    #[test]
+    fn nota_que_ninguem_solta_termina_no_fim_da_musica() {
+        let trilha = [
+            0x00, 0x90, 69, 100, // toca e nunca solta
+            96, 0x90, 71, 100, // outra nota, para haver fim
+            0x00, 0xff, 0x2f, 0x00,
+        ];
+        let som = decode(&smf(96, &trilha)).expect("é música");
+        // O fim é o último evento mais a sobra da soltura: um segundo e meio cobre tudo.
+        assert!(
+            som.frames() < (1.5 * RATE as f32) as usize,
+            "{}",
+            som.frames()
+        );
+        // E o rabo do arquivo é silêncio, não uma nota presa.
+        let ultimas = &som.samples[som.samples.len() - 100..];
+        assert!(ultimas.iter().all(|s| s.abs() < 1e-6));
+    }
+
+    /// O pico não passa do teto: acima de 1,0 o misturador cortaria, e corte soa como
+    /// sintetizador ruim sem ser.
+    ///
+    /// **O que se cobra aqui mudou junto com a política de ganho.** Antes o pico era *exatamente*
+    /// 0,8 porque cada música era normalizada pelo próprio pico; agora o ganho é fixo
+    /// ([`GANHO_TABELA`]) e o limitador só entra quando a soma ainda assim passa de [`TETO`].
+    /// Trinta notas na força máxima são justamente esse caso extremo.
+    #[test]
+    fn muitas_vozes_juntas_nao_estouram() {
+        let mut trilha = Vec::new();
+        for nota in 40..70 {
+            trilha.extend([0x00, 0x90, nota, 127]);
+        }
+        trilha.extend([96, 0xff, 0x2f, 0x00]);
+        let som = decode(&smf(96, &trilha)).expect("é música");
+        let pico = som.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        assert!(pico <= TETO, "estourou: {pico}");
+        assert!(pico > 0.1, "ficou quase mudo: {pico}");
+    }
+
+    /// Energia de uma faixa, por um passa-baixa de um polo — grave quando `alta` é falso, e o
+    /// que sobra dele quando é verdadeiro.
+    fn energia(samples: &[f32], hz: f32, alta: bool) -> f32 {
+        let alpha = hz / (hz + RATE as f32 / std::f32::consts::TAU);
+        let mut baixa = 0.0f32;
+        let mut soma = 0.0f64;
+        for &amostra in samples {
+            baixa += alpha * (amostra - baixa);
+            let faixa = match alta {
+                true => amostra - baixa,
+                false => baixa,
+            };
+            soma += f64::from(faixa * faixa);
+        }
+        (soma / samples.len().max(1) as f64).sqrt() as f32
+    }
+
+    fn percussao_sozinha(nota: u8) -> crate::audio::wav::Sound {
+        let mut trilha = vec![0x00, 0x99, nota, 127];
+        trilha.extend(delta(96));
+        trilha.extend([0x89, nota, 0x40, 0x00, 0xff, 0x2f, 0x00]);
+        decode(&smf(96, &trilha)).expect("percussão é música")
+    }
+
+    /// **O chimbau mora acima do baixo, e o bombo abaixo.**
+    ///
+    /// É o teste do defeito que se ouviu antes de entender: no Double Dragon o chimbau
+    /// desaparecia nos trechos de baixo contínuo. Não era volume, era faixa — chimbau e prato
+    /// levavam passa-baixa, ficavam sem brilho e passavam a disputar a mesma faixa do baixo. Dois
+    /// sons na mesma faixa e o mais forte come o mais fraco, que é mascaramento e não mixagem.
+    #[test]
+    fn o_chimbau_e_agudo_e_o_bombo_e_grave() {
+        let chimbau = percussao_sozinha(42);
+        let bombo = percussao_sozinha(36);
+        // No chimbau, o agudo tem de dominar o grave — e no bombo, o contrário.
+        let (agudo_ch, grave_ch) = (
+            energia(&chimbau.samples, 2_000.0, true),
+            energia(&chimbau.samples, 2_000.0, false),
+        );
+        let brilho_ch = agudo_ch / grave_ch;
+        let (agudo_bo, grave_bo) = (
+            energia(&bombo.samples, 2_000.0, true),
+            energia(&bombo.samples, 2_000.0, false),
+        );
+        let brilho_bo = agudo_bo / grave_bo;
+        // Medido: 2,6 no chimbau e 0,19 no bombo. O que o teste cobra é a separação, com folga —
+        // o divisor de faixa da medição é de um polo e vaza de propósito, para o número não
+        // depender de um filtro melhor que o do sintetizador.
+        assert!(brilho_ch > 2.0, "chimbau sem brilho: {brilho_ch}");
+        assert!(brilho_bo < 0.5, "bombo sem corpo: {brilho_bo}");
+        assert!(
+            brilho_ch > brilho_bo * 8.0,
+            "chimbau e bombo na mesma faixa: {brilho_ch} contra {brilho_bo}"
+        );
+    }
+
+    /// O baixo contínuo não abafa o chimbau: eles ocupam faixas diferentes.
+    ///
+    /// A conta é a que o ouvido faz: quanta energia de agudo existe enquanto o baixo soa. Se o
+    /// chimbau estivesse na faixa do baixo, esse número cairia para o do baixo sozinho.
+    #[test]
+    fn o_baixo_continuo_nao_come_o_chimbau() {
+        // Programa 33 é baixo elétrico. Nota 40 segurada, e um chimbau em cima.
+        let mut trilha = vec![
+            0x00, 0xc0, 33, // baixo no canal 0
+            0x00, 0x90, 40, 127, // e ele segura a nota
+            0x00, 0x99, 42, 100, // chimbau, no canal da percussão
+        ];
+        trilha.extend(delta(96));
+        trilha.extend([0x89, 42, 0x40]);
+        trilha.extend(delta(96));
+        trilha.extend([0x80, 40, 0x40, 0x00, 0xff, 0x2f, 0x00]);
+        let com_chimbau = decode(&smf(96, &trilha)).unwrap();
+
+        // O mesmo trecho, só o baixo.
+        let mut so_baixo = vec![0x00, 0xc0, 33, 0x00, 0x90, 40, 127];
+        so_baixo.extend(delta(192));
+        so_baixo.extend([0x80, 40, 0x40, 0x00, 0xff, 0x2f, 0x00]);
+        let sem_chimbau = decode(&smf(96, &so_baixo)).unwrap();
+
+        // Os primeiros 50 ms, onde o chimbau está soando.
+        let quanto = (0.05 * RATE as f32) as usize;
+        let agudo_com = energia(&com_chimbau.samples[..quanto], 3_000.0, true);
+        let agudo_sem = energia(&sem_chimbau.samples[..quanto], 3_000.0, true);
+        assert!(
+            agudo_com > agudo_sem * 4.0,
+            "o chimbau não apareceu por cima do baixo: {agudo_com} contra {agudo_sem}"
+        );
+    }
+
+    /// Passando do teto de vozes, quem sai é a mais antiga — não a que acabou de chegar.
+    ///
+    /// Descartar a nota nova é uma regra de prioridade disfarçada, e a pior: quem fica é a nota
+    /// comprida que já soa, quem perde é a curta que chegou. Numa música com baixo contínuo isso
+    /// engole a percussão, que é o que dá o ritmo.
+    #[test]
+    fn passando_do_teto_de_vozes_sai_a_mais_antiga() {
+        let mut trilha = Vec::new();
+        // Mais notas do que o teto, todas seguradas, no canal 0.
+        for i in 0..(MAX_VOZES + 8) {
+            trilha.extend([0x00, 0x90, 36 + i as u8, 100]);
+        }
+        // E um chimbau depois de tudo, que é a nota que não pode ser recusada.
+        trilha.extend(delta(96));
+        trilha.extend([0x99, 42, 127]);
+        trilha.extend(delta(96));
+        trilha.extend([0x89, 42, 0x40, 0x00, 0xff, 0x2f, 0x00]);
+        let som = decode(&smf(96, &trilha)).unwrap();
+        // No instante do chimbau (meio segundo) tem de haver agudo, que nenhuma das notas
+        // seguradas produz.
+        let inicio = (0.5 * RATE as f32) as usize;
+        let fim = (inicio + (0.05 * RATE as f32) as usize).min(som.samples.len());
+        let agudo = energia(&som.samples[inicio..fim], 3_000.0, true);
+        assert!(agudo > 0.01, "o chimbau foi recusado pelo teto: {agudo}");
+    }
+
+    #[test]
+    fn o_que_nao_e_midi_nao_decodifica() {
+        assert!(decode(b"RIFF\x00\x00\x00\x00WAVEfmt ").is_none());
+        assert!(decode(&[]).is_none());
+        assert!(decode(b"MThd").is_none());
+        // Formato 2 é coleção de padrões independentes, não uma música.
+        let mut dois = smf(96, &uma_nota(69, 96));
+        dois[9] = 2;
+        assert!(decode(&dois).is_none());
+        // Divisão zero não diz quanto dura um pulso.
+        assert!(decode(&smf(0, &uma_nota(69, 96))).is_none());
+    }
+
+    /// Trilha truncada no meio de um evento não entra em pânico nem inventa nota.
+    #[test]
+    fn arquivo_truncado_para_onde_da() {
+        let completo = smf(96, &uma_nota(69, 96));
+        for corte in 1..completo.len() {
+            let _ = decode(&completo[..corte]);
+        }
+    }
+
+    /// Divisão SMPTE: o tempo vem de quadros por segundo, e o `Set Tempo` não vale.
+    #[test]
+    fn a_divisao_smpte_conta_por_quadro() {
+        // 0xe7 é -25 em complemento de dois: 25 quadros por segundo, 40 pulsos por quadro,
+        // ou seja mil pulsos por segundo. É assim que o campo é escrito no arquivo.
+        let divisao = i16::from_be_bytes([0xe7, 40]);
+        let eventos = le(&smf(divisao, &uma_nota(69, 250))).unwrap().no_tempo();
+        assert!((eventos[1].0 - 0.25).abs() < 1e-6, "{:?}", eventos[1].0);
+    }
+}

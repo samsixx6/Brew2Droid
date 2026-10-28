@@ -1,0 +1,626 @@
+//! As imagens que vêm dentro dos jogos.
+//!
+//! Um `.mif` guarda o ícone do título já pronto para exibição, e cada console gravou o dele no
+//! formato que quis: os jogos mais novos usam PNG, os da primeira leva usam BMP paletado, e o
+//! Z-Wheel usa JPEG. Como os três aparecem nas ROMs reais, os três são lidos aqui.
+//!
+//! O BMP é decodificado à mão porque o que os `.mif` trazem é o subconjunto mais simples do
+//! formato — sem compressão, paleta de 16 ou 256 cores — e uma dependência inteira para isso
+//! custaria mais que as poucas dezenas de linhas abaixo.
+
+use std::fmt;
+
+/// Teto de área para uma imagem vinda de um jogo. Os ícones reais não passam de 65×42; o
+/// limite existe para um arquivo corrompido não pedir gigabytes ao anunciar um tamanho absurdo.
+const MAX_PIXELS: usize = 4096 * 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub width: usize,
+    pub height: usize,
+    /// RGBA não-premultiplicado, uma linha por vez, de cima para baixo.
+    pub rgba: Vec<u8>,
+}
+
+impl Image {
+    pub fn pixels(&self) -> usize {
+        self.width * self.height
+    }
+
+    /// Reduz a imagem até nenhum lado passar de `max_side`, por média de blocos.
+    ///
+    /// A média é feita com a cor **premultiplicada** pelo alfa e desfeita no fim. Sem isso, um
+    /// pixel transparente entra na conta com a cor que ele guarda — que costuma ser preta — e a
+    /// borda de um logo com fundo transparente fica com um halo escuro.
+    ///
+    /// O fator é inteiro: reduzir por 5 é somar blocos de 5×5, sem interpolação nem reamostragem
+    /// fracionária. Para um ícone é o suficiente, e evita um redimensionador inteiro.
+    pub fn downscaled(&self, max_side: usize) -> Image {
+        let longest = self.width.max(self.height);
+        if longest <= max_side || max_side == 0 {
+            return self.clone();
+        }
+        let factor = longest.div_ceil(max_side);
+        let (width, height) = (self.width.div_ceil(factor), self.height.div_ceil(factor));
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for block_y in 0..height {
+            for block_x in 0..width {
+                let (mut sum, mut alpha, mut count) = ([0u32; 3], 0u32, 0u32);
+                for y in block_y * factor..((block_y + 1) * factor).min(self.height) {
+                    for x in block_x * factor..((block_x + 1) * factor).min(self.width) {
+                        let at = (y * self.width + x) * 4;
+                        let a = self.rgba[at + 3] as u32;
+                        for (channel, total) in sum.iter_mut().enumerate() {
+                            *total += self.rgba[at + channel] as u32 * a;
+                        }
+                        alpha += a;
+                        count += 1;
+                    }
+                }
+                let count = count.max(1);
+                for channel in sum {
+                    rgba.push(match alpha {
+                        0 => 0,
+                        _ => (channel / alpha) as u8,
+                    });
+                }
+                rgba.push((alpha / count) as u8);
+            }
+        }
+        Image {
+            width,
+            height,
+            rgba,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ImageError {
+    /// O formato não é nenhum dos que sabemos ler.
+    Unknown,
+    /// O arquivo diz uma coisa e entrega outra.
+    Malformed(&'static str),
+    Png(png::DecodingError),
+    Jpeg(String),
+}
+
+impl fmt::Display for ImageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "formato de imagem desconhecido"),
+            Self::Malformed(what) => write!(f, "imagem inconsistente: {what}"),
+            Self::Png(err) => write!(f, "png ilegível: {err}"),
+            Self::Jpeg(err) => write!(f, "jpeg ilegível: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ImageError {}
+
+/// Decodifica pelo que o arquivo é, não pelo que ele diz ser.
+///
+/// A assinatura é mais confiável que o tipo anunciado no `.mif`: um deles chama o JPEG de
+/// `image/jpg`, e seguir o rótulo à risca deixaria o ícone de fora por causa de uma letra.
+pub fn decode(data: &[u8]) -> Result<Image, ImageError> {
+    match data {
+        [0x89, b'P', b'N', b'G', ..] => decode_png(data),
+        [b'B', b'M', ..] => decode_bmp(data),
+        [0xff, 0xd8, 0xff, ..] => decode_jpeg(data),
+        [b'G', b'I', b'F', b'8', ..] => decode_gif(data),
+        _ => Err(ImageError::Unknown),
+    }
+}
+
+/// A chave magenta de fundo pertence à apresentação do MIF, não ao BMP genérico.
+/// Só a região ligada à borda é removida: rosa dentro do desenho continua sendo arte.
+pub(crate) fn decode_mif(data: &[u8]) -> Result<Image, ImageError> {
+    let mut image = decode(data)?;
+    if !data.starts_with(b"BM") || image.width == 0 || image.height == 0 {
+        return Ok(image);
+    }
+    let mut pending = Vec::new();
+    let add = |index: usize, rgba: &mut [u8], pending: &mut Vec<usize>| {
+        let at = index * 4;
+        // JewelQuest guarda o mesmo fundo em entradas (255, 7..14, 255).
+        // A tolerância fica na região ligada à borda, sem apagar rosa interno.
+        if rgba[at] >= 248 && rgba[at + 1] <= 32 && rgba[at + 2] >= 248 && rgba[at + 3] == 255 {
+            rgba[at + 3] = 0;
+            pending.push(index);
+        }
+    };
+    let (width, height) = (image.width, image.height);
+    for x in 0..width {
+        add(x, &mut image.rgba, &mut pending);
+        add((height - 1) * width + x, &mut image.rgba, &mut pending);
+    }
+    for y in 0..height {
+        add(y * width, &mut image.rgba, &mut pending);
+        add(y * width + width - 1, &mut image.rgba, &mut pending);
+    }
+    while let Some(index) = pending.pop() {
+        let (x, y) = (index % width, index / width);
+        if x > 0 { add(index - 1, &mut image.rgba, &mut pending); }
+        if x + 1 < width { add(index + 1, &mut image.rgba, &mut pending); }
+        if y > 0 { add(index - width, &mut image.rgba, &mut pending); }
+        if y + 1 < height { add(index + width, &mut image.rgba, &mut pending); }
+    }
+    Ok(image)
+}
+
+fn decode_gif(data: &[u8]) -> Result<Image, ImageError> {
+    let gif = super::gif::primeiro_quadro(data).ok_or(ImageError::Malformed("gif inválido ou grande demais"))?;
+    let frame = gif.quadros.first().ok_or(ImageError::Malformed("gif sem quadro"))?;
+    Ok(Image { width: gif.largura as usize, height: gif.altura as usize,
+        rgba: frame.iter().flat_map(|pixel| pixel.iter().copied()).collect() })
+}
+
+pub fn decode_png(data: &[u8]) -> Result<Image, ImageError> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    // Os ícones dos jogos são quase todos paletados; sem esta expansão viria o índice da cor,
+    // e não a cor.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(ImageError::Png)?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or(ImageError::Malformed("tamanho impossível"))?;
+    let mut buffer = vec![0; size];
+    let info = reader.next_frame(&mut buffer).map_err(ImageError::Png)?;
+    let channels = info.color_type.samples();
+    let mut rgba = Vec::with_capacity(info.width as usize * info.height as usize * 4);
+    for pixel in buffer[..info.buffer_size()].chunks_exact(channels) {
+        let (rgb, alpha) = match channels {
+            1 => ([pixel[0]; 3], 255),
+            2 => ([pixel[0]; 3], pixel[1]),
+            3 => ([pixel[0], pixel[1], pixel[2]], 255),
+            _ => ([pixel[0], pixel[1], pixel[2]], pixel[3]),
+        };
+        rgba.extend_from_slice(&rgb);
+        rgba.push(alpha);
+    }
+    Ok(Image {
+        width: info.width as usize,
+        height: info.height as usize,
+        rgba,
+    })
+}
+
+fn decode_jpeg(data: &[u8]) -> Result<Image, ImageError> {
+    let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(data));
+    decoder
+        .decode_headers()
+        .map_err(|err| ImageError::Jpeg(err.to_string()))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| ImageError::Jpeg("sem cabeçalho".into()))?;
+    let pixels = decoder
+        .decode()
+        .map_err(|err| ImageError::Jpeg(err.to_string()))?;
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = match width * height {
+        0 => return Err(ImageError::Malformed("jpeg vazio")),
+        area => pixels.len() / area,
+    };
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for pixel in pixels.chunks_exact(channels.max(1)) {
+        match channels {
+            1 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255]),
+            _ => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),
+        }
+    }
+    Ok(Image {
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Um canal de pixel empacotado, esticado para oito bits.
+fn canal(pixel: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let valor = (pixel & mask) >> mask.trailing_zeros();
+    let maximo = mask >> mask.trailing_zeros();
+    (valor * 255 / maximo) as u8
+}
+
+/// Desempacota as linhas de um BMP `BI_RLE8` ou `BI_RLE4`, devolvendo um índice de paleta por
+/// pixel, na ordem em que o arquivo guarda as linhas.
+///
+/// O esquema é o do Windows: um par `(contagem, valor)` repete o valor; contagem zero abre uma
+/// fuga — `0` fim de linha, `1` fim da imagem, `2` um salto `(dx, dy)`, e de `3` para cima uma
+/// sequência literal, sempre terminada em fronteira de palavra. No `RLE4` cada valor traz dois
+/// pixels, o alto e o baixo, alternando.
+///
+/// O que a imagem não cobrir fica no índice zero, como o Windows faz.
+fn desempacota_rle(
+    data: &[u8],
+    inicio: usize,
+    width: usize,
+    height: usize,
+    depth: usize,
+) -> Result<Vec<u8>, ImageError> {
+    let mut indices = vec![0u8; width * height];
+    let (mut x, mut y) = (0usize, 0usize);
+    let mut at = inicio;
+    let escreve = |x: usize, y: usize, valor: u8, indices: &mut Vec<u8>| {
+        if x < width && y < height {
+            indices[y * width + x] = valor;
+        }
+    };
+    while at + 1 < data.len() {
+        let (contagem, valor) = (data[at] as usize, data[at + 1]);
+        at += 2;
+        if contagem > 0 {
+            for i in 0..contagem {
+                let pixel = match depth {
+                    4 if i % 2 == 1 => valor & 0x0f,
+                    4 => valor >> 4,
+                    _ => valor,
+                };
+                escreve(x + i, y, pixel, &mut indices);
+            }
+            x += contagem;
+            continue;
+        }
+        match valor {
+            // Fim de linha.
+            0 => {
+                x = 0;
+                y += 1;
+            }
+            // Fim da imagem.
+            1 => break,
+            // Salto relativo, em pixels.
+            2 => {
+                if at + 1 >= data.len() {
+                    break;
+                }
+                x += data[at] as usize;
+                y += data[at + 1] as usize;
+                at += 2;
+            }
+            // Sequência literal de `valor` pixels.
+            n => {
+                let n = n as usize;
+                let bytes = match depth {
+                    4 => n.div_ceil(2),
+                    _ => n,
+                };
+                if at + bytes > data.len() {
+                    break;
+                }
+                for i in 0..n {
+                    let bruto = match depth {
+                        4 => data[at + i / 2],
+                        _ => data[at + i],
+                    };
+                    let pixel = match depth {
+                        4 if i % 2 == 1 => bruto & 0x0f,
+                        4 => bruto >> 4,
+                        _ => bruto,
+                    };
+                    escreve(x + i, y, pixel, &mut indices);
+                }
+                x += n;
+                // A sequência é preenchida até uma fronteira de dois bytes.
+                at += bytes + bytes % 2;
+            }
+        }
+        if y >= height {
+            break;
+        }
+    }
+    Ok(indices)
+}
+
+/// Decodifica o BMP que os `.mif` e os jogos guardam.
+///
+/// Cobre 1, 4, 8, 16, 24 e 32 bits por pixel, e as duas compressões RLE de paleta — o Disney All
+/// Star Cards guarda a maioria das imagens dele em `BI_RLE8` e `BI_RLE4`. As máscaras do
+/// `BI_BITFIELDS` não são compressão, e entram: é como um BMP de 16 bits diz que é 5-6-5.
+fn decode_bmp(data: &[u8]) -> Result<Image, ImageError> {
+    let u16_at = |at: usize| -> u16 { u16::from_le_bytes([data[at], data[at + 1]]) };
+    let u32_at = |at: usize| -> u32 {
+        u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
+    };
+    if data.len() < 54 {
+        return Err(ImageError::Malformed("cabeçalho truncado"));
+    }
+    let data_offset = u32_at(10) as usize;
+    let header_size = u32_at(14) as usize;
+    let width = u32_at(18) as i32 as isize;
+    let raw_height = u32_at(22) as i32 as isize;
+    let depth = u16_at(28) as usize;
+    let compression = u32_at(30);
+    // Altura negativa significa que as linhas vêm de cima para baixo, ao contrário do usual.
+    let (height, top_down) = (raw_height.unsigned_abs(), raw_height < 0);
+    let width = match width > 0 {
+        true => width as usize,
+        false => return Err(ImageError::Malformed("largura inválida")),
+    };
+    // Sem máscaras declaradas, 16 bits é 5-5-5: as capas da Z-Wheel vêm assim, e os cinzas delas
+    // só saem neutros lidos desse jeito.
+    let masks = match (compression, depth) {
+        (0, _) => [0x7c00, 0x03e0, 0x001f],
+        (1, 8) | (2, 4) => [0, 0, 0],
+        (3, 16 | 32) if data.len() >= 66 => [u32_at(54), u32_at(58), u32_at(62)],
+        _ => return Err(ImageError::Malformed("bmp comprimido")),
+    };
+    let rle = matches!((compression, depth), (1, 8) | (2, 4));
+    if compression == 3 && depth == 32 {
+        return Err(ImageError::Malformed("bmp comprimido"));
+    }
+    if width * height > MAX_PIXELS {
+        return Err(ImageError::Malformed("imagem grande demais"));
+    }
+
+    // A paleta fica entre o cabeçalho e os pixels. Quando a contagem de cores vem zerada, ela
+    // ocupa tudo o que couber ali — que é como os `.mif` a gravam.
+    let palette_start = 14 + header_size;
+    let mut palette = Vec::new();
+    if depth <= 8 {
+        let declared = u32_at(46) as usize;
+        let available = data_offset.saturating_sub(palette_start) / 4;
+        let count = match declared {
+            0 => available,
+            n => n.min(available),
+        };
+        for i in 0..count {
+            let at = palette_start + i * 4;
+            if at + 3 >= data.len() {
+                break;
+            }
+            // O BMP guarda azul, verde e vermelho nesta ordem.
+            palette.push([data[at + 2], data[at + 1], data[at]]);
+        }
+    }
+
+    // Cada linha é preenchida até um múltiplo de quatro bytes.
+    let stride = (width * depth).div_ceil(8).div_ceil(4) * 4;
+    let comprimidos = match rle {
+        true => Some(desempacota_rle(data, data_offset, width, height, depth)?),
+        false => None,
+    };
+    if comprimidos.is_none() && data_offset + stride * height > data.len() {
+        return Err(ImageError::Malformed("pixels truncados"));
+    }
+    let color = |index: usize| -> [u8; 3] {
+        palette.get(index).copied().unwrap_or([255, 0, 255]) // Índice fora da paleta salta à vista em vez de sumir.
+    };
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let row = match top_down {
+            true => y,
+            false => height - 1 - y,
+        };
+        if let Some(indices) = &comprimidos {
+            for x in 0..width {
+                let rgb = color(indices[row * width + x] as usize);
+                rgba.extend_from_slice(&rgb);
+                rgba.push(255);
+            }
+            continue;
+        }
+        let line = &data[data_offset + row * stride..][..stride];
+        for x in 0..width {
+            let (rgb, alpha) = match depth {
+                1 => (color((line[x / 8] >> (7 - x % 8)) as usize & 1), 255),
+                4 => {
+                    let byte = line[x / 2];
+                    let index = match x % 2 {
+                        0 => byte >> 4,
+                        _ => byte & 0x0f,
+                    };
+                    (color(index as usize), 255)
+                }
+                8 => (color(line[x] as usize), 255),
+                16 => {
+                    let pixel = u32::from(u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]));
+                    (masks.map(|mask| canal(pixel, mask)), 255)
+                }
+                24 => ([line[x * 3 + 2], line[x * 3 + 1], line[x * 3]], 255),
+                32 => (
+                    [line[x * 4 + 2], line[x * 4 + 1], line[x * 4]],
+                    // Um BMP de 32 bits com o canal sempre zerado é opaco, não invisível.
+                    line[x * 4 + 3],
+                ),
+                _ => return Err(ImageError::Malformed("profundidade não suportada")),
+            };
+            rgba.extend_from_slice(&rgb);
+            rgba.push(alpha);
+        }
+    }
+    // A regra do canal zerado só pode ser aplicada depois de ver a imagem inteira.
+    if depth == 32 && rgba.iter().skip(3).step_by(4).all(|&a| a == 0) {
+        rgba.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
+    }
+    Ok(Image {
+        width,
+        height,
+        rgba,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Monta um BMP paletado de 4 bits, 2x2, com o cabeçalho que os `.mif` usam.
+    fn bmp4() -> Vec<u8> {
+        let palette: [[u8; 4]; 2] = [[0, 0, 255, 0], [0, 255, 0, 0]]; // BGRA: vermelho, verde.
+        let data_offset = 54 + palette.len() * 4;
+        let mut bmp = vec![0u8; data_offset];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[10..14].copy_from_slice(&(data_offset as u32).to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&2u32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&2u32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&4u16.to_le_bytes());
+        bmp[46..50].copy_from_slice(&(palette.len() as u32).to_le_bytes());
+        for (i, entry) in palette.iter().enumerate() {
+            bmp[54 + i * 4..54 + i * 4 + 4].copy_from_slice(entry);
+        }
+        // De baixo para cima: primeiro a linha de baixo (verde, vermelho).
+        bmp.extend_from_slice(&[0x10, 0, 0, 0]);
+        bmp.extend_from_slice(&[0x01, 0, 0, 0]);
+        bmp
+    }
+
+    /// Monta um BMP `BI_RLE8` de 4x2 com a paleta e os dados dados.
+    fn bmp_rle8(dados: &[u8]) -> Vec<u8> {
+        let palette: [[u8; 4]; 3] = [[0, 0, 0, 0], [0, 0, 255, 0], [0, 255, 0, 0]]; // preto, vermelho, verde.
+        let data_offset = 54 + palette.len() * 4;
+        let mut bmp = vec![0u8; data_offset];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[10..14].copy_from_slice(&(data_offset as u32).to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&4u32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&2u32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&8u16.to_le_bytes());
+        bmp[30..34].copy_from_slice(&1u32.to_le_bytes()); // BI_RLE8
+        bmp[46..50].copy_from_slice(&(palette.len() as u32).to_le_bytes());
+        for (i, entry) in palette.iter().enumerate() {
+            bmp[54 + i * 4..54 + i * 4 + 4].copy_from_slice(entry);
+        }
+        bmp.extend_from_slice(dados);
+        bmp
+    }
+
+    #[test]
+    fn o_bmp_comprimido_em_rle8_repete_e_copia() {
+        // Linha de baixo: quatro vermelhos. Linha de cima: dois verdes literais e o resto vazio,
+        // que fica no índice zero — é o que o Windows faz com o que a imagem não cobre.
+        let image = decode(&bmp_rle8(&[
+            4, 1, // quatro vezes o índice 1
+            0, 0, // fim de linha
+            0, 3, 2, 2, 2, 0, // três literais do índice 2, com o enchimento até a palavra
+            0, 1, // fim da imagem
+        ]))
+        .unwrap();
+        assert_eq!((image.width, image.height), (4, 2));
+        // O topo é a última linha guardada: verde, verde, verde, vazio.
+        assert_eq!(&image.rgba[0..4], &[0, 255, 0, 255]);
+        assert_eq!(&image.rgba[8..12], &[0, 255, 0, 255]);
+        assert_eq!(&image.rgba[12..16], &[0, 0, 0, 255], "o que não foi coberto fica no índice 0");
+        // A base é a primeira linha guardada: quatro vermelhos.
+        assert_eq!(&image.rgba[16..20], &[255, 0, 0, 255]);
+        assert_eq!(&image.rgba[28..32], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn o_bmp_paletado_vira_cores_na_ordem_certa() {
+        // O BMP guarda as linhas de baixo para cima e as cores em BGR: errar qualquer um dos
+        // dois dá uma imagem plausível e errada, que ninguém percebe olhando.
+        let image = decode(&bmp4()).unwrap();
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(&image.rgba[0..4], &[255, 0, 0, 255], "topo à esquerda");
+        assert_eq!(&image.rgba[4..8], &[0, 255, 0, 255], "topo à direita");
+        assert_eq!(&image.rgba[8..12], &[0, 255, 0, 255], "base à esquerda");
+        assert_eq!(&image.rgba[12..16], &[255, 0, 0, 255], "base à direita");
+    }
+
+    #[test]
+    fn a_reducao_respeita_o_lado_maior_e_nao_mexe_no_que_ja_cabe() {
+        let grande = Image {
+            width: 100,
+            height: 50,
+            rgba: vec![255; 100 * 50 * 4],
+        };
+        // Fator 10: 100 -> 10, e a altura acompanha.
+        let pequena = grande.downscaled(10);
+        assert_eq!((pequena.width, pequena.height), (10, 5));
+        // O que já cabe volta igual.
+        assert_eq!(pequena.downscaled(64), pequena);
+    }
+
+    #[test]
+    fn o_transparente_nao_escurece_a_borda_ao_reduzir() {
+        // Um bloco 2x2 com um pixel branco opaco e três transparentes pretos. Media ingênua
+        // daria cinza escuro; com a cor premultiplicada, a cor que sobra é a do único pixel que
+        // existe de verdade — e só o alfa cai.
+        let image = Image {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 255, 255, 255, // branco opaco
+                0, 0, 0, 0, //
+                0, 0, 0, 0, //
+                0, 0, 0, 0,
+            ],
+        };
+        let one = image.downscaled(1);
+        assert_eq!((one.width, one.height), (1, 1));
+        assert_eq!(
+            &one.rgba[0..3],
+            &[255, 255, 255],
+            "a cor é a do pixel visível"
+        );
+        assert_eq!(one.rgba[3], 63, "e o alfa é a média dos quatro");
+    }
+
+    #[test]
+    fn o_formato_sai_da_assinatura_e_nao_do_rotulo() {
+        assert!(matches!(decode(b"nada disso"), Err(ImageError::Unknown)));
+        assert!(matches!(decode(&[]), Err(ImageError::Unknown)));
+    }
+
+    /// As capas da Z-Wheel são BMP de 16 bits sem máscara: 5-5-5.
+    #[test]
+    fn bmp_de_dezesseis_bits_e_cinco_cinco_cinco() {
+        let mut bmp = vec![0u8; 54];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[10] = 54;
+        bmp[14] = 40;
+        bmp[18] = 2;
+        bmp[22] = 1;
+        bmp[26] = 1;
+        bmp[28] = 16;
+        // Branco puro e vermelho puro, com o preenchimento da linha até quatro bytes.
+        bmp.extend_from_slice(&[0xff, 0x7f, 0x00, 0x7c]);
+        let image = decode_bmp(&bmp).unwrap();
+        assert_eq!(&image.rgba[..4], &[255, 255, 255, 255]);
+        assert_eq!(&image.rgba[4..], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn bmp_comprimido_e_recusado_por_nome() {
+        // Recusar dizendo o motivo evita a caçada a um ícone que some sem explicação.
+        let mut bmp = bmp4();
+        bmp[30..34].copy_from_slice(&1u32.to_le_bytes());
+        let err = decode(&bmp).unwrap_err();
+        assert_eq!(err.to_string(), "imagem inconsistente: bmp comprimido");
+    }
+
+    #[test]
+    fn bmp_truncado_nao_derruba_nada() {
+        let bmp = bmp4();
+        assert!(decode(&bmp[..bmp.len() - 4]).is_err());
+        assert!(decode(&bmp[..20]).is_err());
+    }
+
+    #[test]
+    fn o_png_paletado_e_expandido_para_cores() {
+        // O `png` entrega o índice da paleta se não pedirmos a expansão, e os ícones dos jogos
+        // são quase todos paletados.
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(std::io::Cursor::new(&mut out), 2, 1);
+            encoder.set_color(png::ColorType::Indexed);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_palette(vec![255, 0, 0, 0, 0, 255]);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[0, 1])
+                .unwrap();
+        }
+        let image = decode(&out).unwrap();
+        assert_eq!(&image.rgba[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&image.rgba[4..8], &[0, 0, 255, 255]);
+    }
+}

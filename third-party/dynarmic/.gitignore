@@ -1,0 +1,21 @@
+# Compiler outputs
+*.so
+*.o
+*.dylib
+*.exe
+*.app
+
+# Build
+target
+build
+
+# IDEs
+.vscode
+.idea
+xcode
+
+# macOS
+._*
+.DS_Store
+
+Cargo.lock

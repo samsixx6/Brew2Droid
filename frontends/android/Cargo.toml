@@ -1,0 +1,43 @@
+[package]
+name = "zeebx-android"
+version = "0.4.2"
+edition = "2024"
+license = "GPL-2.0-or-later"
+description = "O frontend de Android do Zeebx"
+publish = false
+
+# A NativeActivity carrega o .so; uma ponte Java mínima só solicita foco ao AudioManager.
+[lib]
+name = "zeebx_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+# `audio` abre o Oboe diretamente no Android. Sem ele o `set_audio` da sessão não existe
+# e o aparelho fica mudo -- e sem compilar. `soundfont` é o MIDI tocado com um `.sf2` escolhido
+# nos ajustes: o `rustysynth` é Rust puro, e o banco só ocupa memória (cerca de 64 MiB para um de
+# 32 MB) quando há um.
+zeebx = { path = "../..", default-features = false, features = ["audio", "gl", "soundfont"] }
+
+# **Não há eframe aqui, e isso é a razão de este arquivo existir.** O eframe gira o laço pelo
+# winit, e o winit joga fora todo botão de controle: ele traduz os códigos de tecla do Android
+# para `Key::Unidentified`, que o egui descarta, e os eixos do manche nem chegam a virar evento.
+# Falando direto com a `android-activity` nós recebemos a entrada como o Android a entrega —
+# botões, gatilhos, eixos e o "voltar" — e ainda ficamos donos do ciclo de vida da janela.
+android-activity = { version = "0.6", features = ["native-activity"] }
+egui = { version = "0.33.3", default-features = false, features = ["default_fonts"] }
+egui_glow = { version = "0.33.3", default-features = false }
+glow = "0.16"
+# O contexto de GL: a `NativeActivity` dá uma `ANativeWindow`, e o resto é EGL. O glutin já
+# sabe fazer isso no Android e é a mesma caixa que o desktop usa.
+glutin = { version = "0.32.3", default-features = false, features = ["egl"] }
+raw-window-handle = "0.6"
+
+# O `MANAGE_EXTERNAL_STORAGE` não é permissão de diálogo: quem a pede abre uma tela do sistema
+# por `Intent`, e isso é uma chamada ao Java. A versão tem de ser a que a `android-activity`
+# resolve, senão são duas JNI diferentes na mesma imagem.
+jni = "0.21"
+serde_json = "1.0.151"
+png = "0.18.1"
+# Sem isto, um pânico do Rust morre em silêncio: o `adb logcat` não mostra nada.
+log = "0.4"
+android_logger = "0.14"

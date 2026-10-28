@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "games": [
+    {
+      "id": "bowling3d",
+      "module": "mod/Bowling3d/bowling3d.mod",
+      "mif": "mif/Bowling3d.mif",
+      "module_sha256": "1f5174a83a784d7ce67145b5d182d09ae734f78a434f2eac4bc80416503d8f60"
+    },
+    {
+      "id": "asphalt2",
+      "module": "mod/Asphalt3D-2/a2.mod",
+      "mif": "mif/Asphalt3D-2.mif",
+      "module_sha256": "c4a114ae6391fec4b04080e2971465197b1867751b0436cb7e8891eabb1b1819"
+    },
+    {
+      "id": "bia240",
+      "module": "mod/BIA240/bia.mod",
+      "mif": "mif/BIA240.mif",
+      "module_sha256": "e2cc4d4c05bb927569a26cdc87bf7f66978ddd7dce04583fe8f169089b979d6d"
+    }
+  ]
+}

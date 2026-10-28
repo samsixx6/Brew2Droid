@@ -1,0 +1,12 @@
+<resources>
+    <style name="BrewTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#FF1F60</item>
+        <item name="android:colorControlActivated">#FF1F60</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:statusBarColor">#202020</item>
+        <item name="android:navigationBarColor">#FAFAFA</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>

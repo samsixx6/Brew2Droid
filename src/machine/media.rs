@@ -1,0 +1,1834 @@
+//! IMedia: a reprodução de som e vídeo pedida pelo jogo.
+
+use super::*;
+
+#[cfg(test)]
+mod handset_audio_tests {
+    use super::*;
+    use crate::cpu::BackendPadrao;
+
+    fn machine() -> (Machine<BackendPadrao>, crate::scratch::TempDir) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = crate::scratch::TempDir::new(&format!("brew-media-{}-{}", std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let mut bytes = vec![0u8; 0x100];
+        for (offset, code) in [(0, vec![0xe3a00000u32, 0xe12fff1e]),
+            (0x20, vec![0xe3a020c8, 0xe2522001, 0x1afffffd, 0xe5912010, 0xe5802000, 0xe12fff1e]),
+            (0x60, vec![0xe5801000,0xe5802004,0xe12fff1e]),
+            (0x80, vec![0xe5801000,0xe5802004,0xe1d310b0,0xe5801008,0xe12fff1e])] {
+            for (index, word) in code.into_iter().enumerate() {
+                bytes[offset + index * 4..offset + index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let image = crate::loader::modfile::ModImage::parse(bytes).unwrap();
+        let module = loader::load_with(&image, &[]).unwrap();
+        let storage = crate::storage::StoragePaths::from_root(root.join("runtime"));
+        let mut machine = Machine::new_with_storage(BackendPadrao::new().unwrap(), module, root.path(), &storage, None);
+        machine.run(1000).unwrap();
+        (machine, root)
+    }
+
+    #[test]
+    fn media_deadline_and_queued_work_wake_the_native_loop() {
+        let (mut machine, _root) = machine();
+        machine.media.insert(0x88, MediaState { state: MM_STATE_PLAY,
+            ends_us: machine.now_us() + 12_345, ..MediaState::default() });
+        assert_eq!(machine.next_guest_work_delay(), Some(std::time::Duration::from_micros(12_345)));
+        machine.media.get_mut(&0x88).unwrap().state = MM_STATE_PLAY_PAUSE;
+        assert_eq!(machine.next_guest_work_delay(), None);
+        machine.media.get_mut(&0x88).unwrap().pendente = (loader::HEAP_BASE, 4);
+        assert_eq!(machine.next_guest_work_delay(), Some(std::time::Duration::ZERO));
+        machine.media.get_mut(&0x88).unwrap().pendente = (0, 0);
+        machine.avisos_de_midia.push((0x88, MM_CMD_PLAY, MM_STATUS_DONE,
+            Callback { function: loader::MODULE_BASE + 0x20, context: loader::HEAP_BASE + 0x10000 }));
+        assert_eq!(machine.next_guest_work_delay(), Some(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn budgeted_media_notice_keeps_its_payload_until_the_guest_returns() {
+        let (mut machine, _root) = machine();
+        let marker = loader::HEAP_BASE + 0x10000;
+        machine.media.insert(0x88, MediaState { notify: Callback {
+            function: loader::MODULE_BASE + 0x20, context: marker }, ..MediaState::default() });
+        machine.notify_media(0x88, MM_CMD_PLAY, MM_STATUS_START).unwrap();
+        machine.notify_media(0x88, MM_CMD_PLAY, MM_STATUS_DONE).unwrap();
+        assert_eq!(machine.deliver_signals(16).unwrap(), vec![Outcome::Budget]);
+        assert_eq!(machine.cpu.read_u32(marker).unwrap(), 0);
+        assert_eq!(machine.avisos_de_midia.len(), 1);
+        for _ in 0..100 {
+            machine.advance(16).unwrap();
+            if machine.handset_event_ready() { break; }
+        }
+        assert_eq!(machine.cpu.read_u32(marker).unwrap(), MM_STATUS_START);
+        machine.deliver_signals(2000).unwrap();
+        assert_eq!(machine.cpu.read_u32(marker).unwrap(), MM_STATUS_DONE);
+        assert!(machine.avisos_de_midia.is_empty());
+    }
+
+    #[test]
+    fn asynchronous_decode_does_not_restart_stopped_or_released_media() {
+        let (mut machine, _root) = machine();
+        let mixer = crate::audio::Mixer::silent(8000);
+        machine.set_audio(Some(mixer.clone()));
+        let mut worker = crate::audio::decode::DecodeWorker::new(Default::default()).unwrap();
+        worker.submit(42, crate::audio::to_wav(&[0.25;1600],8000)).unwrap();
+        machine.decodificador_midia = Some(worker);
+        machine.cargas_em_decodificacao.insert(42);
+        machine.cargas_de_midia.insert(42,CargaDeMidia::default());
+        machine.media.insert(1,MediaState { carga:42,state:MM_STATE_PLAY,tocar_ao_ler:true,ends_us:u64::MAX,..Default::default() });
+        machine.media.insert(2,MediaState { carga:42,state:MM_STATE_READY,..Default::default() });
+        let deadline = std::time::Instant::now()+std::time::Duration::from_secs(2);
+        while !machine.cargas_em_decodificacao.is_empty() {
+            machine.recebe_midias_decodificadas().unwrap();
+            assert!(std::time::Instant::now()<deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(mixer.is_playing(1));
+        assert!(!mixer.is_playing(2));
+        assert_eq!(machine.media[&2].state,MM_STATE_READY);
+        assert_eq!(machine.media[&1].ends_us-machine.now_us(),100_000);
+    }
+
+    #[test]
+    fn game_pause_preserves_the_remaining_media_deadline() {
+        let (mut machine,_root) = machine();
+        machine.media.insert(7,MediaState { state:MM_STATE_PLAY,ends_us:machine.now_us()+100_000,..Default::default() });
+        machine.media_call_inner(Interface::Media,"Pause",7).unwrap();
+        machine.clock_us += 2_000_000;
+        machine.poll_media().unwrap();
+        assert_eq!(machine.media[&7].state,MM_STATE_PLAY_PAUSE);
+        machine.media_call_inner(Interface::Media,"Resume",7).unwrap();
+        assert_eq!(machine.media[&7].ends_us-machine.now_us(),100_000);
+    }
+
+    fn cmf_curto() -> Vec<u8> {
+        let events = [0, 0xff, 0xf1, 0, 8, 0, 0x44, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xdf, 0];
+        let mut bytes = b"cmid\0\0\0\0\0\x03\x02\x02\x01trac".to_vec();
+        bytes.extend((events.len() as u32).to_be_bytes());
+        bytes.extend(events);
+        let size = bytes.len() as u32 - 8;
+        bytes[4..8].copy_from_slice(&size.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn handset_cmf_rejects_external_repeat_and_finishes_a_single_effect() {
+        for file in [false, true] {
+            let (mut machine, root) = machine();
+            machine.enable_handset_clock();
+            let bytes = cmf_curto();
+            let data = loader::HEAP_BASE + 0x2000;
+            let info = data + 0x1000;
+            let object = machine.new_object(Interface::Media).unwrap();
+            let mixer = crate::audio::Mixer::silent(8000);
+            machine.set_audio(Some(mixer.clone()));
+            if file {
+                std::fs::write(root.join("efeito.cmf"), &bytes).unwrap();
+                machine.cpu.write_mem(data, b"efeito.cmf\0").unwrap();
+            } else {
+                machine.cpu.write_mem(data, &bytes).unwrap();
+            }
+            for (offset, value) in [(0, if file { MMD_FILE_NAME } else { MMD_BUFFER }),
+                (4, data), (8, bytes.len() as u32)] {
+                machine.cpu.write_u32(info + offset, value).unwrap();
+            }
+            for (reg, value) in [(Reg::R1, MM_PARM_MEDIA_DATA), (Reg::R2, info)] {
+                machine.cpu.write_reg(reg, value);
+            }
+            assert_eq!(machine.media_call_inner(Interface::Media, "SetMediaParm", object).unwrap(), Some(SUCCESS));
+            machine.media.get_mut(&object).unwrap().notify = Callback {
+                function: loader::MODULE_BASE, context: 0,
+            };
+            machine.cpu.write_reg(Reg::R1, MM_PARM_PLAY_REPEAT);
+            machine.cpu.write_reg(Reg::R2, 0);
+            assert_eq!(machine.media_call_inner(Interface::Media, "SetMediaParm", object).unwrap(), Some(EUNSUPPORTED));
+            machine.media_play(object).unwrap();
+            machine.resolve_midias_pendentes().unwrap();
+            machine.espera_duracao_da_midia(object).unwrap();
+            assert_eq!(machine.media[&object].repeat, 1);
+            assert!(machine.media[&object].ends_us < u64::MAX);
+            mixer.render(800);
+            assert!(!mixer.is_playing(object));
+            machine.handset_clock = Some(crate::handset::clock::RealtimeClock::new(
+                std::time::Instant::now(), machine.media[&object].ends_us + 1));
+            machine.poll_media().unwrap();
+            assert_eq!(machine.media[&object].state, MM_STATE_READY);
+            assert_eq!(machine.avisos_de_midia.iter().filter(|(_, cmd, status, _)|
+                *cmd == MM_CMD_PLAY && *status == MM_STATUS_DONE).count(), 1);
+        }
+    }
+
+    #[test]
+    fn handset_wave_keeps_explicit_infinite_repeat() {
+        let (mut machine, _root) = machine();
+        machine.enable_handset_clock();
+        let data = loader::HEAP_BASE + 0x2000;
+        let bytes = crate::audio::to_wav(&[0.25; 320], 8000);
+        machine.cpu.write_mem(data, &bytes).unwrap();
+        machine.media.insert(7, MediaState { buffer: (data, bytes.len() as u32),
+            pendente: (data, bytes.len() as u32), ..Default::default() });
+        machine.cpu.write_reg(Reg::R1, MM_PARM_PLAY_REPEAT);
+        machine.cpu.write_reg(Reg::R2, 0);
+        assert_eq!(machine.media_call_inner(Interface::Media, "SetMediaParm", 7).unwrap(), Some(SUCCESS));
+        machine.media_play(7).unwrap();
+        machine.resolve_midias_pendentes().unwrap();
+        machine.espera_duracao_da_midia(7).unwrap();
+        assert_eq!(machine.media[&7].repeat, 0);
+        assert_eq!(machine.media[&7].ends_us, u64::MAX);
+    }
+
+    #[test]
+    fn cmf_movel_normaliza_repeticao_previa_inclusive_em_buffer_gzip() {
+        use std::io::Write;
+        for (gzip, reutilizado) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (mut machine, _root) = machine();
+            machine.enable_handset_clock();
+            let data = loader::HEAP_BASE + 0x2000;
+            let info = data + 0x1000;
+            let object = machine.new_object(Interface::Media).unwrap();
+            let mixer = crate::audio::Mixer::silent(8000);
+            machine.set_audio(Some(mixer.clone()));
+            if reutilizado {
+                let carga = machine.guarda_som(crate::audio::to_wav(&[0.25; 320], 8000));
+                machine.media.insert(object, MediaState { carga, ..Default::default() });
+            }
+            // O formato ainda não é conhecido quando o chamador pede repetição.
+            machine.cpu.write_reg(Reg::R1, MM_PARM_PLAY_REPEAT);
+            machine.cpu.write_reg(Reg::R2, 0);
+            machine.media_call_inner(Interface::Media, "SetMediaParm", object).unwrap();
+            let mut bytes = cmf_curto();
+            if gzip {
+                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+                encoder.write_all(&bytes).unwrap();
+                bytes = encoder.finish().unwrap();
+            }
+            machine.cpu.write_mem(data, &bytes).unwrap();
+            for (offset, value) in [(0, MMD_BUFFER), (4, data), (8, bytes.len() as u32)] {
+                machine.cpu.write_u32(info + offset, value).unwrap();
+            }
+            machine.cpu.write_reg(Reg::R1, MM_PARM_MEDIA_DATA);
+            machine.cpu.write_reg(Reg::R2, info);
+            machine.media_call_inner(Interface::Media, "SetMediaParm", object).unwrap();
+            machine.media.get_mut(&object).unwrap().notify = Callback {
+                function: loader::MODULE_BASE, context: 0,
+            };
+            machine.media_play(object).unwrap();
+            machine.resolve_midias_pendentes().unwrap();
+            machine.espera_duracao_da_midia(object).unwrap();
+            assert_eq!(machine.media[&object].repeat, 1, "gzip={gzip}, reutilizado={reutilizado}");
+            assert!(machine.media[&object].ends_us < u64::MAX);
+            mixer.render(800);
+            assert!(!mixer.is_playing(object));
+            machine.handset_clock = Some(crate::handset::clock::RealtimeClock::new(
+                std::time::Instant::now(), machine.media[&object].ends_us + 1));
+            machine.poll_media().unwrap();
+            assert_eq!(machine.avisos_de_midia.iter().filter(|(_, cmd, status, _)|
+                *cmd == MM_CMD_PLAY && *status == MM_STATUS_DONE).count(), 1);
+        }
+    }
+
+    #[test]
+    fn pending_decode_is_polled_without_busy_spinning_or_sleeping_forever() {
+        let (mut machine,_root) = machine();
+        machine.cargas_em_decodificacao.insert(42);
+        assert_eq!(machine.next_guest_work_delay(),Some(std::time::Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn legacy_device_volume_is_delivered_by_pointer_after_factory_creation() {
+        let (mut machine, _root) = machine();
+        let output = loader::HEAP_BASE + 0x3000;
+        let marker = output + 16;
+        machine.cpu.write_reg(Reg::R1, 0x0100_100b);
+        machine.cpu.write_reg(Reg::R2, output);
+        assert_eq!(machine.shell_create_instance().unwrap(), SUCCESS);
+        let object = machine.cpu.read_u32(output).unwrap();
+        machine.sounds.entry(object).or_default().notify = Callback {
+            function: loader::MODULE_BASE + 0x80, context: marker,
+        };
+        machine.cpu.write_reg(Reg::R0, object);
+        assert_eq!(machine.sound_call(13).unwrap(), Some(SUCCESS));
+        machine.deliver_signals(1000).unwrap();
+        assert_eq!(machine.cpu.read_u32(marker).unwrap(), 1);
+        assert_eq!(machine.cpu.read_u32(marker + 4).unwrap(), 1);
+        assert_eq!(machine.cpu.read_u32(marker + 8).unwrap(), 100);
+    }
+
+    #[test]
+    fn legacy_sound_player_null_info_reports_idle_busy_and_stopped() {
+        let (mut machine, _root) = machine();
+        let object = machine.new_object(Interface::SoundPlayer).unwrap();
+        let query = |machine: &mut Machine<BackendPadrao>| {
+            machine.cpu.write_reg(Reg::R0, object);
+            machine.cpu.write_reg(Reg::R1, 0);
+            machine.sound_player_call(18).unwrap()
+        };
+        // AEEError.h define EIDLE=31 e EITEMBUSY=32. GetInfo(NULL) é consulta de estado.
+        assert_eq!(query(&mut machine), Some(31));
+        let data = loader::HEAP_BASE + 0x2000;
+        let info = data + 0x1000;
+        let bytes = crate::audio::to_wav(&[0.25; 1600], 8000);
+        machine.cpu.write_mem(data, &bytes).unwrap();
+        // No ARM eInput é int8; os três bytes de padding podem conter dados antigos.
+        for (offset, value) in [(0, 0x1000_0102), (4, data), (8, bytes.len() as u32)] {
+            machine.cpu.write_u32(info + offset, value).unwrap();
+        }
+        machine.cpu.write_reg(Reg::R1, info);
+        assert_eq!(machine.sound_player_call(17).unwrap(), Some(SUCCESS));
+        machine.cpu.write_u32(info, 0xaabb_cc00).unwrap();
+        assert_eq!(machine.sound_player_call(18).unwrap(), Some(SUCCESS));
+        assert_eq!(machine.cpu.read_u32(info).unwrap(), 0xaabb_cc02);
+        assert_eq!(machine.cpu.read_u32(info + 4).unwrap(), data);
+        assert_eq!(machine.cpu.read_u32(info + 8).unwrap(), bytes.len() as u32);
+        assert_eq!(query(&mut machine), Some(31));
+        let mixer = crate::audio::Mixer::silent(8000);
+        machine.set_audio(Some(mixer.clone()));
+        assert_eq!(machine.sound_player_call(4).unwrap(), Some(SUCCESS));
+        assert_eq!(query(&mut machine), Some(32));
+        machine.resolve_midias_pendentes().unwrap();
+        assert!(mixer.render(16).iter().any(|v| *v > 0.2));
+        assert_eq!(machine.sound_player_call(5).unwrap(), Some(SUCCESS));
+        assert_eq!(query(&mut machine), Some(31));
+        assert_eq!(machine.sound_player_call(4).unwrap(), Some(SUCCESS));
+        machine.resolve_midias_pendentes().unwrap();
+        assert_eq!(query(&mut machine), Some(32));
+        machine.clock_us += 100_000;
+        machine.poll_media().unwrap();
+        assert_eq!(query(&mut machine), Some(31));
+    }
+
+    #[test]
+    fn legacy_sound_player_uses_real_pcm_and_four_argument_notifications() {
+        let (mut machine,_root) = machine();
+        let object = machine.new_object(Interface::SoundPlayer).unwrap();
+        let data = loader::HEAP_BASE + 0x2000;
+        let info = data + 0x1000;
+        let marker = data + 0x1100;
+        let bytes = crate::audio::to_wav(&[0.25;1600],8000);
+        machine.cpu.write_mem(data,&bytes).unwrap();
+        for (offset,value) in [(0,2),(4,data),(8,bytes.len() as u32)] { machine.cpu.write_u32(info+offset,value).unwrap(); }
+        let mixer = crate::audio::Mixer::silent(8000); machine.set_audio(Some(mixer.clone()));
+        for (slot,args) in [(17,[object,info,0,0]),(2,[object,loader::MODULE_BASE+0x60,marker,0]),(4,[object,0,0,0])] {
+            for (reg,value) in [Reg::R0,Reg::R1,Reg::R2,Reg::R3].into_iter().zip(args) { machine.cpu.write_reg(reg,value); }
+            assert_eq!(machine.sound_player_call(slot).unwrap(),Some(SUCCESS));
+        }
+        machine.resolve_midias_pendentes().unwrap();
+        assert!(mixer.render(16).iter().all(|v| *v > 0.2));
+        machine.deliver_signals(1000).unwrap();
+        assert_eq!(machine.cpu.read_u32(marker).unwrap(),1);
+        assert_eq!(machine.cpu.read_u32(marker+4).unwrap(),1);
+        machine.clock_us += 100_000;
+        machine.poll_media().unwrap(); machine.deliver_signals(1000).unwrap();
+        assert_eq!(machine.cpu.read_u32(marker+4).unwrap(),14);
+    }
+
+    #[test]
+    fn legacy_volume_query_uses_callback_payload_without_an_output_argument() {
+        let (mut machine,_root) = machine();
+        let object = machine.new_object(Interface::SoundPlayer).unwrap();
+        let marker = loader::HEAP_BASE+0x3000;
+        machine.media.insert(object,MediaState { volume:63,notify:Callback {
+            function:loader::MODULE_BASE+0x80,context:marker },..Default::default() });
+        machine.cpu.write_reg(Reg::R0,object);
+        // O chamador real deixa R1 apontando para um trampolim: GetVolume não tem argumento.
+        machine.cpu.write_reg(Reg::R1,crate::cpu::API_BASE+0x3f034);
+        assert_eq!(machine.sound_player_call(13).unwrap(),Some(SUCCESS));
+        machine.deliver_signals(1000).unwrap();
+        assert_eq!(machine.cpu.read_u32(marker).unwrap(),4);
+        assert_eq!(machine.cpu.read_u32(marker+4).unwrap(),1);
+        assert_eq!(machine.cpu.read_u32(marker+8).unwrap(),63);
+    }
+}
+
+/// Quantos sons decodificados o cache guarda antes de esquecer os que ninguém usa. Ver
+/// [`Machine::descarta_sons_sem_dono`].
+///
+/// No Switch, 64 entradas descartam uma trilha que ninguém está tocando e a próxima
+/// reprodução sintetiza de novo. O teto em bytes continua sendo o limite de memória.
+#[cfg(zeebx_switch)]
+const MAX_SONS_GUARDADOS: usize = 512;
+#[cfg(not(zeebx_switch))]
+const MAX_SONS_GUARDADOS: usize = 64;
+
+/// Quanto de PCM decodificado o cache guarda, em bytes, antes de esquecer os que ninguém usa.
+///
+/// **Contar entradas não é contar memória, e a diferença cresceu.** Um efeito curto ocupa poucos
+/// quilobytes e uma trilha longa ocupa dezenas de megabytes: 64 entradas podem ser meio megabyte
+/// de efeitos ou mais de cem megabytes de música, e só o segundo caso importa. A trilha mais longa
+/// medida no Double Dragon tem 109 s, o que a 44.100 Hz em `f32` dá 19,3 MB — quatro delas
+/// guardadas passam de 77 MB.
+///
+/// O número cresceu de propósito junto com [`crate::audio::soundfont::TAXA_BANCO`]: sintetizar o
+/// banco a 44.100 em vez de 22.050 **dobra** o PCM de cada música. Num aparelho de mão o que
+/// sobra de RAM é pouco, e o custo de esquecer é uma re-síntese; o custo de não esquecer é o
+/// sistema matar o processo.
+const MAX_BYTES_DE_SOM: usize = 24 * 1024 * 1024;
+
+/// O teto escolhido agora, que começa em [`MAX_BYTES_DE_SOM`] e o frontend pode mudar.
+///
+/// Global pelo mesmo motivo da taxa do banco: o valor vale para o próximo descarte, e não para o
+/// nascimento da máquina. Ver `crate::audio::soundfont::define_taxa`.
+static TETO_ESCOLHIDO: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAX_BYTES_DE_SOM);
+
+/// Muda quanto de PCM decodificado o cache pode guardar, em bytes.
+///
+/// O piso de 1 MiB existe para que um valor pequeno demais não transforme o cache em "esquece
+/// tudo a cada som", que é pior que não ter cache: custaria uma re-síntese por efeito tocado.
+pub fn define_teto_do_cache_de_som(bytes: usize) {
+    TETO_ESCOLHIDO.store(bytes.max(1024 * 1024), std::sync::atomic::Ordering::Relaxed);
+}
+
+impl<C: CpuBackend> Machine<C> {
+    /// `ISound` (`AEECLSID_SOUND` = `0x01001056`), de `inc/AEEISound.h`.
+    ///
+    /// É a API de som *básica* do BREW: tons do gerador do aparelho, vibração e volume — não
+    /// toca arquivos, isso é o `ISoundPlayer`. Aqui ela é silenciosa: aceita tudo, guarda o
+    /// estado que o jogo pode ler de volta e avisa o callback de que a reprodução terminou.
+    /// Sem isso os jogos que checam o retorno de `Set` desistem da inicialização.
+    /// `IMediaUtil` e `IMedia`, de `sdk/inc/AEEMediaUtil.h` e `inc/AEEIMedia.h`.
+    ///
+    /// Mudos, como o `ISound`: guardam o estado de reprodução e respondem o que o jogo espera,
+    /// mas não sai som. O que importa aqui é existir — o Quake cria o tocador de trilha na
+    /// inicialização do áudio e, se ela falha, ele segue em frente e depois chama `Play` num
+    /// ponteiro nulo, sem conferir.
+    pub(super) fn media_call(
+        &mut self,
+        iface: Interface,
+        slot: u32,
+    ) -> Result<Option<u32>, CpuError> {
+        let Some(name) = iface.method(slot) else {
+            return Ok(None);
+        };
+        let this = self.arg(0);
+        let chamada = self.descreve_chamada_de_midia(iface, name)?;
+        let result = self.media_call_inner(iface, name, this)?;
+        if let Some(result) = result {
+            self.anota_midia(this, format!("{chamada} -> {result:#x}"));
+        } else {
+            self.anota_midia(this, format!("{chamada} -> NÃO IMPLEMENTADO"));
+        }
+        Ok(result)
+    }
+
+    /// A chamada em texto, com os argumentos que dizem alguma coisa sobre o som.
+    fn descreve_chamada_de_midia(
+        &mut self,
+        iface: Interface,
+        name: &str,
+    ) -> Result<String, CpuError> {
+        let (a1, a2, a3) = (self.arg(1), self.arg(2), self.arg(3));
+        Ok(match (iface, name) {
+            (Interface::Media, "SetMediaParm") => {
+                let extra = match a1 {
+                    MM_PARM_MEDIA_DATA if a2 != 0 => {
+                        let classe = self.cpu.read_u32(a2)?;
+                        let dados = self.cpu.read_u32(a2 + 4)?;
+                        let tamanho = self.cpu.read_u32(a2 + 8)?;
+                        let mut cabeca = [0u8; 4];
+                        if classe == MMD_BUFFER && dados != 0 {
+                            self.cpu.read_mem(dados, &mut cabeca).ok();
+                        }
+                        match classe {
+                            MMD_FILE_NAME if dados != 0 => format!(
+                                " arquivo{{{:?}}}",
+                                self.cpu.read_cstring(dados, MAX_STRING)
+                            ),
+                            _ => format!(
+                                " dados{{classe {classe:#x}, {tamanho} bytes em {dados:#x}, {:?}}}",
+                                String::from_utf8_lossy(&cabeca)
+                            ),
+                        }
+                    }
+                    _ => String::new(),
+                };
+                format!("SetMediaParm(parm {a1}, {a2:#x}, {a3:#x}){extra}")
+            }
+            (Interface::MediaUtil, _) => format!("IMediaUtil::{name}({a1:#x}, {a2:#x})"),
+            _ => format!("{name}({a1:#x}, {a2:#x})"),
+        })
+    }
+
+    /// Guarda uma linha no [`Machine::media_log`], juntando repetições seguidas.
+    pub(super) fn anota_midia(&mut self, objeto: u32, linha: String) {
+        let agora = self.elapsed_ms();
+        if let Some(ultima) = self.media_log.back_mut() {
+            if ultima.1 == objeto && ultima.2 == linha {
+                ultima.3 += 1;
+                return;
+            }
+        }
+        if self.media_log.len() == MEDIA_LOG_MAX {
+            self.media_log.pop_front();
+        }
+        self.media_log.push_back((agora, objeto, linha, 1));
+    }
+
+    /// O registro de mídia, para o relatório: `(instante, objeto, chamada, vezes seguidas)`.
+    pub fn media_log(&self) -> Vec<(u32, u32, String, u32)> {
+        self.media_log.iter().cloned().collect()
+    }
+
+    pub(super) fn media_call_inner(
+        &mut self,
+        iface: Interface,
+        name: &str,
+        this: u32,
+    ) -> Result<Option<u32>, CpuError> {
+        let result = match (iface, name) {
+            (_, "AddRef") => self.objects.add_ref(this),
+            (_, "Release") => {
+                let remaining = self.objects.release(this);
+                if remaining == 0 {
+                    self.media.remove(&this);
+                    self.fluxos_pcm.remove(&this);
+                    self.buffers_vivos.remove(&this);
+                    // Uma música em repetição seguia tocando depois de o objeto sumir.
+                    if let Some(mixer) = &self.audio {
+                        mixer.stop(this);
+                    }
+                }
+                remaining
+            }
+            (_, "QueryInterface") => {
+                let out = self.arg(2);
+                if out != 0 {
+                    self.cpu.write_u32(out, this)?;
+                }
+                SUCCESS
+            }
+            // int CreateMedia(IMediaUtil *, AEEMediaData *, IMedia **ppm)
+            (Interface::MediaUtil, "CreateMedia" | "CreateMediaEx") => {
+                let out = self.arg(2);
+                let media = self.new_object(Interface::Media)?;
+                if media == 0 {
+                    return Ok(Some(ENOMEMORY));
+                }
+                let mut state = MediaState::default();
+                match self.read_media_data(self.arg(1))? {
+                    Entrega::Pronta(carga) => state.carga = carga,
+                    Entrega::Buffer(onde, tamanho) => {
+                        (state.pendente, state.buffer) = ((onde, tamanho), (onde, tamanho))
+                    }
+                    Entrega::Nada => {}
+                }
+                self.media.insert(media, state);
+                if out != 0 {
+                    self.cpu.write_u32(out, media)?;
+                }
+                SUCCESS
+            }
+            // int SetMediaParm(IMedia *, int16 nParmID, int32 p1, int32 p2)
+            (Interface::Media, "SetMediaParm") => {
+                let (parm, p1) = (self.arg(1), self.arg(2));
+                let mut state = self
+                    .media
+                    .get(&this)
+                    .copied()
+                    .unwrap_or(MediaState::default());
+                let mut resultado = SUCCESS;
+                match parm {
+                    MM_PARM_MEDIA_DATA if self.le_fluxo_pcm(this, p1)? => {}
+                    MM_PARM_MEDIA_DATA => match self.read_media_data(p1)? {
+                        Entrega::Pronta(carga) => {
+                            (state.carga, state.pendente, state.buffer) = (carga, (0, 0), (0, 0))
+                        }
+                        Entrega::Buffer(onde, tamanho) => {
+                            (state.pendente, state.buffer) = ((onde, tamanho), (onde, tamanho))
+                        }
+                        Entrega::Nada => resultado = EFAILED,
+                    },
+                    MM_PARM_VOLUME => state.volume = p1.min(MAX_VOLUME),
+                    MM_PARM_MUTE => state.muted = p1 != 0,
+                    MM_PARM_PLAY_REPEAT => {
+                        // O tocador móvel CMF não oferece repetição externa. Asphalt passa zero
+                        // para todos os efeitos e ignora o retorno; aceitar isso mantinha o mesmo
+                        // efeito em laço até outro substituí-lo, sem o DONE esperado pelo jogo.
+                        // Outros formatos conservam zero=infinito. Ler só a assinatura não
+                        // antecipa a captura/decodificação do buffer que o guest ainda escreve.
+                        if self.handset_clock.is_some() {
+                            let cmf = match state.buffer {
+                                (address, size) if size >= 4 => self.cpu.read_u32(address)? == u32::from_le_bytes(*b"cmid"),
+                                (_, 0) => self.cargas_de_midia.get(&state.carga).is_some_and(|carga| carga.cmf),
+                                _ => false,
+                            };
+                            if cmf { return Ok(Some(EUNSUPPORTED)); }
+                        }
+                        state.repeat = p1;
+                    }
+                    // O resto do `MM_PARM_XXX` é aceito e ignorado: recusar faria jogos
+                    // desistirem de tocar por causa de um ajuste que não muda o som.
+                    _ => {}
+                }
+                self.media.insert(this, state);
+                if let (Some(mixer), MM_PARM_VOLUME | MM_PARM_MUTE) = (&self.audio, parm) {
+                    mixer.set_volume(this, state.gain());
+                }
+                resultado
+            }
+            // void RegisterNotify(IMedia *, PFNMEDIANOTIFY pfn, void *pUser)
+            (Interface::Media, "RegisterNotify") => {
+                let notify = Callback {
+                    function: self.arg(1),
+                    context: self.arg(2),
+                };
+                self.media.entry(this).or_default().notify = notify;
+                SUCCESS
+            }
+            (Interface::Media, "Play") => self.media_play(this)?,
+            (Interface::Media, "Resume") => {
+                let now = self.now_us();
+                if let Some(state) = self.media.get_mut(&this) {
+                    if state.state == MM_STATE_PLAY_PAUSE && state.ends_us != u64::MAX {
+                        state.ends_us = state.ends_us.saturating_add(now.saturating_sub(state.paused_at_us));
+                    }
+                    if state.state == MM_STATE_PLAY_PAUSE { state.state = MM_STATE_PLAY; }
+                }
+                if self.media.get(&this).is_some_and(|state| state.tocar_ao_ler && state.pendente.1 == 0
+                    && !self.cargas_em_decodificacao.contains(&state.carga)) {
+                    self.media.get_mut(&this).unwrap().tocar_ao_ler=false;
+                    self.inicia_reproducao(this,false)?;
+                }
+                if let Some(mixer) = &self.audio {
+                    mixer.set_paused(this, false);
+                }
+                SUCCESS
+            }
+            (Interface::Media, "Pause") => {
+                let now = self.now_us();
+                if let Some(state) = self.media.get_mut(&this) {
+                    if state.state == MM_STATE_PLAY {
+                        state.paused_at_us = now;
+                        state.state = MM_STATE_PLAY_PAUSE;
+                    }
+                }
+                if let Some(mixer) = &self.audio {
+                    mixer.set_paused(this, true);
+                }
+                SUCCESS
+            }
+            // O `Stop` avisa o callback de que a reprodução terminou, **com `MM_STATUS_DONE`**. O
+            // Crash Nitro Kart conta os sons ativos e só toca a música da pista quando a conta
+            // zera; o tratador dele (`0x11a80`) desconta no `DONE` e no status 9 e ignora o
+            // `ABORT`. Sem aviso — e depois com `ABORT` —, as músicas do menu paradas na entrada
+            // da corrida nunca saíam da conta, e a corrida inteira ficava muda. O Double Dragon
+            // trata os dois status do mesmo jeito.
+            (Interface::Media, "Stop") => {
+                let tocando = self.esta_tocando(this);
+                // **Quem cala a fala.** Na Turma da Mônica, quem encerra a fala é o jogo, por
+                // `Stop`, quando o decodificador dele chega ao fim — ver
+                // [`Machine::abre_buffer_vivo`]. Esta linha diz de quem foi a ordem: do jogo, por
+                // `Stop`, ou nossa, por fim de som — e quantos segundos de fato tocaram.
+                if tocando
+                    && let Some(som) = self.media_sound(this)?
+                {
+                    let dur_s = som.samples.len() as f64
+                        / f64::from(som.channels.max(1))
+                        / f64::from(som.rate.max(1));
+                    // **Som de laço não tem fim, e por isso não tem "quanto falta".** O
+                    // `ends_us` dele é `u64::MAX`, e subtrair o relógio dava um número de doze
+                    // dígitos que parecia defeito nosso nas medições. A frase certa é a que se
+                    // pode ler.
+                    let em_laco = self
+                        .media
+                        .get(&this)
+                        .is_some_and(|estado| estado.ends_us == u64::MAX);
+                    let previsto = self
+                        .media
+                        .get(&this)
+                        .map(|estado| estado.ends_us.saturating_sub(self.now_us()) as f64 / 1e6)
+                        .unwrap_or(0.0);
+                    if em_laco {
+                        crate::registro!(
+                            crate::registro::Nivel::Informacao,
+                            "midia",
+                            "Stop {}: o jogo parou um som de {:.2}s que tocava em laço",
+                            this,
+                            dur_s
+                        );
+                    } else {
+                        crate::registro!(
+                            crate::registro::Nivel::Informacao,
+                            "midia",
+                            "Stop {}: o jogo parou um som de {:.2}s com {:.2}s ainda por tocar",
+                            this,
+                            dur_s,
+                            previsto.max(0.0)
+                        );
+                    }
+                }
+                if let Some(fluxo) = self.fluxos_pcm.get_mut(&this) {
+                    fluxo.tocando = false;
+                }
+                self.buffers_vivos.remove(&this);
+                if let Some(state) = self.media.get_mut(&this) {
+                    state.state = MM_STATE_READY;
+                    state.ends_us = 0;
+                    state.tocar_ao_ler = false;
+                }
+                if let Some(mixer) = &self.audio {
+                    mixer.stop(this);
+                }
+                if tocando {
+                    self.notify_media(this, MM_CMD_PLAY, MM_STATUS_DONE)?;
+                }
+                SUCCESS
+            }
+            // int GetState(IMedia *, boolean *pbStateChanging) — o estado é o retorno, e o
+            // ponteiro diz se ele está em transição. Aqui nunca está: a mudança é imediata.
+            (Interface::Media, "GetState") => {
+                let out = self.arg(1);
+                if out != 0 {
+                    self.cpu.write_mem(out, &[0])?;
+                }
+                // Um som que acabou volta o objeto para "pronto": é o que o jogo consulta
+                // para saber que o som terminou. Quem diz que acabou é o **relógio virtual**,
+                // não o mixer — pelo mesmo motivo que em `media_play`: o emulador roda mudo
+                // sem deixar de contar o tempo, e há som que toca em silêncio porque não
+                // sabemos decodificá-lo, só cronometrá-lo.
+                let now = self.now_us();
+                let state = self.media.entry(this).or_default();
+                if state.state == MM_STATE_PLAY && now >= state.ends_us {
+                    state.state = MM_STATE_READY;
+                }
+                state.state
+            }
+            // int32 GetTotalTime(IMedia *) — a duração do som, em milissegundos.
+            //
+            // O som que toca em silêncio responde a duração dele como qualquer outro. Zero aqui
+            // é um divisor esperando acontecer: quem monta uma barra de progresso divide pelo
+            // total, e um total zero derruba o jogo por uma resposta nossa.
+            (Interface::Media, "GetTotalTime") => match {
+                // A duração precisa do som: quem pergunta não pode esperar a próxima volta.
+                self.resolve_midia(this)?;
+                self.espera_duracao_da_midia(this)?;
+                self.media_sound(this)?
+            } {
+                Some(sound) => (sound.frames() as u64 * 1000 / u64::from(sound.rate.max(1))) as u32,
+                None => (self.media_silent_length(this)?.unwrap_or(0) / 1000) as u32,
+            },
+            // O volume e o mudo voltam o que foi guardado: um jogo que lê o volume e grava de
+            // volta se emudecia com o zero de antes. O resto continua zerado.
+            (Interface::Media, "GetMediaParm") => {
+                let state = self.media.get(&this).copied().unwrap_or_default();
+                let valor = match self.arg(1) {
+                    MM_PARM_VOLUME => state.volume,
+                    MM_PARM_MUTE => u32::from(state.muted),
+                    _ => 0,
+                };
+                for (index, v) in [(2, valor), (3, 0)] {
+                    let out = self.arg(index);
+                    if out != 0 {
+                        self.cpu.write_u32(out, v)?;
+                    }
+                }
+                SUCCESS
+            }
+            // O resto do `IMedia` responde sucesso sem fazer nada — e agora aparece no registro
+            // com o nome, que é o que faltava para saber se uma partida muda depende dele.
+            (Interface::Media, _) => SUCCESS,
+            _ => return Ok(None),
+        };
+        Ok(Some(result))
+    }
+
+    /// Lê um `AEEMediaData` do guest e devolve a chave do som em [`Machine::cargas_de_midia`].
+    ///
+    /// A struct é `{ AEECLSID clsData; void *pData; uint32 dwSize; }`. `MMD_BUFFER` aponta para
+    /// os bytes; `MMD_FILE_NAME` aponta para o nome de um arquivo do pacote. Os bytes são lidos e
+    /// decodificados **agora** — ver [`CargaDeMidia`]. `None` quando não há som a guardar: um
+    /// arquivo que não existe ou uma forma de entrega que não conhecemos.
+    pub(super) fn read_media_data(&mut self, pointer: u32) -> Result<Entrega, CpuError> {
+        if pointer == 0 {
+            return Ok(Entrega::Nada);
+        }
+        let class = self.cpu.read_u32(pointer)?;
+        let data = self.cpu.read_u32(pointer + 4)?;
+        let size = self.cpu.read_u32(pointer + 8)?;
+        let bytes = match class {
+            MMD_BUFFER if data != 0 && size != 0 && size <= MAX_MEDIA_BUFFER => {
+                return Ok(Entrega::Buffer(data, size));
+            }
+            MMD_BUFFER => return Ok(Entrega::Nada),
+            MMD_FILE_NAME if data != 0 => {
+                let nome = self.cpu.read_cstring(data, MAX_STRING);
+                match self.vfs.resolve(&nome).and_then(|p| std::fs::read(p).ok()) {
+                    Some(bytes) => bytes,
+                    None => {
+                        self.bad_pointers
+                            .insert(format!("som pedido por nome, e o arquivo não existe: {nome}"));
+                        return Ok(Entrega::Nada);
+                    }
+                }
+            }
+            _ => {
+                self.anota_ponto_ruim(format!(
+                    "uma mídia foi entregue como {class:#010x}, e só sabemos ler memória e arquivo"
+                ));
+                return Ok(Entrega::Nada);
+            }
+        };
+        Ok(Entrega::Pronta(self.guarda_som(bytes)))
+    }
+
+    /// Lê agora o buffer que um objeto recebeu e ainda não foi lido.
+    ///
+    /// **O buffer é lido na volta seguinte do laço, e não na entrega nem no `Play`.** Os dois
+    /// extremos quebram jogos diferentes. Lido no `Play`, um jogo que carrega vários sons pelo
+    /// mesmo buffer de rascunho já o reaproveitou quando toca, e sai o som errado. Lido na entrega,
+    /// o Zeebo F.C. Super League entrega o som de navegação do menu com só o cabeçalho escrito —
+    /// ele manda tocar e copia as amostras em seguida, no mesmo tratador —, e saía um chiado com
+    /// o conteúdo antigo do buffer (havia até o cabeçalho de uma textura ATC lá dentro). No
+    /// aparelho o `Play` também só lê o buffer depois, numa tarefa separada.
+    pub(super) fn resolve_midia(&mut self, this: u32) -> Result<(), CpuError> {
+        let Some(state) = self.media.get(&this).copied() else {
+            return Ok(());
+        };
+        let (onde, tamanho) = state.pendente;
+        if tamanho == 0 {
+            return Ok(());
+        }
+        let bytes = self.read_bytes(onde, tamanho)?;
+        let carga = self.guarda_som(bytes);
+        let tocar = match self.media.get_mut(&this) {
+            Some(state) => {
+                state.carga = carga;
+                state.pendente = (0, 0);
+                std::mem::take(&mut state.tocar_ao_ler)
+            }
+            None => false,
+        };
+        if tocar {
+            // O aviso de início já saiu no `Play`.
+            self.inicia_reproducao(this, false)?;
+        }
+        Ok(())
+    }
+
+    /// Lê os buffers que ficaram para esta volta do laço. Ver [`Machine::resolve_midia`].
+    pub(super) fn resolve_midias_pendentes(&mut self) -> Result<(), CpuError> {
+        let pendentes: Vec<u32> = self
+            .media
+            .iter()
+            .filter(|(_, state)| state.pendente.1 != 0)
+            .map(|(this, _)| *this)
+            .collect();
+        for this in pendentes {
+            self.resolve_midia(this)?;
+        }
+        self.recebe_midias_decodificadas()?;
+        Ok(())
+    }
+
+    fn recebe_midias_decodificadas(&mut self) -> Result<(),CpuError> {
+        loop {
+            let Some(result) = self.decodificador_midia.as_mut().and_then(|worker| worker.try_recv()) else { break; };
+            if !self.cargas_em_decodificacao.remove(&result.key) { continue; }
+            if result.midi {
+                self.assumptions.insert(if result.soundfont {
+                    "MIDI móvel usa o SoundFont selecionado pelo usuário"
+                } else { "MIDI móvel usa timbres aproximados do sintetizador interno" });
+            }
+            let cmf = self.cargas_de_midia.get(&result.key).is_some_and(|carga| carga.cmf);
+            let carga = match result.sound {
+                Ok(sound) => {
+                    crate::registro!(crate::registro::Nivel::Informacao,"midia",
+                        "worker: {} bytes -> {} quadros a {}Hz/{} canal(is), {:.2}ms",result.encoded_bytes,
+                        sound.frames(),sound.rate,sound.channels,result.elapsed_ms);
+                    CargaDeMidia { som:Some(std::sync::Arc::new(sound)),silencio_us:None,cmf }
+                },
+                Err(error) => {
+                    self.anota_ponto_ruim(format!("worker de áudio recusou {} bytes: {error}",result.encoded_bytes));
+                    CargaDeMidia { som:None,silencio_us:result.silent_us,cmf }
+                },
+            };
+            self.cargas_de_midia.insert(result.key,carga);
+            self.descarta_sons_sem_dono(result.key);
+            let playing:Vec<u32> = self.media.iter().filter(|(_,state)| state.carga == result.key
+                && state.tocar_ao_ler && state.state == MM_STATE_PLAY).map(|(id,_)| *id).collect();
+            for id in playing {
+                self.media.get_mut(&id).unwrap().tocar_ao_ler=false;
+                self.inicia_reproducao(id,false)?;
+            }
+        }
+        if self.decodificador_midia.as_ref().is_some_and(|worker| worker.is_finished()) {
+            let pending = std::mem::take(&mut self.cargas_em_decodificacao);
+            if !pending.is_empty() {
+                self.anota_ponto_ruim("worker de áudio encerrou antes das cargas pendentes".into());
+                for state in self.media.values_mut().filter(|state| pending.contains(&state.carga)) {
+                    state.ends_us = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn espera_duracao_da_midia(&mut self, this:u32) -> Result<(),CpuError> {
+        let deadline = std::time::Instant::now()+std::time::Duration::from_secs(5);
+        while self.media.get(&this).is_some_and(|state| self.cargas_em_decodificacao.contains(&state.carga)) {
+            self.recebe_midias_decodificadas()?;
+            if std::time::Instant::now()>=deadline {
+                self.anota_ponto_ruim("GetTotalTime aguardou cinco segundos sem resultado do decoder".into());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    /// Decodifica e guarda um som pelos bytes, e devolve a chave dele.
+    pub(super) fn guarda_som(&mut self, bytes: Vec<u8>) -> u64 {
+        // O `sound.ggz` do Double Dragon guarda os sons comprimidos: com o envelope de gzip, o
+        // formato de verdade está dentro dele.
+        let bytes = match bytes.starts_with(&[0x1f, 0x8b]) {
+            true => inflate(&bytes).unwrap_or(bytes),
+            false => bytes,
+        };
+        let chave = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            // Zero é "nada entregue" no estado do objeto.
+            hasher.finish().max(1)
+        };
+        if self.handset_clock.is_some() && !self.cargas_de_midia.contains_key(&chave) {
+            let cmf = bytes.starts_with(b"cmid");
+            if self.decodificador_midia.is_none() {
+                let settings = crate::audio::decode::DecodeSettings {
+                    #[cfg(feature = "soundfont")]
+                    bank: self.banco_de_som.clone(),
+                };
+                match crate::audio::decode::DecodeWorker::new(settings) {
+                    Ok(worker) => self.decodificador_midia = Some(worker),
+                    Err(error) => self.anota_ponto_ruim(format!("worker de áudio: {error}")),
+                }
+            }
+            if let Some(worker) = &mut self.decodificador_midia {
+                let result = worker.submit(chave,bytes);
+                match result {
+                    Ok(()) => {
+                        self.cargas_de_midia.insert(chave,CargaDeMidia { cmf,..Default::default() });
+                        self.cargas_em_decodificacao.insert(chave);
+                    },
+                    Err(error) => self.anota_ponto_ruim(format!("áudio não enfileirado: {error}")),
+                }
+                return chave;
+            }
+        }
+        if !self.cargas_de_midia.contains_key(&chave) {
+            let carga = self.decodifica_som(&bytes);
+            // **A conta que o issue #43 pede, em uma linha por som.** O formato que chegou (pelos
+            // primeiros bytes), quantos bytes, e quantos segundos decodificamos de verdade. Se uma
+            // fala longa aparecer aqui com um segundo, o corte está aqui e não no jogo -- e é isso
+            // que separa "não decodifica" de "decodifica e é cortado".
+            crate::registro!(
+                crate::registro::Nivel::Informacao,
+                "midia",
+                "som: {} bytes, assinatura {:?}, RIFF diz {} e data diz {}, decodificado em {}",
+                bytes.len(),
+                String::from_utf8_lossy(&bytes[..bytes.len().min(4)]),
+                // **Os dois tamanhos que o parser tem de escolher entre si.** Um jogo escreve no
+                // `data` o buffer inteiro e no `RIFF` a verdade; a Turma da Mônica parece fazer o
+                // inverso, com o `RIFF` trazendo só o que já foi preenchido. Sem estes dois
+                // números lado a lado, a escolha do parser é indistinguível do defeito.
+                if bytes.len() >= 8 {
+                    u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize + 8
+                } else {
+                    0
+                },
+                if bytes.len() >= 44 {
+                    (0..bytes.len().saturating_sub(8))
+                        .find(|&i| &bytes[i..i + 4] == b"data")
+                        .and_then(|i| bytes.get(i + 4..i + 8))
+                        .map(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]) as usize)
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
+                match &carga.som {
+                    // **Divide pelos canais, senão o estéreo sai dobrado.** As amostras vêm
+                    // entrelaçadas: um mp3 de dois canais tem o dobro de amostras do que de
+                    // quadros. Sem esta divisão, `menu_music.mp3` (15,67 s) aparecia com 31,19 s.
+                    Some(som) => format!(
+                        "{:.2}s a {} Hz, {} canal(is)",
+                        som.samples.len() as f64
+                            / f64::from(som.channels.max(1))
+                            / f64::from(som.rate.max(1)),
+                        som.rate,
+                        som.channels
+                    ),
+                    None => format!(
+                        "nada (só cronometrado: {} ms)",
+                        carga.silencio_us.map(|us| us / 1000).unwrap_or(0)
+                    ),
+                },
+            );
+            self.cargas_de_midia.insert(chave, carga);
+            self.descarta_sons_sem_dono(chave);
+        }
+        chave
+    }
+
+    /// Esquece os sons decodificados que nenhum `IMedia` usa, passando de
+    /// [`MAX_SONS_GUARDADOS`].
+    ///
+    /// O cache existe para não decodificar de novo o som que o jogo entrega outra vez, mas sem
+    /// teto ele guardava **todo** conteúdo que já passou por um `Play`: o Zeebo F.C. escreve
+    /// efeitos diferentes no mesmo buffer de 500 KB, e cada um virava uma entrada para sempre.
+    /// Uma voz tocando não perde nada: o PCM dela está num `Arc` que o mixer também segura.
+    fn descarta_sons_sem_dono(&mut self, nova: u64) {
+        // **Os dois tetos, e não só o de entradas.** Ver [`MAX_BYTES_DE_SOM`]: sessenta e quatro
+        // efeitos curtos cabem de sobra, e quatro músicas longas sintetizadas pelo banco já não
+        // cabem. Quem estoura primeiro manda.
+        let bytes_guardados: usize = self
+            .cargas_de_midia
+            .values()
+            .filter_map(|carga| carga.som.as_ref())
+            .map(|som| som.samples.len() * std::mem::size_of::<f32>())
+            .sum();
+        let teto = TETO_ESCOLHIDO.load(std::sync::atomic::Ordering::Relaxed);
+        if self.cargas_de_midia.len() <= MAX_SONS_GUARDADOS && bytes_guardados <= teto
+        {
+            return;
+        }
+        let em_uso: std::collections::HashSet<u64> =
+            self.media.values().map(|state| state.carga).collect();
+        self.cargas_de_midia
+            .retain(|chave, _| *chave == nova || em_uso.contains(chave) || self.cargas_em_decodificacao.contains(chave));
+    }
+
+
+    /// Toca uma partitura com o banco de amostras, quando o aparelho tem um.
+    ///
+    /// Só tenta quando os bytes começam com `MThd`: reconhecer o formato **antes** de abrir o banco
+    /// evita gastar 32 MB de carga por causa de um som que não é partitura, e evita que o banco
+    /// mude o desfecho de um formato que a tabela já tratava.
+    #[cfg(feature = "soundfont")]
+    fn toca_com_banco(&self, bytes: &[u8]) -> Option<crate::audio::wav::Sound> {
+        if !bytes.starts_with(b"MThd") {
+            return None;
+        }
+        let banco = self.banco_de_som.as_ref()?;
+        // **A taxa do banco não é a da tabela.** Ver [`crate::audio::soundfont::TAXA_BANCO`]: as
+        // amostras do `.sf2` são gravadas a 44,1 kHz, e sintetizar a 22,05 cortava o brilho delas
+        // antes que o misturador tivesse qualquer chance de reamostrar de volta.
+        crate::audio::soundfont::toca(banco, bytes, crate::audio::soundfont::taxa())
+    }
+
+    /// Sem a feature, o caminho é sempre o da tabela de timbres.
+    #[cfg(not(feature = "soundfont"))]
+    fn toca_com_banco(&self, _bytes: &[u8]) -> Option<crate::audio::wav::Sound> {
+        None
+    }
+
+    /// Decodifica um som pelo que ele é, e não pelo nome.
+    fn decodifica_som(&mut self, bytes: &[u8]) -> CargaDeMidia {
+        // RIFF/WAVE primeiro porque é o que quase todo som é, e é o mais barato de reconhecer.
+        // MP3 depois: é o formato da **música**, e enquanto ele não existia aqui, efeito tocava
+        // e trilha não tocava em jogo nenhum.
+        let mobile = if bytes.starts_with(b"cmid") {
+            let mut bank_used = false;
+            let result = crate::audio::cmf::decode_with(bytes, |midi| {
+                if let Some(sound) = self.toca_com_banco(midi) {
+                    bank_used = true;
+                    Some(sound)
+                } else { crate::audio::midi::decode(midi) }
+            });
+            if result.is_ok() && crate::audio::cmf::contains_music(bytes) {
+                self.assumptions.insert(if bank_used {
+                    "Música CMX usa o banco de instrumentos selecionado"
+                } else { "Música CMX usa timbres aproximados do sintetizador interno" });
+            }
+            Some(result)
+        }
+            else if bytes.get(8..12) == Some(b"QLCM") { Some(crate::audio::qcp::decode(bytes)) } else { None };
+        let som = if let Some(decoded) = mobile {
+            match decoded { Ok(sound) => Some(sound), Err(error) => {
+                self.anota_ponto_ruim(format!("áudio móvel recusado: {error}")); None
+            }}
+        } else { match crate::audio::wav::parse(bytes) {
+            Ok(sound) => Some(sound),
+            Err(sem_wav) => match crate::audio::mp3::decode_detalhado(bytes) {
+                Ok(sound) => Some(sound),
+                // **O banco de amostras vem antes da tabela de timbres.** Quando ele existe, a
+                // partitura é tocada com as amostras de verdade, e o que a tabela não alcança (a
+                // razão de harmônicos das cordas e da distorção, a ressonância da bateria) passa a
+                // vir do banco. Sem banco, o caminho é o de sempre.
+                Err(porque) => match self.toca_com_banco(bytes) {
+                    Some(sound) => {
+                        self.assumptions.insert(concat!(
+                            "a música MIDI é tocada com o banco de amostras do aparelho, e não com ",
+                            "a tabela de timbres; o banco do console está no firmware que ainda não lemos"
+                        ));
+                        Some(sound)
+                    }
+                    None => match {
+                        let t_midi = std::time::Instant::now();
+                        let dec = crate::audio::midi::decode(bytes);
+                        if let Some(ref sound) = dec {
+                            let dur_s = sound.samples.len() as f64 / sound.rate.max(1) as f64;
+                            crate::registro!(
+                                crate::registro::Nivel::Informacao,
+                                "midi",
+                                "tabela de timbres: {} bytes de SMF -> {:.1}s de áudio sintetizados em {:.1}ms",
+                                bytes.len(),
+                                dur_s,
+                                t_midi.elapsed().as_secs_f64() * 1000.0
+                            );
+                            self.assumptions.insert(concat!(
+                                "a música MIDI é sintetizada aqui, com timbre aproximado — ",
+                                "o banco de instrumentos do console está no firmware que ainda não lemos"
+                            ));
+                        }
+                        dec
+                    } {
+                        Some(sound) => Some(sound),
+                        None => {
+                    // Dizer *qual* formato chegou é o que permite saber o que implementar
+                    // depois — e "não é um RIFF/WAVE" não diz. O que diz é a assinatura do
+                    // próprio bloco: é assim que se soube que a trilha do Tekken 2 é MP3 sem
+                    // abrir o jogo, e que a dos ports de arcade é MIDI.
+                    let formato = detect_mime(bytes, "").unwrap_or("formato desconhecido");
+                    // Os primeiros bytes vão no relatório junto do nome do formato: é o que
+                    // **identifica** o que chegou sem abrir o jogo. `FF FB` é quadro MP3, `ftyp`
+                    // é caixa MP4, `OggS` é Ogg — e a diferença entre eles decide o que
+                    // implementar. Sem isto, a linha dizia só "recusado", e a investigação
+                    // seguinte começava do zero, dentro do jogo.
+                    let assinatura: String = bytes
+                        .iter()
+                        .take(16)
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                        // **Os dois motivos**, e não só o do WAV: "não é um RIFF/WAVE" é
+                        // verdade e não ajuda — a pergunta é o que o decodificador de música
+                        // recusou. Foi vendo os dois que se descobriu o Ogg do Turma da Mônica.
+                        self.anota_ponto_ruim(format!(
+                            "som recusado ({formato}, {} bytes, {assinatura}): {sem_wav} / {porque}",
+                            bytes.len()
+                        ));
+                        None
+                    }
+                    },
+                },
+            },
+        }
+        };
+        let silencio_us = match som {
+            Some(_) => None,
+            None => crate::audio::mp3::probe(bytes).map(|mp3| mp3.duration_us()),
+        };
+        CargaDeMidia {
+            som: som.map(std::sync::Arc::new),
+            silencio_us,
+            cmf: bytes.starts_with(b"cmid"),
+        }
+    }
+
+    /// O som de um objeto `IMedia`, já lido na entrega.
+    pub(super) fn media_sound(
+        &mut self,
+        this: u32,
+    ) -> Result<Option<std::sync::Arc<crate::audio::wav::Sound>>, CpuError> {
+        Ok(self.carga_do(this).and_then(|carga| carga.som.clone()))
+    }
+
+    /// Quanto dura um som que não sabemos decodificar, quando dá para descobrir sem decodificar.
+    ///
+    /// Hoje só o MP3 cai aqui, pelo cabeçalho do primeiro quadro e pela etiqueta do codificador
+    /// — ver [`crate::audio::mp3`].
+    pub(super) fn media_silent_length(&mut self, this: u32) -> Result<Option<u64>, CpuError> {
+        Ok(self.carga_do(this).and_then(|carga| carga.silencio_us))
+    }
+
+    fn carga_do(&self, this: u32) -> Option<&CargaDeMidia> {
+        let carga = self.media.get(&this)?.carga;
+        self.cargas_de_midia.get(&carga)
+    }
+
+    /// Se o objeto tem um som tocando agora.
+    pub(super) fn esta_tocando(&self, this: u32) -> bool {
+        self.media
+            .get(&this)
+            .is_some_and(|state| state.state == MM_STATE_PLAY && self.now_us() < state.ends_us)
+    }
+
+    /// `int Play(IMedia *)`.
+    ///
+    /// **Um som entregue por memória é relido a cada `Play`.** O `IMedia` do aparelho não copia
+    /// o buffer: toca o que estiver lá. O Zeebo F.C. Super League tem um objeto só para os
+    /// efeitos da partida, com um buffer de 500 KB; ele escreve o chute, ou o passo, e manda
+    /// tocar de novo, sem outro `SetMediaParm`. Guardado da primeira leitura, todo efeito saía
+    /// com o som de seleção do menu, que foi o primeiro a passar por ali.
+    pub(super) fn media_play(&mut self, this: u32) -> Result<u32, CpuError> {
+        if self.fluxos_pcm.contains_key(&this) {
+            return self.inicia_fluxo(this);
+        }
+        // **Um `Play` sobre a música que já toca em laço não a recomeça.** O gerenciador de som
+        // dos Zeebo Extreme manda tocar a trilha da pista de novo toda vez que um efeito acaba —
+        // o turbo, a derrapagem —, e aqui a voz recomeçava do início: a música reiniciava a cada
+        // efeito. Recusar com `EBADSTATE` também não serve: ele entende que a música parou e
+        // repete o `Play` a cada quadro. O que ele espera é o `START`, que o passa a "tocando"; a
+        // voz segue de onde está. A regra fica restrita ao laço infinito: um efeito tocado de
+        // novo por cima de si mesmo é o que o Zeebo F.C. faz, e ele precisa recomeçar.
+        if self.esta_tocando(this) && self.media.get(&this).is_some_and(|state| state.repeat == 0)
+        {
+            self.notify_media(this, MM_CMD_PLAY, MM_STATUS_START)?;
+            return Ok(SUCCESS);
+        }
+        if let Some(state) = self.media.get_mut(&this)
+            && state.buffer.1 != 0
+        {
+            state.pendente = state.buffer;
+        }
+        // Um som ainda não lido começa quando for lido, na volta seguinte do laço. Para o jogo ele
+        // já está tocando.
+        if let Some(state) = self.media.get_mut(&this)
+            && state.pendente.1 != 0
+        {
+            state.tocar_ao_ler = true;
+            state.state = MM_STATE_PLAY;
+            state.ends_us = u64::MAX;
+            self.notify_media(this, MM_CMD_PLAY, MM_STATUS_START)?;
+            return Ok(SUCCESS);
+        }
+        self.inicia_reproducao(this, true)
+    }
+
+    /// Toca o som de um objeto **lendo o buffer do jogo enquanto toca**, quando o cabeçalho não
+    /// decide sozinho onde ele acaba. Devolve `false` para seguir pelo caminho de sempre.
+    ///
+    /// **A fala da Turma da Mônica é decodificada enquanto toca.** O jogo traz o próprio
+    /// decodificador Vorbis (o Tremor) e escreve cada fala, de até cinco segundos, num buffer de
+    /// 882.000 bytes cujo cabeçalho é de um molde: `RIFF` de 56.352 (0,638 s) e `data` do tamanho do
+    /// buffer. No `Play` só há uns 0,2 s decodificados; o resto chega cerca de 0,3 s à frente do
+    /// que toca, e o `RIFF` nunca muda — medido em trinta segundos de jogo. Lido de uma vez e
+    /// cortado no `RIFF`, o som durava 0,638 s, o `DONE` chegava, e o jogo **apagava o buffer e
+    /// parava de decodificar**: a fala morria no começo.
+    ///
+    /// Cortar no `data` não serve: no Zeebo F.C. Super League o `RIFF` está certo e o que vem
+    /// depois dele é lixo de memória, alto. O que separa os dois é o que o jogo faz **depois do
+    /// `Play`**: o som só cresce além do `RIFF` com o que for escrito ali depois de ele começar. O
+    /// lixo que já estava lá não conta.
+    fn abre_buffer_vivo(&mut self, this: u32) -> Result<bool, CpuError> {
+        self.buffers_vivos.remove(&this);
+        let Some(state) = self.media.get(&this).copied() else {
+            return Ok(false);
+        };
+        let (onde, tamanho) = state.buffer;
+        // Um som em laço volta ao começo, e aí não há "o que foi escrito depois": fica com o
+        // caminho de sempre.
+        if onde == 0 || tamanho == 0 || state.repeat != 1 {
+            return Ok(false);
+        }
+        let bytes = self.read_bytes(onde, tamanho)?;
+        let Some(aberto) = crate::audio::wav::pcm_aberto(&bytes) else {
+            return Ok(false);
+        };
+        let quadro = u32::from(aberto.channels) * u32::from(aberto.bits / 8);
+        let relativo = |n: usize| (n - aberto.inicio) as u32 / quadro * quadro;
+        let (fim, limite) = (relativo(aberto.fim_riff), relativo(aberto.fim_data));
+        let antes = aberto.inicio + fim as usize..aberto.inicio + limite as usize;
+        let now = self.now_us();
+        let vivo = BufferVivo {
+            pcm: onde + aberto.inicio as u32,
+            taxa: aberto.rate,
+            canais: aberto.channels,
+            bits: aberto.bits,
+            fim,
+            limite,
+            antes: bytes[antes].to_vec(),
+            base: fim,
+            inicio_us: now,
+            enviados: 0,
+            varrido_us: 0,
+        };
+        // Sem crescimento, acaba onde o `RIFF` diz, como antes: é o Super League.
+        let ends_us = now + vivo.duracao_us(fim);
+        let gain = state.gain();
+        if let Some(state) = self.media.get_mut(&this) {
+            state.state = MM_STATE_PLAY;
+            state.ends_us = ends_us;
+        }
+        if let Some(mixer) = &self.audio {
+            mixer.open_stream(this, vivo.taxa, vivo.canais, gain);
+        }
+        self.buffers_vivos.insert(this, vivo);
+        Ok(true)
+    }
+
+    /// Estende os buffers vivos com o que o jogo escreveu e entrega ao mixer o que o relógio já
+    /// deve. Ver [`Machine::abre_buffer_vivo`].
+    ///
+    /// **O fim do som é projetado, e não "quando o jogo parar".** A cada crescimento o `ends_us`
+    /// passa a ser o fim do que já foi escrito mais [`GRACA_DO_BUFFER_VIVO_US`]: é o que deixa o
+    /// `GetState` e o `DONE` funcionarem sem caminho próprio, e um save state carregado no meio da
+    /// fala — que não guarda este estado — ainda recebe o `DONE` na hora.
+    pub(super) fn bombeia_buffers_vivos(&mut self) -> Result<(), CpuError> {
+        if self.buffers_vivos.is_empty() {
+            return Ok(());
+        }
+        let now = self.now_us();
+        let ids: Vec<u32> = self.buffers_vivos.keys().copied().collect();
+        for this in ids {
+            match self.media.get(&this).map(|state| state.state) {
+                Some(MM_STATE_PLAY) => {}
+                Some(MM_STATE_PLAY_PAUSE) => continue,
+                _ => {
+                    self.buffers_vivos.remove(&this);
+                    continue;
+                }
+            }
+            let Some(mut vivo) = self.buffers_vivos.remove(&this) else {
+                continue;
+            };
+            let quadro = vivo.quadro();
+            // Varrer a cada volta do laço custava caro: o jogo dá milhares de voltas por segundo,
+            // e o Tremor escreve em pedaços de décimos de segundo.
+            if now >= vivo.varrido_us + INTERVALO_DE_VARREDURA_US && vivo.fim < vivo.limite {
+                vivo.varrido_us = now;
+                let janela = (vivo.taxa / 2 * quadro).max(quadro);
+                let ate = vivo.limite.min(vivo.fim.saturating_add(janela));
+                let agora = self.read_bytes(vivo.pcm + vivo.fim, ate - vivo.fim)?;
+                let de = (vivo.fim - vivo.base) as usize;
+                if let Some(escrito) = fim_escrito(&agora, &vivo.antes[de..de + agora.len()]) {
+                    vivo.fim = vivo
+                        .limite
+                        .min(vivo.fim + (escrito as u32).div_ceil(quadro) * quadro);
+                    let ends_us =
+                        vivo.inicio_us + vivo.duracao_us(vivo.fim) + GRACA_DO_BUFFER_VIVO_US;
+                    if let Some(state) = self.media.get_mut(&this) {
+                        state.ends_us = state.ends_us.max(ends_us);
+                    }
+                }
+            }
+            let devidos = (now.saturating_sub(vivo.inicio_us) + ADIANTE_DO_BUFFER_VIVO_US)
+                * u64::from(vivo.taxa)
+                / 1_000_000
+                * u64::from(quadro);
+            let alvo = u64::from(vivo.fim).min(devidos) as u32;
+            if alvo > vivo.enviados {
+                let bytes = self.read_bytes(vivo.pcm + vivo.enviados, alvo - vivo.enviados)?;
+                if let Some(mixer) = &self.audio {
+                    // PCM de 8 bits no WAVE é sem sinal; o de 16, com sinal.
+                    mixer.feed_stream(this, &pcm_para_f32(&bytes, vivo.bits, vivo.bits == 8));
+                }
+                vivo.enviados = alvo;
+            }
+            self.buffers_vivos.insert(this, vivo);
+        }
+        Ok(())
+    }
+
+    /// Começa a tocar o som já lido de um objeto.
+    fn inicia_reproducao(&mut self, this: u32, avisa: bool) -> Result<u32, CpuError> {
+        // O formato só fica conhecido na captura do buffer, inclusive gzip. Não herdar
+        // repetição de um WAV anterior, nem de uma configuração feita antes dos dados.
+        if self.handset_clock.is_some() && self.carga_do(this).is_some_and(|carga| carga.cmf) {
+            self.media.get_mut(&this).unwrap().repeat = 1;
+        }
+        if self.abre_buffer_vivo(this)? {
+            if avisa {
+                self.notify_media(this, MM_CMD_PLAY, MM_STATUS_START)?;
+            }
+            return Ok(SUCCESS);
+        }
+        if self.media.get(&this).is_some_and(|state| self.cargas_em_decodificacao.contains(&state.carga)) {
+            let state = self.media.entry(this).or_default();
+            state.tocar_ao_ler = true;
+            state.state = MM_STATE_PLAY;
+            state.ends_us = u64::MAX;
+            if avisa { self.notify_media(this,MM_CMD_PLAY,MM_STATUS_START)?; }
+            return Ok(SUCCESS);
+        }
+        // **Um `Play` sobre um som que ainda toca não avisa.** Avisar `DONE` aqui fazia um ciclo
+        // nos jogos que tocam de novo dentro do tratador do aviso: o novo `Play` caía sobre o som
+        // que acabara de começar, gerava outro aviso, e o som reiniciava a cada quadro — o áudio
+        // do Zeebo F.C. Super League saía estourado e picotado. O aviso de fim fica só no `Stop`
+        // e no fim natural.
+        let Some(sound) = self.media_sound(this)? else {
+            // Um som que não sabemos ler mas sabemos **cronometrar** toca em silêncio pelo
+            // tempo certo. Sem isso o Tekken 2 ficava preso: a música dele é MP3, o `Play`
+            // respondia "esse som já acabou", o jogo consultava o estado, via "pronto" e
+            // mandava tocar de novo — 766 mil vezes em quatro segundos virtuais, o que o
+            // deixava na lista de "lento demais" sem ter trabalho nenhum para fazer.
+            if let Some(length_us) = self.media_silent_length(this)? {
+                self.assumptions
+                    .insert("um som em formato que não decodificamos toca em silêncio, só com a duração certa");
+                let now = self.now_us();
+                let state = self.media.entry(this).or_default();
+                state.state = MM_STATE_PLAY;
+                state.ends_us = match state.repeat {
+                    0 => u64::MAX,
+                    times => now + length_us * u64::from(times),
+                };
+                if avisa {
+                    self.notify_media(this, MM_CMD_PLAY, MM_STATUS_START)?;
+                }
+                return Ok(SUCCESS);
+            }
+            // Sem som legível não há o que tocar, mas recusar faria o jogo tratar como erro
+            // grave; para ele, o som simplesmente acabou na hora.
+            if let Some(state) = self.media.get_mut(&this) {
+                state.state = MM_STATE_READY;
+            }
+            self.notify_media(this, MM_CMD_PLAY, MM_STATUS_DONE)?;
+            return Ok(SUCCESS);
+        };
+        // Quando o som acaba sai do **relógio virtual**, e não do mixer: um jogo que espera o
+        // aviso de fim para tocar o próximo precisa recebê-lo mesmo com o som desligado, ou
+        // emudece de vez depois do primeiro efeito.
+        let length_us = sound.frames() as u64 * 1_000_000 / u64::from(sound.rate.max(1));
+        let now = self.now_us();
+        let state = self.media.entry(this).or_default();
+        state.state = MM_STATE_PLAY;
+        state.ends_us = match state.repeat {
+            0 => u64::MAX,
+            times => now + length_us * u64::from(times),
+        };
+        let (gain, repeat) = (state.gain(), state.repeat);
+        if let Some(mixer) = &self.audio {
+            mixer.play(this, sound, gain, repeat);
+        }
+        if avisa {
+            self.notify_media(this, MM_CMD_PLAY, MM_STATUS_START)?;
+        }
+        Ok(SUCCESS)
+    }
+
+    /// Avisa o jogo de que um som começou ou chegou ao fim.
+    ///
+    /// O aviso é o que fecha o ciclo de quem toca uma coisa de cada vez: sem ele o jogo fica
+    /// esperando para sempre o efeito anterior terminar, e o som para depois do primeiro.
+    ///
+    /// **Todo aviso sai na volta do laço de eventos, e não na saída da chamada** — como no BREW,
+    /// que entrega pelo laço depois de o tratador do jogo devolver o controle. Três jogos
+    /// mediram as duas escolhas:
+    ///
+    /// - Os **Zeebo Extreme** marcam o som como "pedido" (2) *depois* do `Play`, e o `START` o
+    ///   passa a "tocando" (1). Entregue na saída do `Play`, o `START` chegava antes da marca e o
+    ///   som ficava em 2 para sempre; o `Stop` deles só age em 1, a música do menu nunca parava, e
+    ///   com a da pista na fila o tocador recusava todo efeito — o Bóia Cross corria só com a trilha.
+    /// - O **Double Dragon** repete a música pelo `DONE`: se o objeto ainda está marcado, agenda
+    ///   um `Play` para dali a 100 ms. Ele desmarca e solta o objeto logo depois do `Stop`. Com o
+    ///   `DONE` na saída do `Stop`, o tratador via o objeto ainda marcado, e o `Play` agendado caía
+    ///   num `IMedia` já liberado — endereço zero, ao apertar voltar.
+    /// - O **Zeebo F.C. Super League** também para e solta, e espera o `DONE` desse som. Por isso o
+    ///   aviso **não** some com o `Release`: o tratador é guardado quando o aviso nasce. Descartado
+    ///   junto com o objeto, a abertura parava na tela de aviso.
+    pub(super) fn notify_media(
+        &mut self,
+        this: u32,
+        cmd: u32,
+        status: u32,
+    ) -> Result<(), CpuError> {
+        if let Some(state) = self.media.get(&this)
+            && state.notify.function != 0
+        {
+            let (cmd,status) = if self.objects.kind_of(this) == Some(Interface::SoundPlayer) {
+                let status = if status == MM_STATUS_START { 1 } else if state.carga != 0
+                    && self.cargas_de_midia.get(&state.carga).is_some_and(|c| c.som.is_some() || c.silencio_us.is_some()) { 14 } else { 15 };
+                (MEDIA_LEGACY_COMMAND | 1,status)
+            } else { (cmd,status) };
+            self.avisos_de_midia.push((this, cmd, status, state.notify));
+        }
+        Ok(())
+    }
+
+    /// Entrega os avisos enfileirados, em ordem.
+    ///
+    /// O `AEEMediaCmdNotify` é escrito **na hora de cada chamada**, num bloco só: um `START` e um
+    /// `DONE` na mesma volta, escritos na entrada, diriam os dois `DONE`.
+    pub fn entrega_avisos_de_midia(&mut self, budget: u64) -> Result<Vec<Outcome>, CpuError> {
+        if self.avisos_de_midia.is_empty() || self.trecho_interrompido.is_some() {
+            return Ok(Vec::new());
+        }
+        if self.bloco_de_aviso_de_midia == 0 {
+            self.bloco_de_aviso_de_midia = self.heap.alloc(MEDIA_NOTIFY_LEN).unwrap_or(0);
+        }
+        let block = self.bloco_de_aviso_de_midia;
+        if block == 0 {
+            self.avisos_de_midia.clear();
+            return Ok(Vec::new());
+        }
+        let mut outcomes = Vec::new();
+        // Se há ISound no lote, qualquer callback anterior pode cancelar seu aviso.
+        // Conservar a cauda na fila visível até para um callback de IMedia/SoundPlayer.
+        let cancellable_sound_batch = self.avisos_de_midia.iter().any(|(owner, _, _, _)|
+            matches!(self.objects.kind_of(*owner), Some(Interface::Sound | Interface::SoundLegacy)));
+        let mut pending = std::mem::take(&mut self.avisos_de_midia).into_iter();
+        while let Some((this, cmd, status, notify)) = pending.next() {
+            let args = if cmd & MEDIA_NATIVE_SOUND_COMMAND != 0 {
+                let kind = cmd & 0xffff;
+                if kind == AEE_SOUND_VOLUME_CB { [notify.context, kind, AEE_SOUND_SUCCESS, status] }
+                else { [notify.context, kind, status, 0] }
+            } else if cmd & MEDIA_LEGACY_COMMAND != 0 {
+                if cmd & MEDIA_LEGACY_VALUE != 0 {
+                    // Notificações de consulta guardam o valor no campo status da fila;
+                    // o guest recebe SUCCESS e a união AEESoundPlayerCmdData estável.
+                    self.cpu.write_u32(block,status)?;
+                    [notify.context,cmd & 0xffff,1,block]
+                } else { [notify.context,cmd & 0xffff,status,0] }
+            } else {
+                // O bloco só muda quando o callback anterior já devolveu o controle.
+                for (index,value) in [0,this,cmd,0,status,0,0].into_iter().enumerate() {
+                    self.cpu.write_u32(block+index as u32*4,value)?;
+                }
+                [notify.context,block,0,0]
+            };
+            if cancellable_sound_batch {
+                // O callback pode liberar o som ou trocar seu registro. Devolver a cauda
+                // antes de chamá-lo conserva seu cancelamento; avisos novos ficam para a
+                // próxima volta, sem alterar o lote de IMedia.
+                let mut remaining: Vec<_> = pending.collect();
+                remaining.append(&mut self.avisos_de_midia);
+                self.avisos_de_midia = remaining;
+                outcomes.push(self.call_guest(notify.function, args, budget)?);
+                return Ok(outcomes);
+            }
+            let outcome = self.call_guest(notify.function,args,budget)?;
+            let incomplete = !matches!(outcome, Outcome::Returned { .. });
+            outcomes.push(outcome);
+            if incomplete {
+                // O callback ainda lê este bloco; o próximo aviso só pode reusá-lo no retorno.
+                let mut remaining: Vec<_> = pending.collect();
+                remaining.append(&mut self.avisos_de_midia);
+                self.avisos_de_midia = remaining;
+                break;
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Reconhece a entrega de um som que o jogo gera enquanto toca, e guarda o formato dele.
+    ///
+    /// O `AEEMediaDataEx` é `{ clsData, pData, dwSize, dwStructSize, dwCaps, bRaw, pSpec,
+    /// dwSpecSize, dwBufferSize }`, e o `AEEMediaWaveSpec` apontado por `pSpec` é `{ uint16
+    /// wSize; AEECLSID clsMedia; uint16 wChannels; uint32 dwSamplesPerSec; uint16
+    /// wBitsPerSample; boolean bUnsigned; uint32 dwAvgBytesPerSec; uint16 wBlockAlign }`. O
+    /// Caveman Ninja monta exatamente isso: 11025 Hz, mono, 16 bits.
+    ///
+    /// Devolve `false` quando a entrega não é essa, para seguir pelo caminho de memória e arquivo.
+    pub(super) fn le_fluxo_pcm(&mut self, this: u32, pointer: u32) -> Result<bool, CpuError> {
+        if pointer == 0 || self.cpu.read_u32(pointer)? != MMD_ISOURCE {
+            return Ok(false);
+        }
+        let fonte = self.cpu.read_u32(pointer + 4)?;
+        let bruto = self.cpu.read_u32(pointer + 20)? & 0xff != 0;
+        let spec = self.cpu.read_u32(pointer + 24)?;
+        if fonte == 0 || spec == 0 || !bruto {
+            self.anota_ponto_ruim("um som veio de um ISource sem ser PCM cru, e só sabemos tocar PCM".into());
+            return Ok(false);
+        }
+        let mut bytes = [0u8; 24];
+        self.cpu.read_mem(spec, &mut bytes)?;
+        let u16_em = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        let canais = u16_em(8);
+        let taxa = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let bits = u16_em(16);
+        let sem_sinal = bytes[18] != 0;
+        if canais == 0 || taxa == 0 || !matches!(bits, 8 | 16) {
+            self.anota_ponto_ruim(format!(
+                "PCM de {canais} canal(is), {taxa} Hz e {bits} bits, que não sabemos tocar"
+            ));
+            return Ok(false);
+        }
+        let por_quadro = u32::from(canais) * u32::from(bits / 8);
+        let bloco = match self.cpu.read_u32(pointer + 32)? {
+            b if b >= por_quadro && b <= MAX_LEITURA_PCM => b - b % por_quadro,
+            _ => 0,
+        };
+        self.fluxos_pcm.insert(
+            this,
+            FluxoPcm {
+                fonte,
+                taxa,
+                canais,
+                bits,
+                sem_sinal,
+                bloco,
+                inicio_us: 0,
+                quadros_lidos: 0,
+                tocando: false,
+                avisou_do_fim: false,
+            },
+        );
+        Ok(true)
+    }
+
+    /// `Play` de um fluxo: a partir daqui as amostras são pedidas ao jogo a cada volta do laço.
+    fn inicia_fluxo(&mut self, this: u32) -> Result<u32, CpuError> {
+        let now = self.now_us();
+        let state = self.media.entry(this).or_default();
+        state.state = MM_STATE_PLAY;
+        // Um fluxo não tem fim conhecido: acaba no `Stop`.
+        state.ends_us = u64::MAX;
+        let gain = state.gain();
+        let Some(fluxo) = self.fluxos_pcm.get_mut(&this) else {
+            return Ok(SUCCESS);
+        };
+        fluxo.inicio_us = now;
+        fluxo.quadros_lidos = 0;
+        fluxo.tocando = true;
+        let (taxa, canais) = (fluxo.taxa, fluxo.canais);
+        if let Some(mixer) = &self.audio {
+            mixer.open_stream(this, taxa, canais, gain);
+        }
+        self.notify_media(this, MM_CMD_PLAY, MM_STATUS_START)?;
+        Ok(SUCCESS)
+    }
+
+    /// Pede ao jogo as amostras que o relógio virtual já deve, e as manda para o mixer.
+    ///
+    /// Quem marca o ritmo é o **tempo virtual**, como no resto do som: sem placa o emulador
+    /// continua pedindo, e o jogo, que em geral emula o chip de som dentro do `Read`, anda do mesmo
+    /// jeito. Um décimo de segundo vai adiantado, para a placa não esvaziar entre duas voltas.
+    pub(super) fn bombeia_fluxos_pcm(&mut self, budget: u64) -> Result<Option<Outcome>, CpuError> {
+        if let Some(read) = self.leitura_pcm {
+            if let Some(code) = read.concluida {
+                self.leitura_pcm = None;
+                self.conclui_leitura_pcm(read, code)?;
+            }
+            // Sem isto cada conclusão dispara outro Read antes do timer do quadro;
+            // um gerador lento de áudio, como o do Raging Thunder 2, prende a corrida.
+            return Ok(None);
+        }
+        let mut tocando: Vec<u32> = self
+            .fluxos_pcm
+            .iter()
+            .filter(|(this, fluxo)| {
+                fluxo.tocando
+                    && self
+                        .media
+                        .get(this)
+                        .is_some_and(|state| state.state == MM_STATE_PLAY)
+            })
+            .map(|(this, _)| *this)
+            .collect();
+        if tocando.is_empty() {
+            return Ok(None);
+        }
+        if self.buffer_de_fluxo == 0 {
+            self.buffer_de_fluxo = self.heap.alloc(MAX_LEITURA_PCM).unwrap_or(0);
+            if self.buffer_de_fluxo == 0 {
+                return Ok(None);
+            }
+        }
+        let buffer = self.buffer_de_fluxo;
+        let now = self.now_us();
+        // Retomar não pode sempre favorecer a primeira chave do HashMap. O próximo
+        // gerador recebe sua vez mesmo quando o anterior ainda deve muitas amostras.
+        tocando.sort_unstable();
+        let next = tocando.partition_point(|id| *id <= self.ultima_pcm);
+        tocando.rotate_left(next);
+        for this in tocando {
+            let Some(fluxo) = self.fluxos_pcm.get(&this).copied() else {
+                continue;
+            };
+            let por_quadro = u32::from(fluxo.canais) * u32::from(fluxo.bits / 8);
+            let devidos = (now.saturating_sub(fluxo.inicio_us) + 100_000) * u64::from(fluxo.taxa)
+                / 1_000_000;
+            let mut faltam = devidos.saturating_sub(fluxo.quadros_lidos);
+            let Ok(vtable) = self.cpu.read_u32(fluxo.fonte) else {
+                continue;
+            };
+            let read = self.cpu.read_u32(vtable + ISOURCE_READ_SLOT * 4)?;
+            // Algumas leituras por volta bastam; um `Read` que devolve menos é o jogo sem
+            // amostras prontas, e insistir na mesma volta só gasta.
+            for _ in 0..8 {
+                if faltam == 0 {
+                    break;
+                }
+                // **Em blocos de `dwBufferSize`, como o BREW pede.** O mixer do Prey 2 Evil pede
+                // `n/4` bytes de ADPCM a cada voz e trata `4 × lidos < n` como fim do som: com os
+                // 734 bytes de 1/60 s a 22050 Hz, toda leitura ímpar de pares rebobinava a voz e
+                // um trecho de 33 ms tocava em laço. O Caveman Ninja declara 732 bytes, quase o
+                // que já se pedia; o Prey declara 6144.
+                let pedido = match fluxo.bloco {
+                    0 => (faltam * u64::from(por_quadro)).min(u64::from(MAX_LEITURA_PCM)) as u32,
+                    bloco => bloco,
+                };
+                let pedido = pedido - pedido % por_quadro;
+                if pedido == 0 {
+                    break;
+                }
+                let pending = LeituraPcm { media: this, fonte: fluxo.fonte, pedido,
+                    inicio_us: fluxo.inicio_us, concluida: None };
+                self.ultima_pcm = this;
+                let outcome = self.call_guest(read, [fluxo.fonte, buffer, pedido, 0], budget)?;
+                let code = match outcome {
+                    Outcome::Returned { code } => code,
+                    Outcome::Budget => {
+                        self.leitura_pcm = Some(pending);
+                        return Ok(Some(Outcome::Budget));
+                    }
+                    other => return Ok(Some(other)),
+                };
+                let lidos = self.conclui_leitura_pcm(pending, code)?;
+                if lidos == 0 { break; }
+                let quadros = u64::from(lidos / por_quadro);
+                faltam = faltam.saturating_sub(quadros);
+                if lidos < pedido {
+                    break;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn conclui_leitura_pcm(&mut self, read: LeituraPcm, code: u32) -> Result<u32, CpuError> {
+        let Some(fluxo) = self.fluxos_pcm.get(&read.media).copied() else { return Ok(0); };
+        // Stop, troca de fonte ou outro Play durante a suspensão invalidam o destino,
+        // mas não se deve abandonar a pilha do gerador ainda em execução.
+        if !fluxo.tocando || fluxo.fonte != read.fonte || fluxo.inicio_us != read.inicio_us
+            || !self.media.get(&read.media).is_some_and(|s| matches!(s.state, MM_STATE_PLAY | MM_STATE_PLAY_PAUSE)) {
+            return Ok(0);
+        }
+        if code as i32 <= 0 {
+            if let Some(fluxo) = self.fluxos_pcm.get_mut(&read.media) && !fluxo.avisou_do_fim {
+                fluxo.avisou_do_fim = true;
+                crate::registro!(crate::registro::Nivel::Informacao, "midia",
+                    "fluxo {}: o jogo parou de fornecer amostras em {:.2}s de áudio ({} Hz, {} canal(is), {} bits)",
+                    read.media, fluxo.quadros_lidos as f64 / f64::from(fluxo.taxa.max(1)),
+                    fluxo.taxa, fluxo.canais, fluxo.bits);
+            }
+            return Ok(0);
+        }
+        let lidos = code.min(read.pedido);
+        let bytes = self.read_bytes(self.buffer_de_fluxo, lidos)?;
+        let amostras = pcm_para_f32(&bytes, fluxo.bits, fluxo.sem_sinal);
+        if let Some(mixer) = &self.audio { mixer.feed_stream(read.media, &amostras); }
+        let por_quadro = u32::from(fluxo.canais) * u32::from(fluxo.bits / 8);
+        if let Some(fluxo) = self.fluxos_pcm.get_mut(&read.media) {
+            fluxo.quadros_lidos += u64::from(lidos / por_quadro);
+        }
+        Ok(lidos)
+    }
+
+    /// Põe o mixer de acordo com um save state recém-restaurado.
+    ///
+    /// **O mixer não entra no save state**, e o que ele tocava era do instante de antes do `Load`.
+    /// Sem isto, voltar no rewind deixava a música da cena seguinte tocando por cima da
+    /// restaurada — e para sempre, quando era um laço: o jogo restaurado não sabe que aquela voz
+    /// existe, e nunca a manda parar. Medido no Action Hero 3D.
+    ///
+    /// O que o estado diz que toca volta a tocar: um efeito, do ponto em que o relógio virtual o
+    /// deixou; um laço, do começo, porque o instante em que ele começou não fica guardado; um
+    /// fluxo, vazio, que o [`Machine::bombeia_fluxos_pcm`] volta a encher. Um som cujo cache não
+    /// está mais na memória — o estado veio de outra sessão — fica calado até o jogo tocá-lo de
+    /// novo, como já ficava. Os buffers vivos não voltam: ver [`Machine::bombeia_buffers_vivos`].
+    pub(super) fn refaz_o_som(&mut self) {
+        self.buffers_vivos.clear();
+        let Some(mixer) = self.audio.clone() else {
+            return;
+        };
+        mixer.para_tudo();
+        let agora = self.now_us();
+        let tocando: Vec<(u32, MediaState)> = self
+            .media
+            .iter()
+            .filter(|(_, state)| state.state == MM_STATE_PLAY && agora < state.ends_us)
+            .map(|(&this, &state)| (this, state))
+            .collect();
+        for (this, state) in tocando {
+            if let Some(fluxo) = self.fluxos_pcm.get(&this) {
+                if fluxo.tocando {
+                    mixer.open_stream(this, fluxo.taxa, fluxo.canais, state.gain());
+                }
+                continue;
+            }
+            let Some(som) = self.carga_do(this).and_then(|carga| carga.som.clone()) else {
+                continue;
+            };
+            let desde_us = match state.repeat {
+                0 => 0,
+                vezes => {
+                    let duracao_us = som.frames() as u64 * 1_000_000 / u64::from(som.rate.max(1));
+                    (duracao_us * u64::from(vezes)).saturating_sub(state.ends_us - agora)
+                }
+            };
+            mixer.play_desde(this, som, state.gain(), state.repeat, desde_us);
+        }
+    }
+
+    /// Enfileira o aviso de fim dos sons que já terminaram.
+    pub(super) fn poll_media(&mut self) -> Result<(), CpuError> {
+        let now = self.now_us();
+        let finished: Vec<u32> = self
+            .media
+            .iter()
+            .filter(|(_, state)| state.state == MM_STATE_PLAY && now >= state.ends_us)
+            .map(|(this, _)| *this)
+            .collect();
+        for this in finished {
+            if let Some(state) = self.media.get_mut(&this) {
+                state.state = MM_STATE_READY;
+                state.ends_us = 0;
+            }
+            self.notify_media(this, MM_CMD_PLAY, MM_STATUS_DONE)?;
+        }
+        Ok(())
+    }
+}
+
+/// Amostras PCM de 8 ou 16 bits, little-endian, para `f32` em [-1, 1].
+pub(super) fn pcm_para_f32(bytes: &[u8], bits: u16, sem_sinal: bool) -> Vec<f32> {
+    match bits {
+        8 => bytes
+            .iter()
+            .map(|&b| match sem_sinal {
+                true => (f32::from(b) - 128.0) / 128.0,
+                false => f32::from(b as i8) / 128.0,
+            })
+            .collect(),
+        _ => bytes
+            .chunks_exact(2)
+            .map(|c| {
+                let valor = u16::from_le_bytes([c[0], c[1]]);
+                match sem_sinal {
+                    true => (f32::from(valor) - 32768.0) / 32768.0,
+                    false => f32::from(valor as i16) / 32768.0,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Até onde `agora` difere de `antes`: o índice logo depois do último byte mudado, ou `None` se
+/// nada mudou.
+///
+/// É a **última** diferença, e não a primeira sequência mudada: uma fala tem pausas, e o silêncio
+/// que o decodificador escreve sobre um buffer zerado não muda nada. Parar na primeira igualdade
+/// seguraria o som no meio da pausa.
+fn fim_escrito(agora: &[u8], antes: &[u8]) -> Option<usize> {
+    agora
+        .iter()
+        .zip(antes)
+        .rposition(|(a, b)| a != b)
+        .map(|i| i + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fim_escrito;
+
+    #[test]
+    fn nada_escrito_nao_cresce() {
+        assert_eq!(fim_escrito(&[0, 7, 0], &[0, 7, 0]), None);
+    }
+
+    /// O lixo que já estava lá é o `antes`, e por isso não conta — é o Super League.
+    #[test]
+    fn so_conta_o_que_mudou() {
+        assert_eq!(fim_escrito(&[9, 9, 9, 9], &[9, 9, 9, 9]), None);
+        assert_eq!(fim_escrito(&[9, 1, 9, 9], &[9, 9, 9, 9]), Some(2));
+    }
+
+    /// Uma pausa na fala escrita sobre zeros não para o crescimento.
+    #[test]
+    fn uma_pausa_no_meio_nao_segura_o_fim() {
+        let antes = [0u8; 8];
+        let agora = [5, 5, 0, 0, 0, 5, 0, 0];
+        assert_eq!(fim_escrito(&agora, &antes), Some(6));
+    }
+}

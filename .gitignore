@@ -1,0 +1,83 @@
+# ROMs / conteúdo de jogos — nunca versionar
+roms/
+
+# Material de terceiros espelhado (docs Qualcomm/Zeebo, SDKs, dumps de firmware, clones)
+docs/vendor/
+
+# Build
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# macOS / editores
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Rust
+/target/
+/.tools/
+/local-tests/
+/third-party/dynarmic/.cargo-ok
+**/__pycache__/
+*.pyc
+# O cxx-qt-build escreve a configuração do servidor de linguagem QML com o caminho desta máquina.
+.qmlls.ini
+
+# Saídas de depuração do `run` (--dump-heap) e o framebuffer exportado
+heap.bin
+module.bin
+*.bmp
+
+# Servidores privados vivem em repositórios próprios, ao lado deste.
+zeeboids-server/
+OperaMini-Server/
+
+# Material do console (firmware, configs, pacotes do sistema) fica fora do repositório.
+vendor/
+
+# Relatórios que o emulador escreve ao lado do executável, um por execução.
+*.log
+*.bmp
+.nodeterm/project.json
+ref z-wheel2.png
+
+# Android: o Gradle e o `.so` copiado pelo `cargo-ndk` são saída de build, não fonte.
+frontends/android/apk/.gradle/
+frontends/android/apk/app/build/
+frontends/android/apk/build/
+frontends/android/apk/local.properties
+frontends/android/apk/app/src/main/jniLibs/
+frontends/android/apk/app/src/main/assets/licenses/
+frontends/switch/saida/
+
+# Xcode: estado local. O projeto em si (`project.pbxproj`) fica versionado.
+xcuserdata/
+*.xcuserstate
+
+# Wiki do GitHub: repositório próprio (zeebx-emu.wiki.git), clonado aqui só para edição.
+/wiki/
+
+# Arquivos privados e saídas de publicação locais.
+.env
+.env.*
+!.env.example
+*.apk
+*.aab
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+local.properties
+/dist/
+/release-files/
+# O único ZIP em fontes é um fixture sintético de migração, sem código de jogo.
+*.zip
+!frontends/handset-probe/tests/fixtures/save-migration.zip

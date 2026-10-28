@@ -1,0 +1,21 @@
+[submodule "externals/fmt"]
+	path = externals/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "externals/catch"]
+	path = externals/catch
+	url = https://github.com/catchorg/Catch2.git
+[submodule "externals/biscuit"]
+	path = externals/biscuit
+	url = https://github.com/lioncash/biscuit.git
+[submodule "externals/robin-map"]
+	path = externals/robin-map
+	url = https://github.com/Tessil/robin-map.git
+[submodule "externals/xbyak"]
+	path = externals/xbyak
+	url = https://github.com/herumi/xbyak.git
+[submodule "externals/zydis"]
+	path = externals/zydis
+	url = https://github.com/zyantific/zydis.git
+[submodule "externals/oaknut"]
+	path = externals/oaknut
+	url = https://github.com/merryhime/oaknut.git

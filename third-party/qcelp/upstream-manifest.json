@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/FFmpeg/FFmpeg",
+  "commit": "140fd653aed8cad774f991ba083e2d01e86420c7",
+  "tag": "n8.0",
+  "license": "LGPL-2.1-or-later",
+  "files_sha256": {
+    "acelp_filters.c": "76ca40088881beb95fd3e8daa48573f1467c22997ee45f95f844c00c351b3c6e",
+    "acelp_vectors.c": "9be033654ee8f0be7f6f84cb543d66f7949dfa3870ab1337c12aba8996251084",
+    "celp_filters.c": "035c9e82711c0ddaa8c7bcbba3125a1244b54abed71ff601ee7aefc6688d15b0",
+    "float_dsp.c": "59e0e5bdf112629652f678eabe565f886fc50a30bf6469e907b53defa53c8b1e",
+    "lsp.c": "1f9028c8796b5a59fbb996c184611913cbe52c5375df273e0288712f0465397c",
+    "qcelpdata.h": "dfb8ce5b048bff07955855d708bb16239a219b0bdb59c8c43027daa2a46ff135",
+    "qcelpdec.c": "0d1d5cb19742c410bf8651c088d6ba455482799aa68ad9174b84ce1806614fee"
+  }
+}

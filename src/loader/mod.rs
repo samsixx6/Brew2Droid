@@ -1,0 +1,439 @@
+//! Monta o ambiente de execução de um módulo BREW e chama `AEEMod_Load`.
+//!
+//! O linker script oficial (`elf2mod.x`) fixa `ro-base = 0x0`, então mapear a imagem no
+//! endereço 0 do guest deixa todos os endereços absolutos corretos e dispensa relocação.
+//!
+//! Assinatura do ponto de entrada, de `sdk/inc/AEEModGen.h` do BREW SDK 4.0.2:
+//!
+//! ```c
+//! int AEEMod_Load(IShell *ps, void *ph, IModule **pMod);
+//! ```
+
+pub mod archive;
+pub mod sete_z;
+pub mod miffile;
+pub mod modfile;
+pub mod resfile;
+
+use crate::brew::aee::{self, Interface};
+use crate::cpu::CpuError;
+use crate::cpu::mem::{GuestMemory, MemError};
+use crate::loader::modfile::ModImage;
+
+/// Onde a imagem do módulo é carregada.
+///
+/// O linker script fixa `ro-base = 0`, mas o módulo **não** pode ficar no endereço 0: o stub
+/// que o `elf2mod` coloca no início calcula a própria base por aritmética relativa ao PC e
+/// depois lê duas palavras **antes** dela (`ldr r0, [r1, #-8]` e `[r1, #-4]`, com `r1` = base).
+/// O carregador do AEE, portanto, reserva um prefixo antes da imagem. Como o stub é
+/// position-independent, qualquer base serve — desde que exista memória válida logo abaixo.
+pub const MODULE_BASE: u32 = 0x0001_0000;
+/// Tamanho do prefixo reservado antes da imagem, para as palavras que o stub lê em offsets
+/// negativos. Uma página é folga de sobra.
+pub const MODULE_PREFIX: u32 = 0x1000;
+/// Espaço zerado reservado depois da imagem, para a `.bss` do módulo.
+///
+/// O `.mod` guarda só as seções com conteúdo; a `.bss` existe em tempo de execução e não no
+/// arquivo. Enquanto não soubermos ler o tamanho real dela do cabeçalho, reservamos uma folga
+/// generosa — sobrar memória zerada é inofensivo.
+pub const MODULE_BSS_SLACK: usize = 1024 * 1024;
+/// Heap do módulo — onde `MALLOC` vai servir.
+///
+/// 64 MB porque o Quake mede a memória livre antes de carregar os `.pak` e desiste com
+/// "Not enough free memory" se ela for pequena. O console tem 128 MB de RAM
+/// (`docs/01-hardware.md`), e o tamanho aqui é escolha nossa — só precisa ser folgado o bastante
+/// para o jogo reconhecer o aparelho.
+///
+/// **Medido em 22/09/2026, e o número ficou:** dobrar para 128 MB não move a Z-Wheel. Ela aloca
+/// ~64 MiB no próprio pool (o `memcheck` dela imprime `Free(67001392)`, o mesmo número nos dois
+/// tamanhos) e depois pede **o total que sobra** — 67 001 488 com 64 MB, 134 110 352 com 128 MB.
+/// O pedido acompanha o heap em vez de ser uma necessidade dele, então aumentar o heap só move o
+/// alvo. O que ficou dessa medição é a contabilidade honesta de "quanto há livre": ver
+/// [`crate::brew::heap::Heap::maior_bloco`].
+pub const HEAP_BASE: u32 = 0x1000_0000;
+pub const HEAP_SIZE: usize = 64 * 1024 * 1024;
+/// Pilha. `sp` começa no topo porque a pilha do ARM cresce para baixo.
+pub const STACK_BASE: u32 = 0x2000_0000;
+pub const STACK_SIZE: usize = 1024 * 1024;
+/// Objetos que o emulador expõe ao guest — cada um começa com o ponteiro de vtable.
+///
+/// Quatro megabytes dão 65.536 objetos, e o número não é capricho: com 64 KB eram **mil e vinte
+/// e quatro**, e a Z-Wheel os esgotava numa execução. Depois disso tudo falha ao mesmo tempo —
+/// `Couldn't open DB: 3`, `Unable to create vector model`, formulários com erro 3 — e nenhum
+/// desses sintomas se parece com a causa.
+///
+/// Mil e vinte e quatro era limite **nosso**, não do console: lá os objetos saem do heap do
+/// BREW, que tem dezenas de megabytes. A região é zerada e só ocupa o que for tocado, então a
+/// folga não custa memória de verdade.
+///
+/// Isso **não** dispensa consertar quem vaza. Mas um teto de mil objetos transforma qualquer
+/// vazamento pequeno numa falha em cascata, e falha em cascata esconde a causa.
+pub const OBJECT_BASE: u32 = 0x3000_0000;
+pub const OBJECT_SIZE: usize = 4 * 1024 * 1024;
+/// Memória dos pixels das superfícies.
+///
+/// Precisa ficar no espaço do guest porque o `IDIB` entrega ao jogo o ponteiro do buffer para
+/// ele desenhar direto — é assim que os jogos comerciais escrevem na tela.
+pub const SURFACE_BASE: u32 = 0x4000_0000;
+pub const SURFACE_SIZE: usize = 8 * 1024 * 1024;
+
+/// Onde os módulos de **extensão** são mapeados.
+///
+/// Um módulo de extensão é um `.mod` como qualquer outro: mesma imagem linkada em base zero,
+/// mesmo `AEEMod_Load`, mesmas duas palavras de helper logo antes da base. O que muda é quem o
+/// chama — o console o carrega quando um jogo pede uma classe que ele fornece, e não porque o
+/// usuário abriu um título.
+///
+/// Mapeá-los na carga, e não na hora do pedido, é decisão de simplicidade: o núcleo não tem
+/// API de mapear região depois do `reset`, e os módulos são pequenos (90 KB e 164 KB nos dois
+/// pacotes que temos). O que fica para a hora do pedido é **chamar** o `AEEMod_Load`.
+pub const EXT_MODULE_BASE: u32 = 0x0800_0000;
+/// Distância entre duas extensões. Tem de caber a imagem, o prefixo e a `.bss`.
+pub const EXT_MODULE_SPACING: u32 = 0x0100_0000;
+/// Quantas extensões cabem antes de encostar no heap do guest, em `0x10000000`.
+pub const MAX_EXTENSIONS: usize = 8;
+
+/// Tabela de helpers da stdlib do BREW.
+///
+/// Módulos dinâmicos não linkam contra libc: eles chamam `MALLOC`, `STRLEN` e companhia por
+/// uma tabela de ponteiros de função que o carregador entrega. O código gerado faz
+/// `ldr r1, [r0, #<offset>]` seguido de `bx r1`, onde `r0` é o ponteiro dessa tabela — o mesmo
+/// padrão aparece em `helloworld.mod` e em `tectoy.mod`, byte a byte.
+///
+/// Preenchemos cada entrada com um endereço-trampolim, então qualquer helper usado aparece
+/// como `AEEHelpers::slot[n]` no log em vez de saltar para o vazio.
+pub const HELPERS_BASE: u32 = 0x3100_0000;
+/// Quantos ponteiros a tabela expõe. `struct AEEHelperFuncs` tem 117 campos; arredondamos
+/// para cima para o caso de alguma build do Zeebo ter alguns a mais no fim.
+const HELPERS_SLOTS: u32 = 256;
+
+/// Trechos de código ARM que o emulador escreve para o guest executar.
+///
+/// Servem os helpers que devolvem sempre a mesma coisa. Atender um deles pelo trampolim custa
+/// parar e religar o núcleo ARM, e o `GetAppInstance` sozinho responde por mais da metade das
+/// chamadas de API do Quake — os jogos do BREW guardam os globais dentro do applet, então
+/// cada acesso a um global passa por ele. Como código, a chamada nem sai da CPU.
+pub const STUB_BASE: u32 = 0x3200_0000;
+pub const STUB_SIZE: usize = 0x1000;
+
+/// Vtables: memória de leitura cujos slots apontam para a faixa-trampolim.
+pub const VTABLE_BASE: u32 = 0xe000_0000;
+/// `AEESTDLIB_VER` do SDK, lida pelo módulo via `GET_HELPER_VER()`.
+/// O valor é 0x00010000: módulos que verificam essa ABI recusam 1 com
+/// `EVERSIONNOTSUPPORT` antes de chamar qualquer helper.
+const HELPER_VERSION: u32 = 0x0001_0000;
+
+/// Quantos slots reservamos por vtable. Nenhuma interface do BREW chega perto disso.
+const SLOTS_PER_VTABLE: u32 = 256;
+/// Interfaces cujos objetos são criados já na carga.
+const BOOT_INTERFACES: [Interface; 2] = [Interface::Shell, Interface::Module];
+
+/// Um módulo de extensão a mapear junto com o principal.
+pub struct ExtensionImage {
+    pub image: ModImage,
+    /// As classes que o `.mif` dele declara fornecer.
+    pub classes: Vec<u32>,
+}
+
+/// Um módulo de extensão já mapeado, à espera do primeiro pedido.
+pub struct LoadedExtension {
+    /// Endereço do `AEEMod_Load` dele.
+    pub entry: u32,
+    /// Onde ele deve gravar o `IModule*` que criar.
+    pub out_module: u32,
+    pub classes: Vec<u32>,
+}
+
+/// Um módulo pronto para executar.
+pub struct LoadedModule {
+    pub mem: GuestMemory,
+    /// Endereço de `AEEMod_Load` no espaço do guest.
+    pub entry: u32,
+    /// Ponteiro para o `IShell` que passamos em `r0`.
+    pub shell: u32,
+    /// Ponteiro de helpers que passamos em `r1`.
+    pub helpers: u32,
+    /// Onde `AEEMod_Load` deve gravar o `IModule*` que criar.
+    pub out_module: u32,
+    /// Os módulos de extensão do pacote, já mapeados e ainda não carregados.
+    pub extensions: Vec<LoadedExtension>,
+}
+
+impl LoadedModule {
+    /// Onde a área de objetos pode começar sem pisar nos ponteiros que o carregador reservou.
+    ///
+    /// São as duas palavras do módulo principal — o `IModule*` e a saída do applet — mais duas
+    /// por extensão. Calcular isto aqui, e não no chamador, é o que evita a colisão silenciosa:
+    /// o `ObjectStore` começava logo depois das duas primeiras e passava por cima das outras.
+    pub fn objects_reserved(&self) -> u32 {
+        self.out_module + 8 + 8 * self.extensions.len() as u32 - OBJECT_BASE
+    }
+}
+
+#[derive(Debug)]
+pub enum LoadError {
+    Memory(MemError),
+    Cpu(CpuError),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(e) => write!(f, "{e}"),
+            Self::Cpu(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+impl From<MemError> for LoadError {
+    fn from(e: MemError) -> Self {
+        Self::Memory(e)
+    }
+}
+
+impl From<CpuError> for LoadError {
+    fn from(e: CpuError) -> Self {
+        Self::Cpu(e)
+    }
+}
+
+/// Monta o mapa de memória com o módulo, pilha, heap, vtables e objetos iniciais.
+///
+/// É o caso de quem não tem módulo de extensão nenhum — os testes e quem carrega um `.mod`
+/// solto, sem o pacote em volta.
+#[cfg(test)]
+pub fn load(image: &ModImage) -> Result<LoadedModule, LoadError> {
+    load_with(image, &[])
+}
+
+/// O mesmo, mapeando também os módulos de extensão do pacote.
+pub fn load_with(
+    image: &ModImage,
+    extensoes: &[ExtensionImage],
+) -> Result<LoadedModule, LoadError> {
+    let mut mem = GuestMemory::new();
+    // A região do módulo é gravável: a imagem carrega a `.data`, que o código altera. Ela
+    // começa antes de `MODULE_BASE` para acomodar o prefixo lido pelo stub do elf2mod.
+    let mut module_bytes = vec![0u8; MODULE_PREFIX as usize];
+    module_bytes.extend_from_slice(image.image());
+    module_bytes.resize(module_bytes.len() + MODULE_BSS_SLACK, 0);
+    mem.map("module", MODULE_BASE - MODULE_PREFIX, module_bytes, true)?;
+    // **A página nula se lê, e dá zero.** No console não há proteção de memória, e o que
+    // mora nos endereços baixos é legível: um jogo que lê por um ponteiro nulo recebe algum
+    // valor e segue. O Aviãozinho, um port do Quake feito por fãs, faz isso ao carregar a
+    // primeira fase: o mapa tem uma textura faltando, a textura de reserva do motor nunca é
+    // criada, e o nome dela é lido do endereço zero. Parando a execução ali, o jogo não
+    // passava do menu. Escrever continua sendo erro, e executar também: um salto para o
+    // endereço zero é defeito que o relatório precisa mostrar, e não código a percorrer.
+    mem.map_com_execucao(
+        "nulo",
+        0,
+        vec![0u8; (MODULE_BASE - MODULE_PREFIX) as usize],
+        false,
+        false,
+    )?;
+    mem.map_zeroed("heap", HEAP_BASE, HEAP_SIZE)?;
+    mem.map_zeroed("stack", STACK_BASE, STACK_SIZE)?;
+    mem.map_zeroed("objects", OBJECT_BASE, OBJECT_SIZE)?;
+    // A tabela de helpers precisa ser gravável: o `GetAppInstance` troca de trampolim para
+    // código assim que passa a ter uma resposta fixa.
+    mem.map("helpers", HELPERS_BASE, build_helper_table(), true)?;
+    mem.map_zeroed("stubs", STUB_BASE, STUB_SIZE)?;
+    mem.map_zeroed("surfaces", SURFACE_BASE, SURFACE_SIZE)?;
+    mem.map("vtables", VTABLE_BASE, build_vtables(), false)?;
+
+    // Cada objeto ocupa uma palavra só por enquanto: o ponteiro para a vtable.
+    let shell = OBJECT_BASE;
+    mem.write_u32(shell, vtable_addr(Interface::Shell))?;
+
+    // Espaço para o `IModule*` de saída, logo depois dos objetos iniciais.
+    let out_module = OBJECT_BASE + 4 * BOOT_INTERFACES.len() as u32;
+    mem.write_u32(out_module, 0)?;
+
+    let helpers = HELPERS_BASE;
+    // O `AEEStdLib.h` do SDK define exatamente estes dois campos antes da base do módulo:
+    //   GET_HELPER()     = *((AEEHelperFuncs **)AEEMod_Load - 1)   -> base - 4
+    //   GET_HELPER_VER() = *(uint32 *)(AEEMod_Load - 4 - 4)        -> base - 8
+    mem.write_u32(MODULE_BASE - 8, HELPER_VERSION)?;
+    mem.write_u32(MODULE_BASE - 4, helpers)?;
+
+    // Cada extensão ganha uma região própria e duas palavras de saída na área de objetos,
+    // logo depois das do módulo principal.
+    let mut extensions = Vec::new();
+    for (i, extensao) in extensoes.iter().take(MAX_EXTENSIONS).enumerate() {
+        let base = EXT_MODULE_BASE + i as u32 * EXT_MODULE_SPACING;
+        let mut bytes = vec![0u8; MODULE_PREFIX as usize];
+        bytes.extend_from_slice(extensao.image.image());
+        bytes.resize(bytes.len() + MODULE_BSS_SLACK, 0);
+        mem.map(
+            EXT_REGION_NAMES[i],
+            base - MODULE_PREFIX,
+            bytes,
+            true,
+        )?;
+        // As mesmas duas palavras que o `AEEStdLib.h` lê antes da base do módulo. Sem elas a
+        // extensão acha a tabela de helpers em zero e morre na primeira chamada de `MALLOC`.
+        mem.write_u32(base - 8, HELPER_VERSION)?;
+        mem.write_u32(base - 4, helpers)?;
+        // Duas palavras por extensão: o `IModule*` dela e a saída do `CreateInstance`. Elas
+        // começam depois das duas do módulo principal — `out_module` e a do applet.
+        let out_module = OBJECT_BASE + 4 * (BOOT_INTERFACES.len() as u32 + 2) + 8 * i as u32;
+        mem.write_u32(out_module, 0)?;
+        mem.write_u32(out_module + 4, 0)?;
+        extensions.push(LoadedExtension {
+            entry: base + extensao.image.entry(),
+            out_module,
+            classes: extensao.classes.clone(),
+        });
+    }
+
+    Ok(LoadedModule {
+        mem,
+        entry: MODULE_BASE + image.entry(),
+        shell,
+        helpers,
+        out_module,
+        extensions,
+    })
+}
+
+/// Nomes das regiões das extensões. O `GuestMemory::map` pede nome, e um nome por índice deixa
+/// o mapa impresso pelo `run` legível — `ext0`, `ext1`, e não oito vezes `ext`.
+const EXT_REGION_NAMES: [&str; MAX_EXTENSIONS] = [
+    "ext0", "ext1", "ext2", "ext3", "ext4", "ext5", "ext6", "ext7",
+];
+
+/// Gera a tabela de helpers: cada entrada é o trampolim do helper correspondente.
+fn build_helper_table() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HELPERS_SLOTS as usize * 4);
+    for slot in 0..HELPERS_SLOTS {
+        bytes.extend_from_slice(&aee::encode(Interface::Helpers, slot).to_le_bytes());
+    }
+    bytes
+}
+
+/// Endereço da vtable de uma interface.
+pub fn vtable_addr(iface: Interface) -> u32 {
+    VTABLE_BASE + (iface as u32) * SLOTS_PER_VTABLE * 4
+}
+
+/// Gera todas as vtables: cada slot contém o endereço-trampolim do método correspondente.
+fn build_vtables() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    // Percorre a lista canônica, que é indexada pelo valor do enum — o mesmo índice que
+    // `vtable_addr` usa para calcular o endereço.
+    for iface in Interface::ALL {
+        for slot in 0..SLOTS_PER_VTABLE {
+            bytes.extend_from_slice(&aee::encode(iface, slot).to_le_bytes());
+        }
+    }
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::{BackendPadrao, CpuBackend, Reg, StopReason, RETURN_MAGIC};
+
+    fn module_checking_stdlib_version() -> ModImage {
+        // Spider-Man e Splinter Cell recusam a carga antes da primeira API quando
+        // GET_HELPER_VER() difere de AEESTDLIB_VER, definido no SDK como 0x00010000.
+        let words = [
+            0xe24f_3008u32, // sub r3, pc, #8: base deste módulo, inclusive em extensão
+            0xe513_3008,    // ldr r3, [r3, #-8]: GET_HELPER_VER()
+            0xe353_0b40,    // cmp r3, #0x00010000
+            0x13a0_0004,    // movne r0, #4: EVERSIONNOTSUPPORT
+            0x03a0_0000,    // moveq r0, #0: SUCCESS
+            0xe12f_ff1e,    // bx lr
+        ];
+        ModImage::parse(words.into_iter().flat_map(u32::to_le_bytes).collect()).unwrap()
+    }
+
+    fn guest_module_load_code(module: &LoadedModule, entry: u32) -> u32 {
+        let mut cpu = BackendPadrao::new().unwrap();
+        cpu.reset(&module.mem).unwrap();
+        cpu.write_reg(Reg::R0, module.shell);
+        cpu.write_reg(Reg::R1, module.helpers);
+        cpu.write_reg(Reg::R2, module.out_module);
+        cpu.write_reg(Reg::Lr, RETURN_MAGIC);
+        assert_eq!(cpu.run(entry, 100).unwrap(), StopReason::Returned);
+        cpu.read_reg(Reg::R0)
+    }
+
+    #[test]
+    fn modulo_aceita_a_versao_da_stdlib_no_prefixo() {
+        let module = load(&module_checking_stdlib_version()).unwrap();
+        assert_eq!(guest_module_load_code(&module, module.entry), 0);
+    }
+
+    #[test]
+    fn extensao_aceita_a_versao_da_stdlib_no_proprio_prefixo() {
+        let module = load_with(
+            &module_checking_stdlib_version(),
+            &[ExtensionImage {
+                image: module_checking_stdlib_version(),
+                classes: vec![],
+            }],
+        )
+        .unwrap();
+        assert_eq!(guest_module_load_code(&module, module.extensions[0].entry), 0);
+    }
+
+    /// Módulo sintético: `AEEMod_Load` chama o slot 3 de `IShell` a partir do ponteiro em r0.
+    ///
+    /// ```asm
+    /// ldr r3, [r0]        ; r3 = vtable do shell
+    /// ldr r3, [r3, #12]   ; r3 = slot 3
+    /// bx  r3
+    /// ```
+    fn module_calling_shell_slot3() -> ModImage {
+        let code = [
+            0xe590_3000u32.to_le_bytes(),
+            0xe593_300cu32.to_le_bytes(),
+            0xe12f_ff13u32.to_le_bytes(),
+        ]
+        .concat();
+        ModImage::parse(code).unwrap()
+    }
+
+    #[test]
+    fn mapa_de_memoria_tem_as_regioes_esperadas() {
+        let module = load(&module_calling_shell_slot3()).unwrap();
+        let names: Vec<_> = module.mem.regions().iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                "module", "nulo", "heap", "stack", "objects", "helpers", "stubs", "surfaces", "vtables"
+            ]
+        );
+    }
+
+    #[test]
+    fn cada_interface_tem_a_propria_vtable_no_lugar_certo() {
+        let module = load(&module_calling_shell_slot3()).unwrap();
+        for iface in Interface::ALL {
+            let addr = vtable_addr(iface);
+            let first = module.mem.read_u32(addr).unwrap();
+            assert_eq!(
+                aee::decode(first),
+                Some((iface, 0)),
+                "a vtable de {} não aponta para os trampolins dela",
+                iface.name()
+            );
+        }
+    }
+
+    #[test]
+    fn shell_aponta_para_a_propria_vtable() {
+        let module = load(&module_calling_shell_slot3()).unwrap();
+        let vtable = module.mem.read_u32(module.shell).unwrap();
+        assert_eq!(vtable, vtable_addr(Interface::Shell));
+        // O slot 0 da vtable do shell é o trampolim do slot 0.
+        assert_eq!(
+            module.mem.read_u32(vtable).unwrap(),
+            aee::encode(Interface::Shell, 0)
+        );
+    }
+}

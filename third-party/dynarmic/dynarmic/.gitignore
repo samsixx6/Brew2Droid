@@ -1,0 +1,9 @@
+# Built files
+build/
+build-*/
+cmake-build-*/
+.idea/
+docs/Doxygen/
+# System files
+.DS_Store
+.vscode

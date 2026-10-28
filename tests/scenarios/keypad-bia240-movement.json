@@ -1,0 +1,172 @@
+[
+  {
+    "step": 1250,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 1251,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 1700,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 1701,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 2100,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 2101,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 2400,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 2401,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 2800,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 2801,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 3100,
+    "key": "select",
+    "down": true
+  },
+  {
+    "step": 3101,
+    "key": "select",
+    "down": false
+  },
+  {
+    "step": 3300,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3301,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3315,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3316,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3330,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3331,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3345,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3346,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3360,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3361,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3375,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3376,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3390,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3391,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3405,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3406,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3420,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3421,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3435,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 3436,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 3470,
+    "key": "up",
+    "down": true
+  },
+  {
+    "step": 3570,
+    "key": "up",
+    "down": false
+  }
+]

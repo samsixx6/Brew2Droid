@@ -1,0 +1,102 @@
+[
+  {
+    "step": 600,
+    "key": "5",
+    "down": true
+  },
+  {
+    "step": 605,
+    "key": "5",
+    "down": false
+  },
+  {
+    "step": 950,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 951,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 1250,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 1251,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 1400,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 1401,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 1550,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 1551,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 1850,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 1851,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 2000,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 2001,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 2400,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 2401,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 2460,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 2461,
+    "key": "soft2",
+    "down": false
+  },
+  {
+    "step": 2520,
+    "key": "soft2",
+    "down": true
+  },
+  {
+    "step": 2521,
+    "key": "soft2",
+    "down": false
+  }
+]

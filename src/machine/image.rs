@@ -1,0 +1,884 @@
+//! IImage e IImageDecoder: decodificar o que o jogo traz e desenhar na tela.
+
+use super::*;
+
+impl<C: CpuBackend> Machine<C> {
+    /// `IImageDecoder` e o `IForceFeed` que o alimenta.
+    ///
+    /// O jogo cria o decodificador, pede a ele a interface de entrada, escreve o arquivo em
+    /// pedaços, fecha com uma escrita vazia e busca o bitmap. É o caminho que o Heavy Weapon, o
+    /// Tork and Kral e o Peggle usam para as imagens deles.
+    pub(super) fn decoder_call(
+        &mut self,
+        iface: Interface,
+        slot: u32,
+    ) -> Result<Option<u32>, CpuError> {
+        let Some(name) = iface.method(slot) else {
+            return Ok(None);
+        };
+        let this = self.cpu.read_reg(Reg::R0);
+        let (a1, a2) = (self.cpu.read_reg(Reg::R1), self.cpu.read_reg(Reg::R2));
+        // Um `IForceFeed` trabalha sempre sobre o decodificador que o criou.
+        let decoder = match iface {
+            Interface::ForceFeed => self.feeds.get(&this).copied().unwrap_or(0),
+            _ => this,
+        };
+        let result = match (iface, name) {
+            (_, "AddRef") => self.objects.add_ref(this),
+            (_, "Release") => {
+                let remaining = self.objects.release(this);
+                if remaining == 0 {
+                    self.feeds.remove(&this);
+                    self.decoders.remove(&this);
+                }
+                remaining
+            }
+            (_, "QueryInterface") => {
+                if a2 == 0 {
+                    return Ok(Some(EBADPARM));
+                }
+                match a1 {
+                    AEEIID_FORCEFEED => {
+                        let feed = self.new_object(Interface::ForceFeed)?;
+                        if feed == 0 {
+                            return Ok(Some(ENOMEMORY));
+                        }
+                        self.feeds.insert(feed, decoder);
+                        self.cpu.write_u32(a2, feed)?;
+                        SUCCESS
+                    }
+                    _ => {
+                        self.unknown_classes.insert(a1);
+                        self.cpu.write_u32(a2, 0)?;
+                        ECLASSNOTSUPPORT
+                    }
+                }
+            }
+            // int Write(IForceFeed *, void *pBuf, int cb)
+            //
+            // Escrita vazia é o fim do arquivo — é assim que o exemplo do SDK fecha a entrega.
+            // Nada a fazer aqui: a decodificação acontece no `GetBitmap`, e adiantá-la só
+            // gastaria trabalho se o jogo desistisse no meio.
+            (Interface::ForceFeed, "Write") => {
+                // O tamanho é do jogo: conferido **antes** de alocar e **antes** de acumular, ou um
+                // pedido absurdo aborta o processo em vez de virar erro de API. O teto do que já
+                // foi entregue é conferido no mesmo passo: antes o excesso era detectado depois de
+                // a memória já estar gasta.
+                let count = tamanho_do_guest(a2 as usize)?;
+                if a1 != 0 && count > 0 {
+                    let ja_entregue = self
+                        .decoders
+                        .get(&decoder)
+                        .map_or(0, |state| state.fed.len());
+                    if ja_entregue + count > MAX_DECODED_INPUT {
+                        return Err(CpuError(format!(
+                            "entrega de imagem passaria de {MAX_DECODED_INPUT} bytes: {ja_entregue} + {count}"
+                        )));
+                    }
+                    let mut bytes = vec![0u8; count];
+                    self.cpu.read_mem(a1, &mut bytes)?;
+                    let state = self.decoders.entry(decoder).or_default();
+                    if state.fed.len() + count <= MAX_DECODED_INPUT {
+                        state.fed.extend_from_slice(&bytes);
+                    }
+                }
+                SUCCESS
+            }
+            (Interface::ForceFeed, "Reset") => {
+                self.decoders.remove(&decoder);
+                SUCCESS
+            }
+            // int GetBitmap(IImageDecoder *, IBitmap **ppiBitmap)
+            (Interface::ImageDecoder, "GetBitmap") => {
+                let bitmap = self.decoded_bitmap(decoder)?;
+                if a1 != 0 {
+                    self.cpu.write_u32(a1, bitmap)?;
+                }
+                match bitmap {
+                    0 => EFAILED,
+                    _ => SUCCESS,
+                }
+            }
+            // int GetRop(IImageDecoder *) — com o que desenhar o bitmap devolvido.
+            (Interface::ImageDecoder, "GetRop") => {
+                self.decoded_bitmap(decoder)?;
+                match self.decoders.get(&decoder).is_some_and(|d| d.transparent) {
+                    true => AEE_RO_TRANSPARENT,
+                    false => AEE_RO_COPY,
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(result))
+    }
+
+    /// O bitmap de um decodificador, decodificando na primeira vez que é pedido.
+    pub(super) fn decoded_bitmap(&mut self, decoder: u32) -> Result<u32, CpuError> {
+        if let Some(state) = self.decoders.get(&decoder) {
+            if let Some(bitmap) = state.bitmap {
+                return Ok(bitmap);
+            }
+        }
+        let Some(fed) = self.decoders.get(&decoder).map(|d| d.fed.clone()) else {
+            return Ok(0);
+        };
+        let Some(image) = decode_imagem(&fed) else {
+            // A hipótese nomeia o que o decodificador **não** reconheceu, e não mais "não é um
+            // PNG": ele passou a tentar pelo menos três formatos pela assinatura.
+            self.assumptions.insert(concat!(
+                "um decodificador recebeu dados que não são PNG, BMP nem JPEG"
+            ));
+            return Ok(0);
+        };
+        let addr = self.bitmap_from_decoded(&image)?;
+        if addr == 0 {
+            return Ok(0);
+        }
+        self.publica_dib_do_png(addr, &fed)?;
+        let transparent = self.transparency.contains_key(&addr);
+        if let Some(state) = self.decoders.get_mut(&decoder) {
+            state.bitmap = Some(addr);
+            state.transparent = transparent;
+        }
+        Ok(addr)
+    }
+
+    /// Publica o `IDIB` de um bitmap do decodificador no formato do PNG: 24 bits por pixel em
+    /// RGB, ou 32 em RGBA quando a imagem tem alfa, linhas contíguas e sem enchimento.
+    ///
+    /// É o que o decodificador do BREW entrega, e o Alien Breaker Deluxe prova pelo uso: ele lê o
+    /// `nDepth`, trata 8 bits como paleta e, fora isso, copia `nDepth / 8` bytes por pixel direto
+    /// para uma textura `GL_RGB` (3) ou `GL_RGBA`. Com o nosso RGB565 ele copiava dois bytes por
+    /// pixel achando que eram quatro, e os logos saíam como quadrados brancos.
+    ///
+    /// O `nColorScheme` do RGBA também é 888, e não `IDIB_COLORSCHEME_NONE`: no `AEEIDIB.h` o
+    /// zero quer dizer **paleta**. O `BltIn` do Bejeweled Twist (0x139d8) decide por ele — zero
+    /// vai para a conversão de 8 bits indexados, 24 vai para a de truecolor, que olha o `nDepth`
+    /// e só com 32 cria a superfície de alfa. Publicado com zero, o RGBA era lido como índices de
+    /// paleta, a superfície de origem saía sem formato e o blit caía num ponteiro nulo.
+    ///
+    /// A nossa cópia em RGB565 continua no mapa de superfícies para os blits; este buffer não
+    /// entra na sincronização.
+    pub(super) fn publica_dib_do_png(&mut self, bitmap: u32, png: &[u8]) -> Result<(), CpuError> {
+        let Some((largura, altura, canais, mut bytes)) = decode_dib_bytes(png) else {
+            return Ok(());
+        };
+        // **Azul no primeiro byte.** O 888 do BREW é `0x00RRGGBB` em little-endian, e o jogo que
+        // sobe o DIB para o GL troca os canais por conta própria. O Peggle faz isso: com R,G,B
+        // aqui, a troca dele deixava o logo azul e o céu cor-de-rosa em vez de laranja e roxo.
+        for pixel in bytes.chunks_exact_mut(canais) {
+            pixel.swap(0, 2);
+        }
+        // Um buffer publicado antes por outro caminho não serve mais: o formato é outro.
+        self.solta_dib(bitmap);
+        let Some((buffer, capacidade)) = self.reserva_superficie(bytes.len() as u32) else {
+            return Ok(());
+        };
+        self.cpu.write_mem(buffer, &bytes)?;
+        self.dib_do_decodificador
+            .insert(bitmap, (buffer, capacidade));
+        let passo = largura as usize * canais;
+        let profundidade = if canais == 4 { 32u8 } else { 24u8 };
+        let esquema = IDIB_COLORSCHEME_888;
+        self.cpu.write_u32(bitmap + 4, 0)?; // pPaletteMap
+        self.cpu.write_u32(bitmap + 8, buffer)?; // pBmp
+        self.cpu.write_u32(bitmap + 12, 0)?; // pRGB
+        self.cpu
+            .write_u32(bitmap + 16, to_rgbval(Rgb::from_rgb565(TRANSPARENT_KEY)))?; // ncTransparent
+        self.cpu
+            .write_mem(bitmap + 20, &(largura as u16).to_le_bytes())?;
+        self.cpu
+            .write_mem(bitmap + 22, &(altura as u16).to_le_bytes())?;
+        self.cpu
+            .write_mem(bitmap + 24, &(passo as i16).to_le_bytes())?;
+        self.cpu.write_mem(bitmap + 26, &0u16.to_le_bytes())?; // cntRGB
+        self.cpu.write_mem(bitmap + 28, &[profundidade, esquema])?;
+        self.cpu.write_mem(bitmap + 30, &[0u8; 6])?;
+        Ok(())
+    }
+
+    /// Um `IBitmap` com a imagem já decodificada dentro.
+    ///
+    /// Sai com os campos públicos do `IDIB` preenchidos, porque um `IBitmap` de software do
+    /// BREW é um `IDIB` e o jogo lê esses campos sem pedir a interface.
+    pub(super) fn bitmap_from_decoded(&mut self, image: &DecodedImage) -> Result<u32, CpuError> {
+        let addr = self.new_object(Interface::Bitmap)?;
+        if addr == 0 {
+            return Ok(0);
+        }
+        let mut surface = Framebuffer::new(image.width, image.height);
+        let mut transparent = false;
+        for row in 0..image.height {
+            for column in 0..image.width {
+                let index = (row * image.width + column) as usize;
+                let opaque = image.opaque.get(index).copied().unwrap_or(true);
+                transparent |= !opaque;
+                // Sem canal alfa no destino, o transparente vira a cor reservada — é como o
+                // BREW resolve, e é o que o `GetRop` anuncia ao jogo em seguida.
+                let pixel = match (opaque, image.pixels.get(index)) {
+                    (true, Some(&pixel)) => pixel,
+                    _ => TRANSPARENT_KEY,
+                };
+                surface.set_pixel_native(column as i32, row as i32, pixel);
+            }
+        }
+        self.bitmaps.insert(addr, surface);
+        if transparent {
+            self.transparency.insert(addr, TRANSPARENT_KEY);
+        }
+        self.expose_dib(addr)?;
+        Ok(addr)
+    }
+
+    /// O RGB565 descarta os índices que FIFA 07 altera diretamente no pRGB do IDIB.
+    /// Manter o BMP indexado permite que a paleta pública continue sendo a fonte da verdade.
+    pub(super) fn publica_bmp_indexado(
+        &mut self,
+        bitmap: u32,
+        bytes: &[u8],
+    ) -> Result<bool, CpuError> {
+        let u16at = |at: usize| {
+            bytes
+                .get(at..at + 2)
+                .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+        };
+        let u32at = |at: usize| {
+            bytes
+                .get(at..at + 4)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        };
+        if bytes.get(..2) != Some(b"BM")
+            || u32at(14).is_none_or(|n| n < 40)
+            || u32at(30) != Some(0)
+            || u16at(26) != Some(1)
+        {
+            return Ok(false);
+        }
+        let depth = u16at(28).unwrap_or(0) as u8;
+        if !matches!(depth, 1 | 2 | 4 | 8) {
+            return Ok(false);
+        }
+        let width = u32at(18).unwrap_or(0) as i32;
+        let signed_height = u32at(22).unwrap_or(0) as i32;
+        if width <= 0 || width > u16::MAX as i32 || signed_height == i32::MIN {
+            return Ok(false);
+        }
+        let height = signed_height.unsigned_abs();
+        if height == 0 || height > u16::MAX as u32 {
+            return Ok(false);
+        }
+        let pitch = (width as u32 * u32::from(depth)).div_ceil(32) * 4;
+        if pitch > i16::MAX as u32 {
+            return Ok(false);
+        }
+        let palette = 14 + u32at(14).unwrap() as usize;
+        let count = match u32at(46).unwrap_or(0) {
+            0 => 1u32 << depth,
+            n => n,
+        };
+        let offset = u32at(10).unwrap_or(0) as usize;
+        let pixels = pitch as usize * height as usize;
+        if count > 1u32 << depth
+            || palette + count as usize * 4 > offset
+            || offset
+                .checked_add(pixels)
+                .is_none_or(|end| end > bytes.len())
+        {
+            return Ok(false);
+        }
+        let total = pixels + count as usize * 4;
+        let Some((buffer, capacity)) = self.reserva_superficie(total as u32) else {
+            return Ok(false);
+        };
+        for y in 0..height as usize {
+            let row = if signed_height > 0 {
+                height as usize - 1 - y
+            } else {
+                y
+            };
+            self.cpu.write_mem(
+                buffer + y as u32 * pitch,
+                &bytes[offset + row * pitch as usize..offset + (row + 1) * pitch as usize],
+            )?;
+        }
+        let colors = &bytes[palette..palette + count as usize * 4];
+        self.cpu.write_mem(buffer + pixels as u32, colors)?;
+        self.solta_dib(bitmap);
+        self.bitmaps.remove(&bitmap);
+        self.dib_do_decodificador.insert(bitmap, (buffer, capacity));
+        self.cpu.write_mem(bitmap + 4, &[0; 32])?;
+        self.cpu.write_u32(bitmap + 8, buffer)?;
+        self.cpu.write_u32(bitmap + 12, buffer + pixels as u32)?;
+        let transparent = colors
+            .chunks_exact(4)
+            .position(|c| c[..3] == [255, 0, 255])
+            .map_or(u32::MAX, |n| n as u32);
+        self.cpu.write_u32(bitmap + 16, transparent)?;
+        self.cpu
+            .write_mem(bitmap + 20, &(width as u16).to_le_bytes())?;
+        self.cpu
+            .write_mem(bitmap + 22, &(height as u16).to_le_bytes())?;
+        self.cpu
+            .write_mem(bitmap + 24, &(pitch as i16).to_le_bytes())?;
+        self.cpu
+            .write_mem(bitmap + 26, &(count as u16).to_le_bytes())?;
+        self.cpu.write_mem(bitmap + 28, &[depth, 0])?;
+        Ok(true)
+    }
+
+    /// Decodifica a imagem em `buffer` no formato nativo do perfil em execução.
+    ///
+    /// O contrato moderno entrega IBitmap. O OEM antigo identificado em Pandora entrega
+    /// pixels RGB565 editáveis pelo jogo, liberados por SYSFREE e apresentados pelo IDisplay.
+    ///
+    /// O tamanho do bloco não vem por parâmetro: quem diz quanto ler é o cabeçalho da própria
+    /// imagem, e por ora só o BMP — que é o que os jogos passam — declara o seu.
+    pub(super) fn setup_native_image(
+        &mut self,
+        buffer: u32,
+        info: u32,
+        realloc: u32,
+    ) -> Result<u32, CpuError> {
+        if realloc != 0 {
+            // A imagem sai numa alocação nossa, e é isso que este sinalizador informa.
+            self.cpu.write_mem(realloc, &[1])?;
+        }
+        let Some(len) = self.encoded_image_len(buffer)? else {
+            return Ok(0);
+        };
+        let mut bytes = vec![0u8; len];
+        self.cpu.read_mem(buffer, &mut bytes)?;
+        let Ok(image) = crate::video::icon::decode(&bytes) else {
+            self.assumptions
+                .insert("uma imagem nativa veio num formato que não sabemos ler");
+            return Ok(0);
+        };
+
+        let (width, height) = (image.width as u32, image.height as u32);
+        if self.bitmap_nativo_565 && (width > u16::MAX as u32 || height > u16::MAX as u32) {
+            return Ok(0);
+        }
+        let mut fb = Framebuffer::new(width, height);
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let at = (y * image.width + x) * 4;
+                let color = Rgb {
+                    r: image.rgba[at],
+                    g: image.rgba[at + 1],
+                    b: image.rgba[at + 2],
+                };
+                fb.set_pixel_native(x as i32, y as i32, color.to_rgb565());
+            }
+        }
+        let addr = if self.bitmap_nativo_565 {
+            let Some(size) = width
+                .checked_mul(height)
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_add(bitmap::PREFIXO_NATIVO_565))
+            else {
+                return Ok(0);
+            };
+            let pixels = self.malloc(size)?;
+            if pixels == 0 {
+                return Ok(0);
+            }
+            // O contrato OEM antigo devolve pixels que o jogo pode substituir. Dimensões
+            // ficam no mapa já persistido, sem varrer todos os rasters a cada chamada.
+            self.cpu
+                .write_mem(pixels, &[0; bitmap::PREFIXO_NATIVO_565 as usize])?;
+            self.cpu
+                .write_mem(pixels + bitmap::PREFIXO_NATIVO_565, &fb.to_rgb565_bytes())?;
+            pixels
+        } else {
+            let Some(size) = (fb.passo_do_dib() as u32).checked_mul(height).and_then(|n| n.checked_add(64)) else {
+                return Ok(0);
+            };
+            let bitmap = self.malloc(size)?;
+            if bitmap == 0 { return Ok(0); }
+            // Blockbreaker mede pBmp - IBitmap e guarda em uint16. O layout real é
+            // contíguo; separar objetos e rasters em regiões distantes fazia esse offset
+            // truncar e as leituras do pacote sobrescreverem outros objetos.
+            self.objects.adopt(bitmap, Interface::Bitmap);
+            self.cpu.write_u32(bitmap, loader::vtable_addr(Interface::Bitmap))?;
+            self.converted_bitmap_blocks.insert(bitmap);
+            self.dib_buffers.insert(bitmap, bitmap + 64);
+            self.cpu.watch_dirty(bitmap, bitmap + 64, size - 64)?;
+            bitmap
+        };
+        self.bitmaps.insert(addr, fb);
+        if self.converted_bitmap_blocks.contains(&addr) {
+            self.sync_to_guest(addr)?;
+            self.write_dib_header(addr)?;
+        }
+
+        if info != 0 {
+            let (cx, cy) = (width as u16, height as u16);
+            self.cpu.write_mem(info, &cx.to_le_bytes())?;
+            self.cpu.write_mem(info + 2, &cy.to_le_bytes())?;
+            // `nColors` é zero para quem tem mais de 65535 cores, e `bAnimated` é falso.
+            self.cpu.write_mem(info + 4, &[0u8; 4])?;
+            self.cpu.write_mem(info + 8, &cx.to_le_bytes())?;
+        }
+        Ok(addr)
+    }
+
+    /// Quanto ler de um bloco de imagem, pelo cabeçalho dela.
+    pub(super) fn encoded_image_len(&self, buffer: u32) -> Result<Option<usize>, CpuError> {
+        if buffer == 0 {
+            return Ok(None);
+        }
+        let mut header = [0u8; 6];
+        self.cpu.read_mem(buffer, &mut header)?;
+        // O BMP declara o tamanho do arquivo na palavra seguinte à assinatura.
+        if &header[0..2] != b"BM" {
+            return Ok(None);
+        }
+        let mut size = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+        if let Some(allocated) = self.heap.size_of(buffer) {
+            if allocated < 54 {
+                return Ok(None);
+            }
+            let mut bmp = [0; 54];
+            self.cpu.read_mem(buffer, &mut bmp)?;
+            let width = i32::from_le_bytes(bmp[18..22].try_into().unwrap());
+            let height = i32::from_le_bytes(bmp[22..26].try_into().unwrap()).unsigned_abs();
+            let depth = u16::from_le_bytes(bmp[28..30].try_into().unwrap());
+            let compression = u32::from_le_bytes(bmp[30..34].try_into().unwrap());
+            if width > 0
+                && height > 0
+                && matches!(depth, 1 | 4 | 8 | 16 | 24 | 32)
+                && matches!(compression, 0 | 3)
+            {
+                let stride = (width as u64 * u64::from(depth) + 31) / 32 * 4;
+                let offset = u32::from_le_bytes(bmp[10..14].try_into().unwrap());
+                let needed = u64::from(offset) + stride * u64::from(height);
+                // Downhill Ski também reconstrói BMPs de dimensões distintas mantendo
+                // o bfSize do modelo. O formato nativo de saída não muda este contrato.
+                // As dimensões dão o limite real: nunca lemos a alocação vizinha,
+                // nem exigimos bytes depois de um raster já completo e válido.
+                if needed > u64::from(allocated) || needed > MAX_NATIVE_IMAGE as u64 {
+                    return Ok(None);
+                }
+                size = needed as usize;
+            } else if size > allocated as usize {
+                return Ok(None);
+            }
+        }
+        Ok((size > 0 && size <= MAX_NATIVE_IMAGE).then_some(size))
+    }
+
+    pub(super) fn release_image(&mut self, image: u32) -> u32 {
+        let remaining = self.objects.release(image);
+        if remaining == 0 {
+            self.images.remove(&image);
+            self.image_bitmaps.remove(&image);
+            self.recortes_de_imagem.remove(&image);
+            // O endereço volta a ser de outro objeto, que não pode herdar o callback.
+            self.image_notify.remove(&image);
+            self.avisos_de_imagem.retain(|&imagem| imagem != image);
+            if let Some(info) = self.image_info.remove(&image) {
+                self.heap.free(info);
+            }
+        }
+        remaining
+    }
+
+    /// `IImage` sobre o decodificador de PNG (`AEECLSID_PNG` = `0x01004004`), de
+    /// `inc/AEEIImage.h`.
+    ///
+    /// O jogo alimenta a imagem com um `IMemAStream` (`SetStream`), lê as dimensões com
+    /// `GetInfo` e desenha com `Draw`. A decodificação em si é PNG padrão — não há nada de
+    /// proprietário aqui, ao contrário do que os bytes de alta entropia do `resources.dat`
+    /// sugeriam à primeira vista.
+    pub(super) fn image_call(&mut self, slot: u32) -> Result<Option<u32>, CpuError> {
+        let Some(name) = Interface::Image.method(slot) else {
+            return Ok(None);
+        };
+        let this = self.cpu.read_reg(Reg::R0);
+        let (a1, a2, a3) = (
+            self.cpu.read_reg(Reg::R1),
+            self.cpu.read_reg(Reg::R2),
+            self.cpu.read_reg(Reg::R3),
+        );
+        let result = match name {
+            "AddRef" => self.objects.add_ref(this),
+            "Release" => self.release_image(this),
+            // void SetStream(IImage *, IAStream *ps) — consome o stream inteiro de uma vez.
+            "SetStream" => {
+                self.decode_image(this, a1)?;
+                SUCCESS
+            }
+            // void GetInfo(IImage *, AEEImageInfo *pi): cx, cy, nColors (uint16), bAnimated
+            // (boolean) e cxFrame (uint16).
+            "GetInfo" => {
+                let (cx, cy, frame) = match self.images.get(&this) {
+                    Some(image) => (image.width as u16, image.height as u16, image.frame_width),
+                    None => (0, 0, 0),
+                };
+                if a1 != 0 {
+                    self.cpu.write_mem(a1, &cx.to_le_bytes())?;
+                    self.cpu.write_mem(a1 + 2, &cy.to_le_bytes())?;
+                    // `nColors` é zero para imagens com mais de 65535 cores, que é o caso.
+                    self.cpu.write_mem(a1 + 4, &0u16.to_le_bytes())?;
+                    self.cpu.write_mem(a1 + 6, &[0u8, 0])?;
+                    self.cpu.write_mem(a1 + 8, &frame.to_le_bytes())?;
+                }
+                SUCCESS
+            }
+            // void SetParm(IImage *, int nParm, int p1, int p2)
+            "SetParm" => {
+                self.image_set_parm(this, a1, a2, a3)?;
+                SUCCESS
+            }
+            "Draw" => {
+                self.draw_image(this, a1 as i32, a2 as i32, None)?;
+                SUCCESS
+            }
+            // void DrawFrame(IImage *, int nFrame, int x, int y)
+            "DrawFrame" => {
+                self.draw_image(this, a2 as i32, a3 as i32, Some(a1))?;
+                SUCCESS
+            }
+            // Sem animação, `Start` é um `Draw` e `Stop` não tem o que parar.
+            "Start" => {
+                self.draw_image(this, a1 as i32, a2 as i32, None)?;
+                SUCCESS
+            }
+            "Stop" | "HandleEvent" => SUCCESS,
+            // void Notify(IImage *, PFNIMAGEINFO pfn, void *pUser)
+            //
+            "Notify" => {
+                if a1 != 0 {
+                    self.image_notify.insert(
+                        this,
+                        Callback {
+                            function: a1,
+                            context: a2,
+                        },
+                    );
+                    // Uma imagem vinda do `LoadResObject` já está pronta quando o jogo
+                    // registra o callback: a notificação é imediata, não fica esperando
+                    // stream nenhum.
+                    if self.images.contains_key(&this) {
+                        self.notify_image(this)?;
+                    }
+                } else {
+                    // Sem função, o `Notify` cancela: o aviso que ainda estava na fila não sai.
+                    self.image_notify.remove(&this);
+                    self.avisos_de_imagem.retain(|&imagem| imagem != this);
+                }
+                SUCCESS
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(result))
+    }
+
+    /// Lê o stream inteiro e decodifica a imagem, seja qual for o formato dela.
+    pub(super) fn decode_image(&mut self, image: u32, stream: u32) -> Result<(), CpuError> {
+        let Some(source) = self.streams.get(&stream).copied() else {
+            return Ok(());
+        };
+        let bytes = self.read_bytes(source.buffer, source.size)?;
+        match decodifica_imagem(&bytes) {
+            Some(decoded) => {
+                self.images.insert(image, std::rc::Rc::new(decoded));
+            }
+            None => {
+                self.assumptions
+                    .insert("uma imagem do jogo foi recusada pelo decodificador");
+            }
+        }
+        self.notify_image(image)
+    }
+
+    /// Enfileira o `PFNIMAGEINFO(pUser, IImage *, AEEImageInfo *, int nErr)` da imagem.
+    ///
+    /// A imagem já está pronta quando o stream chega — não há decodificação em segundo plano
+    /// aqui —, mas o jogo espera a notificação para seguir carregando.
+    ///
+    /// **O aviso sai na volta do laço de eventos, e não na saída do `SetStream`** — como no
+    /// BREW, que entrega pelo laço depois de o tratador do jogo devolver o controle. O Bejeweled
+    /// Twist conta com essa ordem: registra o `Notify`, chama `SetStream` e, ainda no mesmo
+    /// tratador, pede o `GetInfo` e guarda o tamanho no objeto que espelha a imagem (0x68010).
+    /// Só no aviso ele desenha a imagem na superfície e a espelha (0x7c530), com a largura
+    /// guardada. Entregue na saída do `SetStream`, o aviso chegava antes do `GetInfo`: os 81
+    /// espelhos feitos até o menu rodavam com largura zero, e toda meia-peça da interface — a ponta
+    /// direita dos botões, a metade direita dos anéis do menu — aparecia sem espelhar, igual à
+    /// esquerda.
+    ///
+    /// **A fila guarda só a imagem; o aviso é montado na entrega.** Até lá o jogo pode soltar a
+    /// imagem ou trocar o callback, e no BREW soltar a imagem cancela o aviso. Guardar o aviso
+    /// pronto entregava ao tratador um objeto morto e o `AEEImageInfo` que o `Release` já tinha
+    /// devolvido ao heap: no Bejeweled Twist, apertar "Jogar" levava o jogo a um ponteiro de
+    /// lixo, e ele parava lendo 0x006f0092 em 0x1c780.
+    pub(super) fn notify_image(&mut self, image: u32) -> Result<(), CpuError> {
+        if self.image_notify.contains_key(&image) && !self.avisos_de_imagem.contains(&image) {
+            self.avisos_de_imagem.push(image);
+        }
+        Ok(())
+    }
+
+    /// Entrega o aviso de uma imagem da fila, se ela ainda tem quem o espere.
+    pub(super) fn entrega_aviso_de_imagem(
+        &mut self,
+        image: u32,
+        budget: u64,
+    ) -> Result<Option<Outcome>, CpuError> {
+        let Some(&callback) = self.image_notify.get(&image) else {
+            return Ok(None);
+        };
+        let decoded = self.images.get(&image).cloned();
+        // `AEEImageInfo` tem 10 bytes; alocamos 12 para manter o alinhamento. Um bloco por
+        // imagem, reaproveitado a cada aviso e devolvido no `Release`: um bloco novo por aviso
+        // nunca voltava ao heap.
+        let info = match self.image_info.get(&image) {
+            Some(&info) => info,
+            None => {
+                let info = self.heap.alloc(12).unwrap_or(0);
+                if info != 0 {
+                    self.image_info.insert(image, info);
+                }
+                info
+            }
+        };
+        if info != 0 {
+            self.cpu.write_mem(info, &[0u8; 12])?;
+            if let Some(image) = &decoded {
+                self.cpu
+                    .write_mem(info, &(image.width as u16).to_le_bytes())?;
+                self.cpu
+                    .write_mem(info + 2, &(image.height as u16).to_le_bytes())?;
+                self.cpu
+                    .write_mem(info + 8, &image.frame_width.to_le_bytes())?;
+            }
+        }
+        let error = if decoded.is_some() { SUCCESS } else { EFAILED };
+        let outcome = self.call_guest(
+            callback.function,
+            [callback.context, image, info, error],
+            budget,
+        )?;
+        Ok(Some(outcome))
+    }
+
+    /// `IPARM_*` de `inc/AEEIImage.h`. Só respondemos aos que mudam o desenho.
+    pub(super) fn image_set_parm(
+        &mut self,
+        image: u32,
+        parm: u32,
+        p1: u32,
+        p2: u32,
+    ) -> Result<(), CpuError> {
+        match parm {
+            IPARM_SIZE => {
+                self.recortes_de_imagem.entry(image).or_default().tamanho =
+                    Some((p1 as i32, p2 as i32));
+            }
+            IPARM_OFFSET => {
+                let recorte = self.recortes_de_imagem.entry(image).or_default();
+                recorte.x = p1 as i32;
+                recorte.y = p2 as i32;
+            }
+            IPARM_ROP => {
+                self.recortes_de_imagem
+                    .entry(image)
+                    .or_default()
+                    .transparente = p1 == AEE_RO_TRANSPARENT;
+            }
+            IPARM_CXFRAME => {
+                if let Some(info) = self.images.get_mut(&image) {
+                    std::rc::Rc::make_mut(info).frame_width = p1 as u16;
+                }
+            }
+            IPARM_NFRAMES => {
+                if let Some(info) = self.images.get_mut(&image) {
+                    let frames = (p1 as u16).max(1);
+                    let width = info.width as u16;
+                    std::rc::Rc::make_mut(info).frame_width = width / frames;
+                }
+            }
+            // p1 = ponteiro para receber o `IBitmap *`, p2 = ponteiro para o código de retorno.
+            IPARM_GETBITMAP => {
+                let bitmap = self.bitmap_from_image(image)?;
+                if p1 != 0 {
+                    self.cpu.write_u32(p1, bitmap)?;
+                }
+                if p2 != 0 {
+                    self.cpu
+                        .write_u32(p2, if bitmap == 0 { EFAILED } else { SUCCESS })?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Materializa a imagem decodificada como uma superfície `IBitmap`.
+    /// Diferente do [`Machine::bitmap_from_decoded`], este caminho **não** publica o `IDIB`.
+    ///
+    /// Publicar custa caro onde não é preciso: toda superfície publicada entra no laço que
+    /// sincroniza os pixels a cada chamada que os toca, e o Pac-Mania — que desenha pixel a
+    /// pixel pela API — saiu de "roda" para "lento demais" quando os dois caminhos foram
+    /// unificados. Quem pede o DIB pede pelo `QueryInterface`, e aí ele é publicado.
+    pub(super) fn bitmap_from_image(&mut self, image: u32) -> Result<u32, CpuError> {
+        // A mesma imagem é pedida de novo a cada quadro — o Pac-Mania faz 34 mil
+        // `IPARM_GETBITMAP` em quatro segundos virtuais. Materializar uma superfície nova a
+        // cada pedido gastava sete segundos e deixava trinta e quatro mil objetos vivos.
+        if let Some(&bitmap) = self.image_bitmaps.get(&image) {
+            return Ok(bitmap);
+        }
+        let Some(info) = self.images.get(&image).cloned() else {
+            return Ok(0);
+        };
+        let addr = self.new_object(Interface::Bitmap)?;
+        if addr == 0 {
+            return Ok(0);
+        }
+        let mut surface = Framebuffer::new(info.width, info.height);
+        for (index, pixel) in info.pixels.iter().enumerate() {
+            let (x, y) = (index as u32 % info.width, index as u32 / info.width);
+            surface.set_pixel_native(x as i32, y as i32, *pixel);
+        }
+        self.bitmaps.insert(addr, surface);
+        self.image_bitmaps.insert(image, addr);
+        Ok(addr)
+    }
+
+    /// Desenha a imagem na superfície corrente.
+    ///
+    /// Quando o destino é uma superfície do próprio jogo, o desenho não pode ser feito aqui:
+    /// ele vira uma chamada ao `BltIn` dela, e entrar no guest no meio do despacho não é
+    /// seguro. Vai para a fila da fronteira, como os callbacks.
+    pub(super) fn draw_image(
+        &mut self,
+        image: u32,
+        x: i32,
+        y: i32,
+        frame: Option<u32>,
+    ) -> Result<(), CpuError> {
+        if !self.images.contains_key(&image) {
+            return Ok(());
+        }
+        let target = self.target()?;
+        let recorte = self
+            .recortes_de_imagem
+            .get(&image)
+            .copied()
+            .unwrap_or_default();
+        if !self.bitmaps.contains_key(&target) {
+            let Some(info) = self.images.get(&image) else {
+                return Ok(());
+            };
+            let frame_width = match (frame, info.frame_width) {
+                (Some(_), width) if width > 0 => width as i32,
+                _ => info.width as i32,
+            };
+            let (src_x, src_y) = (recorte.x.max(0), recorte.y.max(0));
+            let (largura, altura) = recorte.tamanho.unwrap_or((i32::MAX, i32::MAX));
+            let mut first_column = 0;
+            let mut last_column = largura.min(frame_width - src_x);
+            let mut first_row = 0;
+            let mut last_row = altura.min(info.height as i32 - src_y);
+            if let Some(clip) = self.clip {
+                first_column = first_column.max(clip.x as i32 - x);
+                last_column = last_column.min(clip.x as i32 + clip.width as i32 - x);
+                first_row = first_row.max(clip.y as i32 - y);
+                last_row = last_row.min(clip.y as i32 + clip.height as i32 - y);
+            }
+            if first_column >= last_column || first_row >= last_row {
+                return Ok(());
+            }
+            self.pending_blits.push(PendingBlit {
+                image,
+                target,
+                x: x + first_column,
+                y: y + first_row,
+                src_x: src_x + first_column,
+                src_y: src_y + first_row,
+                width: (last_column - first_column) as u32,
+                height: (last_row - first_row) as u32,
+                rop: match recorte.transparente {
+                    true => AEE_RO_TRANSPARENT,
+                    false => AEE_RO_COPY,
+                },
+                frame,
+            });
+            return Ok(());
+        }
+        let clip = self.clip;
+        // **A imagem não é copiada para ser lida.** Ler o mapa de imagens e escrever no de
+        // superfícies são campos diferentes do `self`, e separá-los aqui é o que deixa o
+        // empréstimo passar sem cópia.
+        //
+        // Com o `.cloned()` que estava nesta linha, cada `IIMAGE_Draw` duplicava a imagem
+        // inteira — pixels e máscara de opacidade — só para ler um retângulo dela. No Pac-Mania
+        // são 21.923 chamadas em cinco segundos virtuais, a 0,6 ms cada: 90% de todo o tempo de
+        // API do jogo estava nessa cópia, e não no laço que o recorte já tinha reduzido.
+        let Self {
+            images, bitmaps, ..
+        } = self;
+        let Some(info) = images.get(&image) else {
+            return Ok(());
+        };
+        let Some(surface) = bitmaps.get_mut(&target) else {
+            return Ok(());
+        };
+        let (frame_width, offset) = match (frame, info.frame_width) {
+            (Some(n), width) if width > 0 => (width as u32, n * width as u32),
+            _ => (info.width, 0),
+        };
+        // O recorte não é acabamento aqui: é o que decide o tamanho do trabalho. O Pac-Mania
+        // desenha a **folha de fontes inteira** e conta com o recorte para que só a letra
+        // apareça. Percorrer a imagem toda e conferir pixel a pixel eram 3,9 bilhões de pixels
+        // lidos em quatro segundos virtuais para pôr na tela algumas centenas de milhares — e
+        // ainda punha na tela o que o jogo mandou esconder.
+        //
+        // O pedaço pedido por `IPARM_OFFSET` e `IPARM_SIZE` entra antes de tudo: `(column, row)`
+        // continua sendo a posição **na tela** a partir de `(x, y)`, e o pixel lido é deslocado
+        // pelo canto do pedaço.
+        let (recorte_x, recorte_y) = (recorte.x.max(0), recorte.y.max(0));
+        let (largura, altura) = recorte.tamanho.unwrap_or((i32::MAX, i32::MAX));
+        let (mut first_column, mut last_column) = (0, largura.min(frame_width as i32 - recorte_x));
+        let (mut first_row, mut last_row) = (0, altura.min(info.height as i32 - recorte_y));
+        if let Some(clip) = clip {
+            first_column = first_column.max(clip.x as i32 - x);
+            last_column = last_column.min(clip.x as i32 + clip.width as i32 - x);
+            first_row = first_row.max(clip.y as i32 - y);
+            last_row = last_row.min(clip.y as i32 + clip.height as i32 - y);
+        }
+        // O mesmo vale para as bordas da superfície: o que cai fora nunca precisou ser lido.
+        first_column = first_column.max(-x).max(0);
+        last_column = last_column.min(surface.width() as i32 - x);
+        first_row = first_row.max(-y).max(0);
+        last_row = last_row.min(surface.height() as i32 - y);
+
+        for row in first_row..last_row {
+            for column in first_column..last_column {
+                let source = ((row + recorte_y) as u32 * info.width
+                    + (column + recorte_x) as u32
+                    + offset) as usize;
+                let Some(&pixel) = info.pixels.get(source) else {
+                    continue;
+                };
+                if recorte.transparente && pixel == TRANSPARENT_KEY {
+                    continue;
+                }
+                match info.alfa.get(source).copied() {
+                    Some(0) => {}
+                    Some(u8::MAX) => surface.set_pixel_native(x + column, y + row, pixel),
+                    Some(alfa) => {
+                        let fundo = surface.get_pixel(x + column, y + row);
+                        let cor = mistura_rgb565(fundo, pixel, alfa);
+                        surface.set_pixel_native(x + column, y + row, cor);
+                    }
+                    None if info.opaque.get(source).copied().unwrap_or(true) => {
+                        surface.set_pixel_native(x + column, y + row, pixel)
+                    }
+                    None => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
