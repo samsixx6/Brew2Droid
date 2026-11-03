@@ -43,17 +43,41 @@ mod gl;
 mod helper;
 mod hid;
 mod image;
+mod image_widget;
+mod xy_container;
+mod modern_font;
+mod font_map_model;
+mod static_widget;
+mod value_model;
+mod viewport;
+mod scrollbar;
+mod softkey_widget;
+mod button_widget;
+mod text_model;
+mod text_layout;
+mod root_container;
+mod display_canvas;
+mod window_manager;
+mod window_startup;
 mod legacy_controls;
 mod media;
+mod mem_cache;
+mod pim_contacts;
 
 /// O teto do cache de sons decodificados, em bytes — reexportado porque quem o ajusta é o
 /// frontend, e o módulo que o guarda é interno.
 pub use media::define_teto_do_cache_de_som;
 mod net;
 mod net_legacy;
+mod socket_legacy;
+mod temporal_controls;
 mod probe;
 mod rsa;
+mod registry;
+pub(crate) mod app_history;
+mod regional_model;
 mod shell;
+pub(crate) mod applet_lifecycle;
 mod signal;
 mod sound;
 mod sound_player;
@@ -61,7 +85,16 @@ mod sql;
 mod thread;
 mod time;
 mod tapi_legacy;
+mod sprite_legacy;
+mod native_text;
+mod addrbook_legacy;
+mod runtime_compat;
+mod kingdom_swerve;
+mod epic_framebuffer;
+pub use native_text::NativeTextEncoding;
 mod widget;
+mod web;
+mod http_transport;
 mod zip;
 
 /// Teto de uma instrução SQL vinda do guest. As maiores do Z-Wheel têm 110 bytes.
@@ -782,35 +815,6 @@ struct Peek {
     posicao: usize,
     /// Endereço, na memória do guest, do buffer de uma linha. Ver [`Machine::source_call`].
     buffer: u32,
-}
-
-impl Peek {
-    /// A próxima linha, sem o `\n` e sem o `\r` que o acompanha nos arquivos do console.
-    ///
-    /// Devolve `None` quando acabou. Uma linha vazia é uma linha: quem separa "linha vazia" de
-    /// "fim do arquivo" é o `Option`, não o tamanho — o `tectoy.cfg` tem linhas em branco entre
-    /// as seções, e confundir as duas coisas pararia a leitura na primeira delas.
-    fn proxima_linha(&mut self) -> Option<Vec<u8>> {
-        if self.posicao >= self.bytes.len() {
-            return None;
-        }
-        let resto = &self.bytes[self.posicao..];
-        let fim = resto.iter().position(|&b| b == b'\n');
-        let linha = match fim {
-            Some(n) => {
-                self.posicao += n + 1;
-                &resto[..n]
-            }
-            None => {
-                self.posicao = self.bytes.len();
-                resto
-            }
-        };
-        Some(match linha.last() {
-            Some(b'\r') => linha[..linha.len() - 1].to_vec(),
-            _ => linha.to_vec(),
-        })
-    }
 }
 
 /// De quantas em quantas chamadas de API o perfil de custo lê o relógio.
@@ -2103,6 +2107,31 @@ fn julian_date(segundos: u32) -> [u16; 7] {
     ]
 }
 
+/// Inverso de `julian_date`, com os mesmos sete uint16 e a época CDMA do BREW.
+/// A semana é informativa; datas inválidas ou fora do uint32 não viram datas diferentes.
+fn julian_seconds(data: [u16; 7]) -> u32 {
+    let [ano, mes, dia, hora, minuto, segundo, _] = data.map(i64::from);
+    if !(1..=12).contains(&mes) || hora >= 24 || minuto >= 60 || segundo >= 60 {
+        return 0;
+    }
+    let bissexto = ano % 4 == 0 && (ano % 100 != 0 || ano % 400 == 0);
+    let limite = match mes {
+        2 => if bissexto { 29 } else { 28 },
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if dia < 1 || dia > limite { return 0; }
+    // Mesma contagem civil do caminho direto, com janeiro/fevereiro no ano anterior.
+    let ano = ano - i64::from(mes <= 2);
+    let era = ano.div_euclid(400);
+    let ano_na_era = ano - era * 400;
+    let mes = mes + if mes > 2 { -3 } else { 9 };
+    let dia_no_ano = (153 * mes + 2) / 5 + dia - 1;
+    let dias = era * 146_097 + ano_na_era * 365 + ano_na_era / 4 - ano_na_era / 100
+        + dia_no_ano - 719_468 - 3657;
+    u32::try_from(dias * 86_400 + hora * 3600 + minuto * 60 + segundo).unwrap_or(0)
+}
+
 /// A fonte que o próprio jogo empacotou, se houver uma.
 ///
 /// A do console vinha da firmware, que não temos. Vários módulos trazem a sua — a Z-Wheel
@@ -2391,6 +2420,23 @@ pub struct Machine<C: CpuBackend> {
     copyright_keys: BTreeSet<u16>,
     copyright_text: Vec<String>,
     applet_manifest: Option<(Vec<u8>, u32)>,
+    native_text: native_text::NativeTextContext,
+    legacy_device_info: bool,
+    descritor_oem_565: bool,
+    native_image_padding: u32,
+    native_image_full_blit: bool,
+    pocket_god_font_compat: bool,
+    penoa_palette_compat: bool,
+    three_kingdoms_background_compat: bool,
+    jumong_public_framebuffer_compat: bool,
+    jjayo_graphics_compat: Option<usize>,
+    mini_resource_layout_compat: Option<bool>,
+    kingdom_swerve_compat: Option<kingdom_swerve::KingdomSwervePort>,
+    epic_public_framebuffer: Option<epic_framebuffer::EpicFramebufferPort>,
+    legacy_sprites: std::collections::BTreeMap<u32, sprite_legacy::SpriteState>,
+    applet_resources: Option<(String, crate::loader::resfile::ResFile)>,
+    /// CheckPrivLevel(FALSE) negado encerra sem retomar o código do applet.
+    applet_privilege_denied: bool,
     probe_classes: BTreeSet<u32>,
     /// Respostas combinadas para slots de sonda: `(classe, slot) -> valor`.
     probe_answers: HashMap<(u32, u32), u32>,
@@ -2420,7 +2466,11 @@ pub struct Machine<C: CpuBackend> {
     file_error: u32,
     /// OnEvent exige remoção explícita: Release de INetMgr não cancela estes pares.
     net_legacy_callbacks: BTreeSet<(u32, u32)>,
+    legacy_sockets: BTreeMap<u32, socket_legacy::SocketState>,
+    legacy_socket_epoch: u64,
+    temporal_controls: BTreeMap<u32, temporal_controls::TemporalControl>,
     net_legacy_errors: BTreeMap<u32, u32>,
+    net_legacy_linger: BTreeMap<u32, u16>,
     /// Os bytes já entregues a cada decodificador de imagem, e o resultado quando ele fecha.
     decoders: HashMap<u32, DecoderState>,
     /// De qual decodificador é cada `IForceFeed` — o `QueryInterface` devolve um objeto
@@ -2446,6 +2496,10 @@ pub struct Machine<C: CpuBackend> {
     scale_source: Option<(i32, i32)>,
     /// As preferências gravadas por `ISHELL_SetPrefs`, por classe e versão.
     prefs: HashMap<(u32, u16), Vec<u8>>,
+    registry: registry::RegistryState,
+    app_history: app_history::AppHistoryState,
+    return_to_idle: bool,
+    applet_display:u32,
     /// A listagem em curso de cada `IFileMgr`. O BREW guarda esse estado dentro do próprio
     /// gerenciador, e dois gerenciadores enumeram diretórios diferentes ao mesmo tempo.
     enumerations: HashMap<u32, std::collections::VecDeque<String>>,
@@ -2464,6 +2518,13 @@ pub struct Machine<C: CpuBackend> {
     /// Sinais disparados e ainda não entregues ao guest.
     pending_signals: Vec<Callback>,
     deferred_callbacks: Vec<(u32, u32)>,
+    /// Evento de sistema por endereço do AEECallback do guest.
+    system_callbacks: BTreeMap<u32, u32>,
+    /// Identidade de cada registro, inclusive quando o mesmo PCB é cancelado e rearmado.
+    /// Somente do host: reconstruída após restore, sem snapshots de entrega em andamento.
+    system_callback_generations: BTreeMap<u32, u64>,
+    next_system_callback_generation: u64,
+    low_ram_dispatching: bool,
     /// Estado corrente de cada porta. Ver [`crate::input::PORTAS`].
     pads: [Pad; input::PORTAS],
     /// Apertos e solturas ainda não lidos pelo jogo, por porta, na ordem em que aconteceram.
@@ -2568,6 +2629,10 @@ pub struct Machine<C: CpuBackend> {
     z_wheel: crate::config::ZWheel,
     /// O applet pediu para fechar com `ISHELL_CloseApplet`. Ver [`Machine::pediu_para_fechar`].
     applet_fechado: bool,
+    /// FALSE em *dwParam de STOP conservou este applet, inclusive quando não há timer.
+    applet_em_background: bool,
+    window_start: Option<window_startup::WindowStartup>,
+    window_start_capable: bool,
     /// `(raiz, formulário)` à espera do aviso de ativo. Ver [`Machine::entrega_ativacao`].
     ativacao_pendente: Option<(u32, u32)>,
     /// As telas apresentadas por `IDISPLAY_Update` dentro de uma mesma volta do laço. Ver
@@ -2699,6 +2764,11 @@ pub struct Machine<C: CpuBackend> {
     network: bool,
     /// O corpo da última resposta recebida.
     web_response: Vec<u8>,
+    /// Handles do host nunca entram no save; cada canal pertence a um único pedido.
+    http_requests: HashMap<u32, http_transport::Pending>,
+    http_callback_pin: u32,
+    http_bodies: HashMap<u32, web::http_body::Builder>,
+    http_body_pin: u32,
     /// Estado de cada `IHash` vivo.
     hashes: HashMap<u32, HashState>,
     rsas: HashMap<u32, rsa::RsaState>,
@@ -2716,6 +2786,9 @@ pub struct Machine<C: CpuBackend> {
     /// o aviso nasceu. Saem na volta do laço, não na saída da chamada: ver
     /// [`Machine::notify_media`].
     avisos_de_midia: Vec<(u32, u32, u32, Callback)>,
+    /// Contextos da cauda original durante uma entrega. FREE os retira antes de
+    /// reutilizar a alocação; avisos de registros novos ficam na fila normal.
+    media_batch_tail_contexts: Option<BTreeSet<u32>>,
     /// As imagens com `PFNIMAGEINFO` ainda não entregue. Também saem na volta do laço: ver
     /// [`Machine::notify_image`].
     avisos_de_imagem: Vec<u32>,
@@ -3102,13 +3175,61 @@ impl<C: CpuBackend> Machine<C> {
         self.applet_fechado
     }
 
-    /// Entrega o `EVT_APP_STOP` ao applet, que é a última coisa que ele recebe antes de sair.
+    pub(crate) fn applet_em_background(&self) -> bool {
+        self.applet_em_background
+    }
+
+    /// Termina o STOP e entrega APP_CLOSED enquanto código e contexto ainda estão vivos.
     ///
-    /// É nele que muitos jogos gravam o progresso. O que ele responde não muda nada: fechar foi
-    /// pedido pelo próprio applet.
-    pub fn encerra_applet(&mut self) -> Result<(), CpuError> {
-        self.send_applet_event(self.applet_class, EVT_APP_STOP, 0, 0)?;
-        Ok(())
+    /// É nele que muitos jogos gravam o progresso. FALSE no boolean apontado por
+    /// dwParam conserva o applet no background; o retorno do HandleEvent não decide isso.
+    /// Retorna true somente quando o applet aceitou o fechamento.
+    pub fn encerra_applet(&mut self) -> Result<bool, CpuError> {
+        if !self.handset_event_ready() {
+            return Err(CpuError("fechamento aguarda a execução pendente do applet".into()));
+        }
+        let applet = match self.current_applet {
+            0 => self.cpu.read_u32(self.module.out_module + 4).unwrap_or(0),
+            vivo => vivo,
+        };
+        if applet == 0 { self.cancel_http_requests()?; return Ok(true); }
+        let table = self.cpu.read_u32(applet)?;
+        let handler = self.cpu.read_u32(table + 8)?;
+        // AEE.h: EVT_APP_STOP recebe boolean*, inicialmente TRUE. O Refresher
+        // escreve FALSE por esse ponteiro; passar zero causava a falha em 0x10660.
+        let close = self.heap.alloc(1)
+            .ok_or_else(|| CpuError("sem memória para o parâmetro de STOP".into()))?;
+        if let Err(error) = self.cpu.write_mem(close, &[1]) {
+            self.heap.free(close);
+            return Err(error);
+        }
+        // O despacho normal reduz falhas/Budget a FALSE. Fechar exige conhecer
+        // o resultado real antes de liberar estado usado pelo tratador do applet.
+        self.nesting += 1;
+        let outer_budget = self.orcamento;
+        let outcome = self.call_guest_aninhado(handler, [applet, EVT_APP_STOP, 0, close], QSORT_BUDGET);
+        self.orcamento = outer_budget;
+        self.nesting -= 1;
+        if !matches!(outcome?, Outcome::Returned { .. }) || !self.handset_event_ready() {
+            // Não reutilizar o parâmetro de uma chamada cujo retorno não foi
+            // observado. A sessão trata esse desfecho como falha, sem limpeza.
+            return Err(CpuError("STOP do applet não terminou; limpeza de fechamento não entregue".into()));
+        }
+        let mut reply = [1];
+        self.cpu.read_mem(close, &mut reply)?;
+        self.heap.free(close);
+        if reply[0] == 0 {
+            self.applet_fechado = false;
+            self.applet_em_background = true;
+            return Ok(false);
+        }
+        self.applet_em_background = false;
+        self.cancel_window_startup();
+        // O SDK descreve o aviso de fechamento sem ordenar os dois sinais.
+        // Este modelo conclui a limpeza do applet antes da dos componentes.
+        self.deliver_system_callbacks(4)?;
+        self.cancel_http_requests()?;
+        Ok(true)
     }
 
     /// Escolhe como a Z-Wheel lê a `tectoy.cfg`, **antes de o applet ser criado**.
@@ -3237,6 +3358,22 @@ impl<C: CpuBackend> Machine<C> {
             copyright_keys: BTreeSet::new(),
             copyright_text: Vec::new(),
             applet_manifest: None,
+            native_text: native_text::NativeTextContext::default(),
+            legacy_device_info: false,
+            descritor_oem_565: false,
+            native_image_padding: 0,
+            native_image_full_blit: false,
+            pocket_god_font_compat: false,
+            penoa_palette_compat: false,
+            three_kingdoms_background_compat: false,
+            jumong_public_framebuffer_compat: false,
+            jjayo_graphics_compat: None,
+            mini_resource_layout_compat: None,
+            kingdom_swerve_compat: None,
+            epic_public_framebuffer: None,
+            legacy_sprites: Default::default(),
+            applet_resources: None,
+            applet_privilege_denied: false,
             probe_classes: BTreeSet::new(),
             probe_answers: HashMap::new(),
             // 6 de janeiro de 1980 é a época do BREW; a do Unix é dez anos e seis dias antes.
@@ -3262,7 +3399,11 @@ impl<C: CpuBackend> Machine<C> {
             open_files: HashMap::new(),
             file_error: SUCCESS,
             net_legacy_callbacks: BTreeSet::new(),
+            legacy_sockets: BTreeMap::new(),
+            legacy_socket_epoch: 0,
+            temporal_controls: BTreeMap::new(),
             net_legacy_errors: BTreeMap::new(),
+            net_legacy_linger: BTreeMap::new(),
             decoders: HashMap::new(),
             feeds: HashMap::new(),
             surface_manip: 0,
@@ -3275,12 +3416,20 @@ impl<C: CpuBackend> Machine<C> {
             gles11_ext_pak: 0,
             scale_source: None,
             prefs: HashMap::new(),
+            registry: registry::RegistryState::default(),
+            app_history: Default::default(),
+            return_to_idle: false,
+            applet_display:0,
             enumerations: HashMap::new(),
             missing_files: BTreeSet::new(),
             input_signals: BTreeMap::new(),
             signals: HashMap::new(),
             pending_signals: Vec::new(),
             deferred_callbacks: Vec::new(),
+            system_callbacks: BTreeMap::new(),
+            system_callback_generations: BTreeMap::new(),
+            next_system_callback_generation: 0,
+            low_ram_dispatching: false,
             pads: [Pad::default(); input::PORTAS],
             pad_events: std::array::from_fn(|_| std::collections::VecDeque::new()),
             movimento: [[0.0, 0.0, 1.0]; input::PORTAS],
@@ -3330,6 +3479,9 @@ impl<C: CpuBackend> Machine<C> {
                 transicoes_sempre: false,
             },
             applet_fechado: false,
+            applet_em_background: false,
+            window_start: None,
+            window_start_capable: false,
             ativacao_pendente: None,
             quadros_do_update: Default::default(),
             updates_na_volta: 0,
@@ -3395,12 +3547,17 @@ impl<C: CpuBackend> Machine<C> {
             // chamada que o `PixelStorei` honra.
             unpack_alignment: 1,
             web_response: Vec::new(),
+            http_requests: HashMap::new(),
+            http_callback_pin: 0,
+            http_bodies: HashMap::new(),
+            http_body_pin: 0,
             streams: HashMap::new(),
             source_streams: HashMap::new(),
             sounds: HashMap::new(),
             pending_calls: Vec::new(),
             posted_calls: Vec::new(),
             avisos_de_midia: Vec::new(),
+            media_batch_tail_contexts: None,
             avisos_de_imagem: Vec::new(),
             fluxos_pcm: HashMap::new(),
             leitura_pcm: None,
@@ -3586,6 +3743,7 @@ impl<C: CpuBackend> Machine<C> {
     /// `budget` é o teto de instruções **por fatia**, entre duas chamadas de API; existe para
     /// que um laço infinito no guest não trave o emulador.
     pub fn run(&mut self, budget: u64) -> Result<Outcome, CpuError> {
+        self.cancel_window_startup();
         self.cpu.reset(&self.module.mem)?;
         self.cpu.write_reg(Reg::R0, self.module.shell);
         self.cpu.write_reg(Reg::R1, self.module.helpers);
@@ -3627,12 +3785,14 @@ impl<C: CpuBackend> Machine<C> {
         let teto = budget.saturating_mul(TETO_DE_TRECHO);
         self.orcamento = budget;
         loop {
+            if self.applet_privilege_denied { return Ok(Outcome::Returned { code: FALSE }); }
             let gasto = self.cpu.instructions().saturating_sub(comeco);
-            let fatia = teto.saturating_sub(gasto).min(budget);
+            let fatia = self.web_body_resume_budget(teto.saturating_sub(gasto).min(budget));
             if fatia == 0 {
                 self.anota_trecho_interrompido(pc);
                 return Ok(Outcome::Budget);
             }
+            self.apply_epic_public_framebuffer(pc)?;
             match self.cpu.run(pc, fatia)? {
                 StopReason::ApiCall { addr }
                     if self.calls_total - chamadas_no_comeco >= MAX_CALLS =>
@@ -3645,6 +3805,7 @@ impl<C: CpuBackend> Machine<C> {
                 StopReason::ApiCall { addr } => match self.dispatch(addr)? {
                     Some(result) => {
                         self.cpu.write_reg(Reg::R0, result);
+                        if self.applet_privilege_denied { return Ok(Outcome::Returned { code: FALSE }); }
                         // O `lr` guarda o endereço de retorno, com o bit 0 indicando Thumb —
                         // o núcleo entende essa convenção, então repassamos como está.
                         pc = self.cpu.read_reg(Reg::Lr);
@@ -3745,6 +3906,13 @@ impl<C: CpuBackend> Machine<C> {
     /// laço de eventos não achava timer nem callback nenhum, e a sessão terminava sozinha aos
     /// 3,8 segundos, como se o jogo tivesse acabado.
     fn retoma_trecho(&mut self, budget: u64) -> Result<Option<Outcome>, CpuError> {
+        let body_budget=self.web_body_resume_budget(budget);
+        if self.http_body_pin!=0&&self.web_body_resume_budget(u64::MAX)==0{
+            self.trecho_interrompido=None;self.trecho_thread=None;
+            self.abort_web_body_call()?;
+            return Ok(Some(Outcome::Returned{code:0}));
+        }
+        let budget=body_budget;
         let Some((pc, estado)) = self.trecho_interrompido.take() else {
             return Ok(None);
         };
@@ -3764,7 +3932,8 @@ impl<C: CpuBackend> Machine<C> {
                 self.cpu.write_reg(reg, value);
             }
         }
-        let outcome = outcome?;
+        let outcome = match outcome{Ok(outcome)=>outcome,Err(error)=>{self.abort_web_body_call()?;return Err(error);}};
+        if self.http_body_pin!=0&&!matches!(outcome,Outcome::Returned{..}|Outcome::Budget){self.abort_web_body_call()?;}
         if self.leitura_pcm.is_some_and(|read| read.concluida.is_none()) {
             match outcome {
                 Outcome::Returned { code } => self.leitura_pcm.as_mut().unwrap().concluida = Some(code),
@@ -3931,6 +4100,130 @@ impl<C: CpuBackend> Machine<C> {
                 }
             }
             (Interface::Shell, 3) => self.shell_query_class()?,
+            (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("CheckPrivLevel") => {
+                self.shell_check_privilege()
+            }
+            (Interface::AddrBookLegacy, _) => match self.addrbook_legado_call(slot)? {
+                Some(value) => value,
+                None => return Ok(None),
+            },
+            (Interface::Sprite, _) => match self.sprite_legado_call(slot)? {
+                Some(value) => value,
+                None => return Ok(None),
+            },
+            (Interface::AppHistory, _) => match self.app_history_call(slot)? {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            (Interface::ImageWidget | Interface::InterfaceModel, _) => {
+                self.sync_surfaces_in()?;
+                let result = if iface==Interface::ImageWidget && slot==10 { let canvas=self.arg(1);self.modern_ui_canvas(canvas,|m|m.image_widget_call(iface, slot))? } else { self.image_widget_call(iface, slot)? };
+                self.sync_surfaces_out()?;
+                match result { Some(result) => result, None => return Ok(None) }
+            },
+            (Interface::XYContainer | Interface::XYContainerWidget, _) => {
+                self.sync_surfaces_in()?;
+                let result = if iface==Interface::XYContainerWidget && slot==10 { let canvas=self.arg(1);self.modern_ui_canvas(canvas,|m|m.xy_container_call(iface, slot))? } else { self.xy_container_call(iface, slot)? };
+                self.sync_surfaces_out()?;
+                match result { Some(result) => result, None => return Ok(None) }
+            },
+            (Interface::WindowMgr, _) => match self.window_manager_call(slot)? {
+                Some(result) => result, None => return Ok(None),
+            },
+            (Interface::WindowViewModel, _) => match self.window_view_model_call(slot)? {
+                Some(result) => result, None => return Ok(None),
+            },
+            (Interface::DisplayWidget, _) => {
+                self.sync_surfaces_in()?;
+                let result = if slot==10 { let canvas=self.arg(1);self.modern_ui_canvas(canvas,|m|m.display_widget_call(slot))? } else { self.display_widget_call(slot)? };
+                self.sync_surfaces_out()?;
+                match result { Some(result) => result, None => return Ok(None) }
+            },
+            (Interface::ModernTypeface | Interface::ModernHFont, _) => {
+                self.sync_surfaces_in()?;
+                let result = self.modern_font_call(iface, slot)?;
+                self.sync_surfaces_out()?;
+                match result { Some(result) => result, None => return Ok(None) }
+            },
+            (Interface::FontMapModel, _) => match self.font_map_call(slot)? {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            (Interface::StaticWidget, _) => {
+                self.sync_surfaces_in()?;
+                let result = if matches!(slot,10|16) { let canvas=self.arg(1);self.modern_ui_canvas(canvas,|m|m.static_widget_call(slot))? } else { self.static_widget_call(slot)? };
+                self.sync_surfaces_out()?;
+                match result { Some(result) => result, None => return Ok(None) }
+            },
+            (Interface::Viewport | Interface::ViewportContainer, _) => {
+                self.sync_surfaces_in()?;
+                let result = if iface==Interface::Viewport && slot==10 { let canvas=self.arg(1);self.modern_ui_canvas(canvas,|m|m.viewport_call(iface, slot))? } else { self.viewport_call(iface, slot)? };
+                self.sync_surfaces_out()?;
+                match result { Some(result) => result, None => return Ok(None) }
+            },
+            (Interface::Scrollbar | Interface::ScrollbarContainer, _) => {
+                self.sync_surfaces_in()?;
+                let result = if iface==Interface::Scrollbar && slot==10 { let canvas=self.arg(1);self.modern_ui_canvas(canvas,|m|m.scrollbar_call(iface, slot))? } else { self.scrollbar_call(iface, slot)? };
+                self.sync_surfaces_out()?;
+                match result { Some(result) => result, None => return Ok(None) }
+            },
+            (Interface::SoftkeyWidget, _) => {
+                self.sync_surfaces_in()?;
+                let result = if slot==10 { let canvas=self.arg(1);self.modern_ui_canvas(canvas,|m|m.softkey_widget_call(slot))? } else { self.softkey_widget_call(slot)? };
+                self.sync_surfaces_out()?;
+                match result { Some(value) => value, None => return Ok(None) }
+            },
+            (Interface::ButtonWidget, _) => {
+                self.sync_surfaces_in()?;
+                let result = if slot == 10 {
+                    let canvas = self.arg(1);
+                    self.modern_ui_canvas(canvas, |m| m.button_widget_call(slot))?
+                } else { self.button_widget_call(slot)? };
+                self.sync_surfaces_out()?;
+                match result { Some(value) => value, None => return Ok(None) }
+            },
+            (Interface::TextModel | Interface::RichTextModel, _) => match self.text_model_call(iface, slot)? {
+                Some(value) => value,
+                None => return Ok(None),
+            },
+            (Interface::TextLayout, _) => {
+                self.sync_surfaces_in()?;
+                let result = if slot==6 { let canvas=self.arg(1);self.modern_ui_canvas(canvas,|m|m.text_layout_call(slot))? } else {self.text_layout_call(slot)?};
+                self.sync_surfaces_out()?;
+                match result {Some(value)=>value,None=>return Ok(None)}
+            },
+            (Interface::RootContainer | Interface::RootContainerWidget, _) => {
+                self.sync_surfaces_in()?;
+                let result=self.root_container_call(iface,slot)?;
+                self.sync_surfaces_out()?;
+                match result {Some(value)=>value,None=>return Ok(None)}
+            },
+            (Interface::StaticDrawHandler, _) => match self.static_draw_handler_call(slot)? {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            (Interface::ValueModel, _) => match self.value_model_call(slot)? {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            (Interface::MemCache1, _) => match self.mem_cache_call(slot)? {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            (Interface::PimContacts | Interface::PimContactsResults, _) => {
+                match self.pim_contacts_call(iface, slot)? {
+                    Some(result) => result,
+                    None => return Ok(None),
+                }
+            },
+            (Interface::Registry, _) => match self.registry_call(slot)? {
+                Some(ret) => ret,
+                None => return Ok(None),
+            },
+            (Interface::RegionalModelInfo, _) => match self.regional_model_call(slot)? {
+                Some(value) => value,
+                None => return Ok(None),
+            },
             (Interface::TapiLegacy, _) => match self.tapi_legacy_call(slot)? {
                 Some(result) => result,
                 None => return Ok(None),
@@ -3966,6 +4259,7 @@ impl<C: CpuBackend> Machine<C> {
             // volta do laço (ver [`Machine::encerra_applet`]).
             (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("CloseApplet") => {
                 self.applet_fechado = true;
+                self.return_to_idle |= self.cpu.read_reg(Reg::R1) != 0;
                 SUCCESS
             }
             (Interface::Shell, 4) => self.shell_get_device_info()?,
@@ -3983,6 +4277,9 @@ impl<C: CpuBackend> Machine<C> {
                     // Z-Wheel pergunta isto em `0x7e58c` antes de lançar e, com zero, desiste
                     // e registra "Failure attempting to launch game".
                     Some("CanStartApplet") => u32::from(instalado),
+                    // AEEShell.h: a primeira abertura aceita continua pendente até
+                    // o guest devolver controle; outra recebe EALREADY (26).
+                    _ if instalado && self.pending_launch.is_some() => 26,
                     _ if instalado => {
                         self.pending_launch = Some(cls);
                         SUCCESS
@@ -4031,7 +4328,7 @@ impl<C: CpuBackend> Machine<C> {
                 }
             }
             (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("ActiveApplet") => {
-                self.applet_class
+                self.app_history.active().unwrap_or(self.applet_class)
             }
 
             (Interface::Shell, slot)
@@ -4055,7 +4352,7 @@ impl<C: CpuBackend> Machine<C> {
                 self.shell_load_res_data(with_type)?
             }
             (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("FreeResData") => {
-                self.heap.free(self.cpu.read_reg(Reg::R1));
+                self.free_guest_allocation(self.cpu.read_reg(Reg::R1));
                 SUCCESS
             }
             // Entrega um evento a um applet. O Z-Wheel manda um para **ele mesmo** — a string
@@ -4072,22 +4369,31 @@ impl<C: CpuBackend> Machine<C> {
                     self.cpu.read_reg(Reg::R2),
                     self.cpu.read_reg(Reg::R3),
                 );
-                let (cls, evt, w) = match a2 == self.applet_class {
-                    true => (a2, a3, self.stack_arg(0)? as u16),
-                    false => (a1, a2, a3 as u16),
+                // AEEShell.h: flags UNIQUE/ASYNC e classe zero também formam a ABI
+                // moderna. ISHELL_HandleEvent usa exatamente flags=0, classe=0.
+                let modern = a2 == self.applet_class || (a2 == 0 && a1 & !3 == 0);
+                let (cls, evt, w, dw) = if modern {
+                    (a2, a3, self.stack_arg(0)? as u16, self.stack_arg(1)?)
+                } else {
+                    // Na forma antiga sem flags há só um argumento depois de r3.
+                    (a1, a2, a3 as u16, self.stack_arg(0)?)
                 };
-                let dw = self.stack_arg(1)?;
                 // O Undercover usa a forma estendida com flags 3 para postar o quadro.
                 // Executá-lo aqui perdia a continuação quando a carga excedia QSORT_BUDGET.
                 // A forma síncrona (inclusive flags zero da Z-Wheel) conserva seu resultado.
-                let post = a2 == self.applet_class && a1 & 2 != 0;
-                self.dispatch_applet_event(cls, evt, w, dw, post)?
+                let post = modern && a1 & 2 != 0;
+                // EVT_USER (AEEEvent.h): eventos privados exigem uma classe explícita.
+                if modern && cls == 0 && evt >= 0x7000 {
+                    FALSE
+                } else {
+                    self.dispatch_applet_event(cls, evt, w, dw, post)?
+                }
             }
             (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("GetHandler") => {
-                let mime = self
-                    .cpu
-                    .read_cstring(self.cpu.read_reg(Reg::R2), MAX_STRING);
-                handler_for(&mime)
+                self.registry_get_handler(self.arg(1), self.arg(2))
+            }
+            (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("RegisterHandler") => {
+                self.registry_set_handler(self.arg(1), self.arg(2), self.arg(3), false)
             }
             // int ISHELL_GetPrefs(IShell *, AEECLSID cls, uint16 wVer, void *pCfg, uint16 nSize)
             // int ISHELL_SetPrefs(IShell *, AEECLSID cls, uint16 wVer, void *pCfg, uint16 nSize)
@@ -4132,6 +4438,12 @@ impl<C: CpuBackend> Machine<C> {
             (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("Resume") => {
                 self.shell_resume()?
             }
+            (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("RegisterSystemCallback") => {
+                match self.register_system_callback()? {
+                    Some(value) => value,
+                    None => return Ok(None),
+                }
+            }
             (Interface::Shell, slot) if Interface::Shell.method(slot) == Some("GetClassItemID") => {
                 self.shell_get_class_item_id()
             }
@@ -4162,7 +4474,7 @@ impl<C: CpuBackend> Machine<C> {
                     Interface::Graphics => self.graphics_call(slot)?,
                     Interface::Display => self.display_call(slot)?,
                     Interface::Transform => self.transform_call(slot)?,
-                    Interface::Canvas => self.canvas_call(slot)?,
+                    Interface::Canvas => self.display_canvas_call(slot)?,
                     _ => self.bitmap_call(slot)?,
                 };
                 let Some(result) = handled else {
@@ -4182,6 +4494,14 @@ impl<C: CpuBackend> Machine<C> {
                 None => return Ok(None),
             },
             (Interface::NetLegacy, _) => match self.net_legacy_call(slot)? {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            (Interface::SocketLegacy, _) => match self.socket_legacy_call(slot)? {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            (Interface::DateLegacy | Interface::ClockLegacy, _) => match self.temporal_control_call(iface, slot)? {
                 Some(result) => result,
                 None => return Ok(None),
             },
@@ -4225,8 +4545,10 @@ impl<C: CpuBackend> Machine<C> {
                 Some(result) => result,
                 None => return Ok(None),
             },
-            (Interface::Web, _)
-            | (Interface::Hash, _)
+            (Interface::Web | Interface::WebResp, _) => match self.web_call(iface, slot)? {
+                Some(result) => result, None => return Ok(None),
+            },
+            (Interface::Hash, _)
             | (Interface::HashCtx, _)
             | (Interface::CipherFactory, _)
             | (Interface::Cipher, _) => match self.crypto_call(iface, slot)? {
@@ -4368,8 +4690,13 @@ impl<C: CpuBackend> Machine<C> {
         // O trecho que o teto cortou continua antes de qualquer outra coisa: ele é o jogo no
         // meio de um quadro, e timer ou callback entregues por cima dele chegariam fora de hora.
         if let Some(outcome) = self.retoma_trecho(budget)? {
+            // O callback retomado já devolveu o controle. Liberar o pin aqui
+            // também cobre Cancel/Release que retirou a última entrada da fila.
+            if matches!(outcome, Outcome::Returned { .. }) { self.finish_web_handler()?; }
+            self.observe_window_startup(matches!(outcome, Outcome::Returned { .. }))?;
             return Ok(vec![outcome]);
         }
+        self.observe_window_startup(false)?;
         self.skip_idle_time();
 
         // Um callback por volta: os outros continuam canceláveis na fila e não podem

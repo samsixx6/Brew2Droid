@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 /// Alinhamento dos blocos. O ARM exige 4; usamos 8 para não penalizar acessos de 64 bits.
 const ALIGN: u32 = 8;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Heap {
     base: u32,
     end: u32,
@@ -23,6 +23,8 @@ pub struct Heap {
     free_list: BTreeMap<u32, u32>,
     /// Blocos em uso, para que `free` saiba o tamanho sem o chamador informar.
     live: HashMap<u32, u32>,
+    /// Extensão lógica, sem alinhamento ou folga reservada pelo chamador.
+    requested: HashMap<u32, u32>,
 }
 
 impl Heap {
@@ -33,6 +35,7 @@ impl Heap {
             next: base,
             free_list: BTreeMap::new(),
             live: HashMap::new(),
+            requested: HashMap::new(),
         }
     }
 
@@ -49,7 +52,12 @@ impl Heap {
     }
 
     pub fn alloc(&mut self, size: u32) -> Option<u32> {
-        let total = size.max(1).div_ceil(ALIGN) * ALIGN;
+        self.alloc_with_padding(size, 0)
+    }
+
+    /// A folga pertence ao alocador, não aos bytes que REALLOC deve preservar.
+    pub(crate) fn alloc_with_padding(&mut self, size: u32, padding: u32) -> Option<u32> {
+        let total = size.checked_add(padding)?.max(1).div_ceil(ALIGN).checked_mul(ALIGN)?;
 
         // Primeiro ajuste entre os blocos livres.
         if let Some((&addr, &len)) = self.free_list.iter().find(|&(_, &len)| len >= total) {
@@ -59,6 +67,7 @@ impl Heap {
                 self.free_list.insert(addr + total, len - total);
             }
             self.live.insert(addr, total);
+            self.requested.insert(addr, size);
             return Some(addr);
         }
 
@@ -68,12 +77,18 @@ impl Heap {
         }
         self.next = addr + total;
         self.live.insert(addr, total);
+        self.requested.insert(addr, size);
         Some(addr)
     }
 
-    /// Tamanho de um bloco vivo — usado pelo `realloc` para saber quanto copiar.
+    /// Tamanho físico do bloco vivo, incluindo alinhamento e folga.
     pub fn size_of(&self, ptr: u32) -> Option<u32> {
         self.live.get(&ptr).copied()
+    }
+
+    /// Estados antigos não registravam esta medida; não inferir o pedido a partir dos dados.
+    pub(crate) fn requested_size_of(&self, ptr: u32) -> Option<u32> {
+        self.requested.get(&ptr).copied()
     }
 
     /// O bloco vivo que contém `addr`, como `(início, tamanho)`.
@@ -97,6 +112,7 @@ impl Heap {
     /// chamando um método em zero.
     pub fn free(&mut self, ptr: u32) -> Option<u32> {
         let size = self.live.remove(&ptr)?;
+        self.requested.remove(&ptr);
         let (mut inicio, mut fim) = (ptr, ptr + size);
         // O vizinho de baixo, se ele termina exatamente onde este começa.
         if let Some((&antes, &len)) = self.free_list.range(..inicio).next_back()
@@ -209,6 +225,7 @@ impl Heap {
             self.free_list.iter().map(|(a, t)| (*a, *t)),
         );
         destino.poe_mapa(&format!("{prefixo}.live"), self.live.iter().map(|(a, t)| (*a, *t)));
+        destino.poe_mapa(&format!("{prefixo}.requested"), self.requested.iter().map(|(a, t)| (*a, *t)));
     }
 
     /// Restaura de um prefixo, conferindo que o heap é desta máquina e que o conteúdo é coerente.
@@ -234,9 +251,22 @@ impl Heap {
                 motivo: format!("o endereço {endereco:#010x} aparece livre e em uso"),
             });
         }
+        let live: HashMap<_, _> = vivos.into_iter().collect();
+        let field = format!("{prefixo}.requested");
+        let mut requested = HashMap::new();
+        if origem.secao(&field).is_some() {
+            for (pointer, size) in origem.pares(&field)? {
+                if !live.get(&pointer).is_some_and(|physical| size <= *physical)
+                    || requested.insert(pointer, size).is_some()
+                {
+                    return Err(Erro::Secao { nome: field, motivo: "tamanho lógico inválido ou duplicado para um bloco vivo".into() });
+                }
+            }
+        }
         self.next = next;
         self.free_list = livres.into_iter().collect();
-        self.live = vivos.into_iter().collect();
+        self.live = live;
+        self.requested = requested;
         Ok(())
     }
 }

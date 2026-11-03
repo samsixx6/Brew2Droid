@@ -3,6 +3,9 @@
 //! Um `.mif` guarda o ícone do título já pronto para exibição, e cada console gravou o dele no
 //! formato que quis: os jogos mais novos usam PNG, os da primeira leva usam BMP paletado, e o
 //! Z-Wheel usa JPEG. Como os três aparecem nas ROMs reais, os três são lidos aqui.
+//! Recursos coreanos também trazem SAF estático RGB332; o subconjunto conferido
+//! passa pelo módulo próprio, sem anunciar suporte a animações SAF desconhecidas.
+//! BCI estático de oito bits usa paleta BGR0 e um raster zlib alinhado a quatro bytes.
 //!
 //! O BMP é decodificado à mão porque o que os `.mif` trazem é o subconjunto mais simples do
 //! formato — sem compressão, paleta de 16 ou 256 cores — e uma dependência inteira para isso
@@ -108,8 +111,75 @@ pub fn decode(data: &[u8]) -> Result<Image, ImageError> {
         [b'B', b'M', ..] => decode_bmp(data),
         [0xff, 0xd8, 0xff, ..] => decode_jpeg(data),
         [b'G', b'I', b'F', b'8', ..] => decode_gif(data),
+        [b'S', b'A', b'F', 0, ..] => super::saf::decode(data),
+        [b'B', b'C', b'I', 0, ..] => decode_bci(data),
         _ => Err(ImageError::Unknown),
     }
+}
+
+/// Subconjunto estático: um objeto opaco ocupa integralmente um único quadro.
+/// Os campos do contêiner e o passo foram conferidos na documentação do BitPim
+/// (brewcompressedimage.py, revisão 9a49c847), sem portar seu código Python/wx.
+/// Quadros compostos, animação e outras profundidades ficam fora deste subconjunto.
+fn decode_bci(input: &[u8]) -> Result<Image, ImageError> {
+    use flate2::{Decompress, FlushDecompress, Status};
+    let invalid = || ImageError::Malformed("BCI estático inválido ou não suportado");
+    if input.len() < 28 { return Err(invalid()); }
+    let declared = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
+    let data = input.get(..declared).filter(|data| data.len() >= 32).ok_or_else(invalid)?;
+    let word = |at: usize| usize::from(u16::from_le_bytes([data[at], data[at + 1]]));
+    let (width, height) = (word(14), word(16));
+    if word(12) != 1 || word(18) != 1 || word(20) != 1 || word(22) != 1
+        || word(24) != 0 || word(26) != 8 || width == 0 || height == 0
+        || width.checked_mul(height).is_none_or(|area| area > MAX_PIXELS)
+    {
+        return Err(invalid());
+    }
+    let (palette_id, colors) = (word(28), word(30));
+    if palette_id == 0 || !(1..=256).contains(&colors) { return Err(invalid()); }
+    let palette_end = 32 + colors * 4;
+    let palette = data.get(32..palette_end).ok_or_else(invalid)?;
+    if palette.chunks_exact(4).any(|color| color[3] != 0) { return Err(invalid()); }
+    let frame_end = palette_end + 20;
+    let frame = data.get(palette_end..frame_end).ok_or_else(invalid)?;
+    let object_at = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    if object_at != frame_end { return Err(invalid()); }
+    let object_end = object_at.checked_add(12).ok_or_else(invalid)?;
+    let object = data.get(object_at..object_end).ok_or_else(invalid)?;
+    let object_word = |at: usize| usize::from(u16::from_le_bytes([object[at], object[at + 1]]));
+    let object_id = object_word(8);
+    // O registro conferido tem referência única e coordenadas/efeitos zerados.
+    // Os quatro bytes em +4 não precisam ser interpretados: o objeto opaco cobre
+    // todo o quadro, de modo que nenhum fundo ou efeito é presumido a partir deles.
+    if frame[2..4] != [1, 0] || frame[8..10] != object[8..10]
+        || frame[10..].iter().any(|&byte| byte != 0) || object_id == 0
+        || object_word(4) != width || object_word(6) != height || object_word(10) != palette_id
+    {
+        return Err(invalid());
+    }
+    let compressed = u32::from_le_bytes(object[..4].try_into().unwrap()) as usize;
+    if object_end.checked_add(compressed) != Some(data.len()) { return Err(invalid()); }
+    let encoded = &data[object_end..];
+    let pitch = (width + 3) & !3;
+    let expected = pitch.checked_mul(height).ok_or_else(invalid)?;
+    // O byte sentinela distingue saída excessiva de um raster exato. O limite
+    // global de área já foi conferido antes de qualquer alocação proporcional.
+    let mut pixels = vec![0; expected + 1];
+    let mut decoder = Decompress::new(true);
+    if decoder.decompress(encoded, &mut pixels, FlushDecompress::Finish).map_err(|_| invalid())? != Status::StreamEnd
+        || decoder.total_out() != expected as u64 || decoder.total_in() != encoded.len() as u64
+    {
+        return Err(invalid());
+    }
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in pixels[..expected].chunks_exact(pitch) {
+        for &index in &row[..width] {
+            let at = usize::from(index) * 4;
+            let color = palette.get(at..at + 4).ok_or_else(invalid)?;
+            rgba.extend_from_slice(&[color[2], color[1], color[0], 255]);
+        }
+    }
+    Ok(Image { width, height, rgba })
 }
 
 /// A chave magenta de fundo pertence à apresentação do MIF, não ao BMP genérico.

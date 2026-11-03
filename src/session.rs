@@ -30,6 +30,7 @@ use crate::video::display::Framebuffer;
 /// Compartilhada para que desktop, headless e Android não reintroduzam um teto de 16 ms e
 /// reduzam jogos rápidos como Crash Nitro Kart a uma fração da velocidade.
 pub const FATIA_MAXIMA: Duration = Duration::from_millis(100);
+pub mod handset_runtime;
 
 /// Teto de instruções por fatia entre duas chamadas de API — evita que um laço infinito no
 /// guest trave o emulador.
@@ -121,6 +122,7 @@ pub struct Session {
     /// interpretador.
     machine: Machine<CpuDaSessao>,
     handset_input: Option<crate::handset::input::Keypad>,
+    handset_identity: Option<(String,String)>,
     handset_pen: crate::handset::input::PenInput,
     handset_avk: crate::handset::input::AvkInput,
     /// O applet criado e ainda **não** iniciado, com o ClassID dele.
@@ -596,6 +598,12 @@ impl Session {
             crate::audio::MidiBackend::Auto, Some(geometry))
     }
 
+    /// Instala o catálogo antes de START; a lista não é descoberta durante o quadro.
+    pub fn start_handset_with_storage_installed(path:&Path,geometry:crate::handset::types::DisplayGeometry,
+        storage:&StoragePaths,contexto:Option<std::sync::Arc<glow::Context>>,installed:&[(u32,String)])->Result<Self,StartError>{
+        Self::start_inner_with_storage_geometry_policy(path,None,None,contexto.is_some(),contexto,
+            crate::config::ZWheel::default(),storage,installed,crate::audio::MidiBackend::Auto,Some(geometry))
+    }
     fn start_inner_with_storage_geometry_policy(
         path: &Path,
         portas: Option<[Option<crate::input::bindings::Aparelho>; crate::input::PORTAS]>,
@@ -627,14 +635,21 @@ impl Session {
             conteudo.display(),
             path.display()
         );
-        let bytes = std::fs::read(path).map_err(StartError::Unreadable)?;
+        let (image,module_identity,handset_manifest,handset_applet,installation) = if geometry.is_some(){
+            let package=crate::handset::launch::read(path).map_err(|e|StartError::NotLoadable(e.to_string()))?;
+            (package.image,package.module_sha256,package.manifest.map(|m|(m.path,m.bytes,m.parsed)),Some(package.applet_class),package.installation)
+        }else{
+            let bytes=std::fs::read(path).map_err(StartError::Unreadable)?;
+            let module_identity={use sha2::{Digest,Sha256};Sha256::digest(&bytes).iter().map(|byte|format!("{byte:02x}")).collect::<String>()};
+            let image=ModImage::parse(bytes).map_err(|e|StartError::NotAModule(e.to_string()))?;
+            (image,module_identity,None,None,None)
+        };
         crate::registro!(
             crate::registro::Nivel::Depuracao,
             "session",
             "{} bytes lidos; analisando o módulo",
-            bytes.len()
+            image.image().len()
         );
-        let image = ModImage::parse(bytes).map_err(|e| StartError::NotAModule(e.to_string()))?;
         let extensoes = extensoes_de(path);
         let module = loader::load_with(&image, &extensoes)
             .map_err(|e| StartError::NotLoadable(e.to_string()))?;
@@ -656,12 +671,28 @@ impl Session {
             false => None,
         };
         let cpu = CpuDaSessao::new().map_err(|e| StartError::NotLoadable(e.to_string()))?;
+        if let Some(installation)=installation{
+            let overlay=save_root.as_ref().ok_or_else(||StartError::NotLoadable("Game installation requires writable app storage".into()))?;
+            installation.prepare(overlay).map_err(|e|StartError::NotLoadable(e.to_string()))?;
+        }
         let mut machine = match geometry {
             Some(geometry) => Machine::new_with_storage_geometry(cpu, module, root, storage, save_root, geometry)
                 .map_err(|error| StartError::NotLoadable(error.to_string()))?,
             None => Machine::new_with_storage_policy(cpu, module, root, storage, save_root, midi_policy),
         };
+        let handset_identity = geometry.map(|_| {
+            use sha2::{Digest,Sha256};
+            // Vazio registra ausência real de MIF. Só perfis de executável
+            // explicitamente auditados aceitam essa identidade sem manifesto.
+            let mif = handset_manifest.as_ref().map(|(_,bytes,_)|
+                Sha256::digest(bytes).iter().map(|byte|format!("{byte:02x}")).collect::<String>()
+            ).unwrap_or_default();
+            (module_identity,mif)
+        });
         if geometry.is_some() { machine.enable_handset_clock(); }
+        if let Some((module,mif)) = &handset_identity {
+            machine.set_handset_runtime_identity(module,mif);
+        }
         // A lista precisa existir antes de `run` e `create_applet`: a Z-Wheel a enumera no boot.
         machine.set_installed_applets(instalados.iter().cloned());
         // Antes de qualquer desenho: ver [`Machine::usa_placa`].
@@ -700,15 +731,12 @@ impl Session {
             return Err(StartError::Stopped(outcome));
         }
 
-        // O aparelho usa a mesma pareação exata validada pelo launcher; a busca ampla do
-        // console pode encontrar outro manifesto e deve continuar restrita ao console.
-        let clsid = if geometry.is_some() {
-            let mif=library::resolve_mif(path).map_err(StartError::NotLoadable)?;
-            let bytes=std::fs::read(&mif).map_err(StartError::Unreadable)?;
-            let class = crate::loader::miffile::MifFile::parse(&bytes).ok().and_then(|mif|mif.main_applet());
-            if let Some(class) = class { machine.set_applet_mif_named(&bytes, class, &mif.file_name().unwrap_or_default().to_string_lossy()); }
-            class
-        }else{library::applet_clsid(path)}.ok_or(StartError::NoApplet)?;
+        // O MIF, quando existe, é o par exato validado pelo launcher. Sem ele só
+        // vale a classe comprovada no executável auditado, não um manifesto vizinho.
+        let clsid=handset_applet.or_else(||library::applet_clsid(path)).ok_or(StartError::NoApplet)?;
+        if let Some((mif,bytes,true))=handset_manifest{
+            machine.set_applet_mif_named(&bytes,clsid,&mif.file_name().unwrap_or_default().to_string_lossy());
+        }
         let created = machine
             .create_applet(clsid, INSTRUCTION_BUDGET)
             .map_err(|e| StartError::NotLoadable(e.to_string()))?;
@@ -760,6 +788,7 @@ impl Session {
         Ok(Self {
             machine,
             handset_input: geometry.map(|_| crate::handset::input::Keypad::default()),
+            handset_identity,
             handset_pen: Default::default(),
             handset_avk: Default::default(),
             partida: Some((applet, clsid)),
@@ -903,10 +932,17 @@ impl Session {
                 self.stopped = Some(bad.clone());
                 return Step::Stopped;
             }
-            if self.machine.pediu_para_fechar() {
-                let _ = self.machine.encerra_applet();
-                self.stopped = Some(Outcome::Returned { code: 0 });
-                return Step::Stopped;
+            if self.machine.pediu_para_fechar() && self.machine.handset_event_ready() {
+                match self.machine.encerra_applet() {
+                    Ok(false) => {},
+                    closed => {
+                        self.stopped = Some(match closed {
+                            Ok(true) => Outcome::Returned { code: 0 },
+                            _ => Outcome::Exception { pc: 0 },
+                        });
+                        return Step::Stopped;
+                    }
+                }
             }
             if self.recebe_apresentacao_handset(before) {
                 return Step::Presented;
@@ -1325,15 +1361,22 @@ impl Session {
             self.stopped = Some(bad.clone());
             return Some(Step::Stopped);
         }
-        // O applet pediu para fechar: recebe o `EVT_APP_STOP` e a sessão termina como uma saída
-        // normal, que é o que a janela lê para voltar à Z-Wheel.
-        if self.machine.pediu_para_fechar() {
-            let _ = self.machine.encerra_applet();
-            self.stopped = Some(Outcome::Returned { code: 0 });
-            return Some(Step::Stopped);
+        // Esperar o retorno do tratador antes de STOP/APP_CLOSED. Uma falha na
+        // limpeza não é uma saída normal, nem autoriza descartar a continuação.
+        if self.machine.pediu_para_fechar() && self.machine.handset_event_ready() {
+            match self.machine.encerra_applet() {
+                Ok(false) => return None,
+                closed => {
+                    self.stopped = Some(match closed {
+                        Ok(true) => Outcome::Returned { code: 0 },
+                        _ => Outcome::Exception { pc: 0 },
+                    });
+                    return Some(Step::Stopped);
+                }
+            }
         }
         // Sem timer armado nem trabalho pendente, nada mais vai acontecer.
-        if outcomes.is_empty() && self.machine.is_idle() {
+        if outcomes.is_empty() && self.machine.is_idle() && !self.machine.applet_em_background() {
             self.stopped = Some(Outcome::Returned { code: 0 });
             return Some(Step::Stopped);
         }
@@ -2219,6 +2262,7 @@ pub(crate) mod tests {
         Session {
             machine,
             handset_input: None,
+            handset_identity: None,
             handset_pen: Default::default(),
             handset_avk: Default::default(),
             partida: None,
@@ -2909,3 +2953,248 @@ pub fn extensoes_de(mod_path: &std::path::Path) -> Vec<loader::ExtensionImage> {
         })
         .collect()
 }
+// Regressões do fechamento assíncrono com módulo ARM e mapa real do loader.
+
+#[cfg(test)]
+mod session_close_review_contracts {
+    use super::*;
+    use crate::brew::aee::{self, Interface};
+    use crate::cpu::CpuBackend;
+    use crate::loader::modfile::ModImage;
+
+    const APPLET: u32 = loader::HEAP_BASE + 0x10000;
+    const VTABLE: u32 = APPLET + 0x100;
+    const STOP_COUNT: u32 = APPLET + 4;
+    const CLOSE_COUNT: u32 = APPLET + 8;
+    const TAIL_DONE: u32 = APPLET + 12;
+    const PCB: u32 = loader::STACK_BASE + 0x200;
+    const HANDLER: u32 = loader::MODULE_BASE + 0x100;
+    const CLEANUP: u32 = loader::MODULE_BASE + 0x200;
+    const REQUEST_AND_WAIT: u32 = loader::MODULE_BASE + 0x300;
+
+    struct Fixture {
+        session: Session,
+        root: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(handset: bool, failing_stop: bool) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("local-tests/startup-repairs-20261029")
+                .join(format!("session-close-review-{}-{}", std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir_all(&root).unwrap();
+            let storage = StoragePaths::from_root(root.join("runtime"));
+            storage.create_dirs().unwrap();
+            let image = ModImage::parse([0xe3a00000u32, 0xe12fff1e]
+                .into_iter().flat_map(u32::to_le_bytes).collect()).unwrap();
+            let mut machine = Machine::new_with_storage(CpuDaSessao::new().unwrap(),
+                loader::load_with(&image, &[]).unwrap(), &root, &storage, None);
+            assert_eq!(machine.run(1000).unwrap(), Outcome::Returned { code: 0 });
+
+            // START retorna TRUE. STOP registra sua entrada e, conforme o caso,
+            // retorna normalmente ou causa uma falha real ao escrever na página nula.
+            let mut handler = vec![0xe3510001u32, 0x13a00001, 0x112fff1e,
+                0xe5901004, 0xe2811001, 0xe5801004];
+            if failing_stop {
+                handler.extend([0xe3a00000, 0xe5800000, 0xe12fff1e]);
+            } else {
+                handler.extend([0xe3a00001, 0xe12fff1e]);
+            }
+            machine.cpu_mut().write_mem(HANDLER,
+                &handler.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+            machine.cpu_mut().write_mem(APPLET, &[0; 16]).unwrap();
+            machine.cpu_mut().write_u32(APPLET, VTABLE).unwrap();
+            machine.cpu_mut().write_u32(VTABLE + 8, HANDLER).unwrap();
+            assert_eq!(machine.start_applet(APPLET, 0x12345678, 1000).unwrap(),
+                Outcome::Returned { code: 1 });
+
+            // APP_CLOSED incrementa um contador distinto; não confundir execução
+            // parcial do STOP com entrega da limpeza dos componentes.
+            machine.cpu_mut().write_mem(CLEANUP,
+                &[0xe5901000u32, 0xe2811001, 0xe5801000, 0xe3a00000, 0xe12fff1e]
+                    .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+            machine.cpu_mut().write_mem(PCB, &[0; 28]).unwrap();
+            machine.cpu_mut().write_u32(PCB + 16, CLEANUP).unwrap();
+            machine.cpu_mut().write_u32(PCB + 20, CLOSE_COUNT).unwrap();
+            let register = shell("RegisterSystemCallback");
+            assert_eq!(machine.call_guest(register,
+                [loader::OBJECT_BASE, PCB, 4, 0], 10000).unwrap(),
+                Outcome::Returned { code: 0 });
+
+            let mut session = super::tests::sessao_minima_para_save_state();
+            session.machine = machine;
+            session.handset_input = handset.then(Default::default);
+            session.started = Instant::now();
+            session.clock_base = u64::from(session.machine.clock_ms());
+            Self { session, root }
+        }
+
+        fn read(&self, pointer: u32) -> u32 {
+            self.session.machine.cpu().read_u32(pointer).unwrap()
+        }
+
+        fn request_close(&mut self) {
+            assert_eq!(self.session.machine.call_guest(shell("CloseApplet"),
+                [loader::OBJECT_BASE, 0, 0, 0], 1000).unwrap(),
+                Outcome::Returned { code: 0 });
+        }
+
+        fn request_close_with_budgeted_tail(&mut self) {
+            let mut words = vec![0xe92d4010u32]; // preserva r4 e LR do chamador.
+            literal(&mut words, 0, loader::OBJECT_BASE);
+            words.push(0xe3a01000);
+            literal(&mut words, 12, shell("CloseApplet"));
+            words.push(0xe12fff3c);
+            // Duas instruções por iteração: maior que a fatia móvel de500k,
+            // mas termina em poucas voltas de teste, sem depender de relógio real.
+            literal(&mut words, 4, 1 << 20);
+            words.extend([0xe2544001, 0x1afffffd]);
+            literal(&mut words, 0, TAIL_DONE);
+            words.extend([0xe3a01001, 0xe5801000, 0xe3a00001, 0xe8bd8010]);
+            self.session.machine.cpu_mut().write_mem(REQUEST_AND_WAIT,
+                &words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+            assert_eq!(self.session.machine.call_guest(REQUEST_AND_WAIT,
+                [0; 4], 16).unwrap(), Outcome::Budget);
+            assert!(self.session.machine.pediu_para_fechar());
+            assert!(!self.session.machine.handset_event_ready());
+            assert_eq!(self.read(TAIL_DONE), 0);
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("local-tests/startup-repairs-20261029").canonicalize().unwrap();
+            let actual = self.root.canonicalize().unwrap();
+            assert!(actual.starts_with(base));
+            std::fs::remove_dir_all(actual).unwrap();
+        }
+    }
+
+    fn shell(method: &str) -> u32 {
+        let slot = (0..256).find(|&slot| Interface::Shell.method(slot) == Some(method)).unwrap();
+        aee::encode(Interface::Shell, slot)
+    }
+
+    fn literal(words: &mut Vec<u32>, register: u32, value: u32) {
+        // LDR reg,[pc,#0]; B próxima instrução; literal.
+        words.extend([0xe59f0000 | (register << 12), 0xea000000, value]);
+    }
+
+    #[test]
+    fn session_close_review_handset_resumes_pending_execution_before_stop_and_cleanup() {
+        let mut f = Fixture::new(true, false);
+        f.request_close_with_budgeted_tail();
+        let step = f.session.anda_handset(Duration::ZERO);
+        assert_ne!(step, Step::Stopped,
+            "CloseApplet não permite abandonar uma continuação ainda em execução");
+        assert_eq!(f.read(TAIL_DONE), 0);
+        assert_eq!(f.read(STOP_COUNT), 0);
+        assert_eq!(f.read(CLOSE_COUNT), 0);
+        assert!(!f.session.machine.handset_event_ready());
+        assert_ne!(f.read(PCB + 8), 0, "limpeza continua registrada enquanto o handler não retorna");
+        for _ in 0..10 {
+            if f.session.anda_handset(Duration::ZERO) == Step::Stopped { break; }
+        }
+        assert!(f.session.stopped.is_some(), "execução finita deve terminar e fechar");
+        assert!(f.session.saiu_normalmente());
+        assert_eq!(f.read(TAIL_DONE), 1);
+        assert_eq!(f.read(STOP_COUNT), 1);
+        assert_eq!(f.read(CLOSE_COUNT), 1);
+    }
+
+    fn stop_failure_is_not_normal_exit(handset: bool) {
+        let mut f = Fixture::new(handset, true);
+        f.request_close();
+        let step = if handset {
+            f.session.anda_handset(Duration::ZERO)
+        } else {
+            f.session.advance_once_inner().unwrap_or(Step::Running)
+        };
+        assert_eq!(step, Step::Stopped, "falha real do STOP termina a sessão");
+        assert!(!f.session.saiu_normalmente(),
+            "uma falha de memória do STOP não pode ser classificada como Returned");
+        assert!(!matches!(f.session.stopped, Some(Outcome::Returned { .. })));
+        assert_eq!(f.read(STOP_COUNT), 1, "o tratador STOP foi realmente chamado");
+        assert_eq!(f.read(CLOSE_COUNT), 0, "APP_CLOSED exige STOP concluído");
+        assert_ne!(f.read(PCB + 8), 0);
+    }
+
+    #[test]
+    fn session_close_review_handset_stop_fault_is_not_normal_exit() {
+        stop_failure_is_not_normal_exit(true);
+    }
+
+    #[test]
+    fn session_close_review_generic_stop_fault_is_not_normal_exit() {
+        stop_failure_is_not_normal_exit(false);
+    }
+
+    #[test]
+    fn session_close_review_handset_background_reply_keeps_polling_without_repeating_stop() {
+        let mut f = Fixture::new(true, false);
+        let handler = [0xe3510001u32, 0x13a00001, 0x112fff1e,
+            0xe5901004, 0xe2811001, 0xe5801004,
+            0xe3a02000, 0xe5c32000, 0xe3a00001, 0xe12fff1e];
+        f.session.machine.cpu_mut().write_mem(HANDLER,
+            &handler.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        f.request_close();
+        for _ in 0..4 {
+            assert_ne!(f.session.anda_handset(Duration::ZERO), Step::Stopped,
+                "FALSE em *dwParam conserva o applet que pediu background");
+        }
+        assert!(f.session.stopped.is_none());
+        assert!(!f.session.machine.pediu_para_fechar());
+        assert_eq!(f.read(STOP_COUNT), 1, "o mesmo CloseApplet só entrega um STOP");
+        assert_eq!(f.read(CLOSE_COUNT), 0);
+        assert_ne!(f.read(PCB + 8), 0);
+    }
+
+    #[test]
+    fn session_close_review_background_survives_generic_idle_and_save_restore() {
+        let mut f = Fixture::new(false, false);
+        let handler = [0xe3510001u32, 0x13a00001, 0x112fff1e,
+            0xe5901004, 0xe2811001, 0xe5801004,
+            0xe3a02000, 0xe5c32000, 0xe3a00001, 0xe12fff1e];
+        f.session.machine.cpu_mut().write_mem(HANDLER,
+            &handler.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        f.request_close();
+        for _ in 0..3 {
+            assert_eq!(f.session.advance_once_inner(), None,
+                "ficar sem timer não encerra um applet que pediu background");
+        }
+        let saved = f.session.grava_estado();
+        f.session.restaura_estado(&saved).unwrap();
+        for _ in 0..3 { assert_eq!(f.session.advance_once_inner(), None); }
+        assert_eq!(f.read(STOP_COUNT), 1);
+        assert_eq!(f.read(CLOSE_COUNT), 0);
+
+        // Uma sessão que carrega estado antigo perde o background da linha do
+        // tempo substituída; os estados antigos não tinham essa transição.
+        let reader = crate::save_state::Leitor::abre(&saved).unwrap();
+        let old = crate::save_state::escreve(&reader.nomes().into_iter()
+            .filter(|name| *name != "esc.applet_em_background")
+            .map(|name| (name.to_owned(), reader.secao(name).unwrap().to_vec()))
+            .collect::<Vec<_>>());
+        f.session.restaura_estado(&old).unwrap();
+        assert_eq!(f.session.advance_once_inner(), Some(Step::Stopped));
+        f.session.restaura_estado(&saved).unwrap();
+        assert_eq!(f.session.advance_once_inner(), None);
+    }
+
+    #[test]
+    fn session_close_review_invalid_background_boolean_is_rejected() {
+        let mut f = Fixture::new(false, false);
+        let saved = f.session.grava_estado();
+        let reader = crate::save_state::Leitor::abre(&saved).unwrap();
+        let mut sections = reader.nomes().into_iter()
+            .filter(|name| *name != "esc.applet_em_background")
+            .map(|name| (name.to_owned(), reader.secao(name).unwrap().to_vec()))
+            .collect::<Vec<_>>();
+        sections.push(("esc.applet_em_background".into(), 2u32.to_le_bytes().to_vec()));
+        assert!(f.session.restaura_estado(&crate::save_state::escreve(&sections)).is_err());
+    }
+}
+

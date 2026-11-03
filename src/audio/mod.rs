@@ -14,6 +14,7 @@ pub mod queued;
 pub mod qcp;
 pub mod cmf;
 pub mod decode;
+pub mod smaf;
 
 /// Backend de síntese MIDI desejado pelo usuário ou frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

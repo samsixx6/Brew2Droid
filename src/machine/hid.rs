@@ -632,6 +632,7 @@ impl<C: CpuBackend> Machine<C> {
                 }
                 super::copyright::CopyrightInput::Pass => {}
             }
+            if self.window_input(evento, avk, 0)?.is_some() { continue; }
             let mut tratado = false;
             // Com o painel de HTML em foco, as setas verticais são dele enquanto houver texto
             // para rolar. Ver [`Machine::rola_html_em_foco`].

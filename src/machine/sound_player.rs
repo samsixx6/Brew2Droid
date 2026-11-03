@@ -230,7 +230,7 @@ impl<C: CpuBackend> Machine<C> {
                     u32::from_le_bytes(header[4..8].try_into().unwrap())
                         .checked_add(8)
                         .unwrap_or(0)
-                } else if header.starts_with(b"cmid") {
+                } else if header.starts_with(b"cmid") || header.starts_with(b"MMMD") {
                     u32::from_be_bytes(header[4..8].try_into().unwrap())
                         .checked_add(8)
                         .unwrap_or(0)
@@ -263,6 +263,13 @@ impl<C: CpuBackend> Machine<C> {
             }
             if size == 0 || size > 4 * 1024 * 1024 {
                 return Ok(EBADPARM);
+            }
+            if size >= 4 && self.read_bytes(data, 4)?.starts_with(b"MMMD") {
+                let bytes = self.read_bytes(data, size)?;
+                if let Err(error) = crate::audio::smaf::validate(&bytes) {
+                    self.anota_midia(this, format!("ISoundPlayer SMAF recusado: {error}"));
+                    return Ok(EUNSUPPORTED);
+                }
             }
             let state = self.media.entry(this).or_default();
             state.carga = 0;

@@ -39,9 +39,9 @@ pub enum Variant {
 /// Cabeçalho da variante `BREW`, lido em bruto.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrewHeader {
-    /// Campo em 0x0C. Vale 1 em todos os módulos observados.
+    /// Campo em 0x0C. Versão 1 nos títulos do console; versão 2 no Vlingo móvel.
     pub version: u32,
-    /// Campo em 0x10. Vale 0x40 em todos os módulos observados — o início do código.
+    /// Campo em 0x10: início do código, 0x40 na v1 e 0x48 na v2 observada.
     pub code_offset: u32,
     /// Campos de 0x14 a 0x3C, ainda não decifrados.
     ///
@@ -94,6 +94,7 @@ pub struct ModImage {
 impl ModImage {
     /// Interpreta os bytes de um arquivo `.mod`.
     pub fn parse(data: Vec<u8>) -> Result<Self, ParseError> {
+        let data = super::flash_dump::recover(&data).unwrap_or(data);
         if data.len() < 8 {
             return Err(ParseError::TooSmall { len: data.len() });
         }

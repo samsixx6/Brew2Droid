@@ -14,16 +14,16 @@ The prepared local repository tracks `https://github.com/samsixx6/Brew2Droid` on
 
 1. In Desktop, use **File > Add local repository**.
 2. Select the prepared source folder, then confirm the selection.
-3. The source files are staged. In **Summary**, enter `Add Brew2Droid source code`, then commit to `main`.
+3. Review the changed source files. Enter a summary describing this update, then commit to `main`.
 4. Click **Push origin** to upload the source to the existing repository.
 5. Refresh the repository page and check that the README and source folders appear together.
 
 ## 3. Add the APK as a development release
 
 1. Open **Releases** on your repository page and choose **Draft a new release**.
-2. Create the tag `v1.0` on `main`.
-3. Use `Brew2Droid 1.0 — Development Preview` as the title. Copy the supplied release notes into the description.
-4. Attach the prepared APK and checksum file. You may also attach the prepared source ZIP; GitHub additionally creates source archives from the tagged commit.
+2. Choose a new, unused version tag on the commit you want to release. Keep existing published version tags intact.
+3. Use a title matching the release, such as `Brew2Droid 1.0 - Development Preview`. Describe the changes and validation in the release notes.
+4. Attach the corresponding APK and checksum file. GitHub creates source archives from the tagged commit.
 5. Select **This is a pre-release**, because this build is an early development APK with a debug-signed wrapper.
 6. Review the files, then choose **Publish release**. Use the save-draft option if you want to finish later.
 
@@ -35,7 +35,7 @@ The Android frontend, shared emulator core, core/probe tests, actual in-game con
 
 Actual games/firmware, SoundFont banks, private tool installations, device captures, personal development history, signing keys, and the proposed 16 game-cover thumbnails are excluded. The tiny ZIP used by an automated migration test contains only synthetic text. Upstream release workflows are not enabled in this copy; the first release is manual.
 
-Keep the GPL license files, third-party notices and upstream credits. Publish the source corresponding to each downloadable APK. An optional source ZIP and `SOURCE_MANIFEST.sha256` have been prepared for this first snapshot.
+Keep the GPL license files, third-party notices and upstream credits. Publish the source corresponding to each downloadable APK. `SOURCE_MANIFEST.sha256` identifies this prepared source snapshot.
 
 ## 5. Later updates
 

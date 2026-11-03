@@ -1396,6 +1396,28 @@ impl<C: CpuBackend> Machine<C> {
         Ok(SUCCESS)
     }
 
+    /// Devolve uma alocação pelas APIs do guest, encerrando os contextos de áudio
+    /// contidos nela. Release do tocador sozinho não encerra a vida de pUser.
+    pub(super) fn free_guest_allocation(&mut self, pointer: u32) -> Option<u32> {
+        let size = self.heap.size_of(pointer)?;
+        let contains = |context: u32| u64::from(context) >= u64::from(pointer)
+            && u64::from(context) < u64::from(pointer) + u64::from(size);
+        self.avisos_de_midia.retain(|(_, _, _, notify)| !contains(notify.context));
+        // A fila reúne IMedia/SoundPlayer e ISound, inclusive avisos legados sem
+        // marcador nativo. Limpar ambas as origens impede recaptura após FREE.
+        let empty = Callback { function: 0, context: 0 };
+        for state in self.media.values_mut() {
+            if contains(state.notify.context) { state.notify = empty; }
+        }
+        for state in self.sounds.values_mut() {
+            if contains(state.notify.context) { state.notify = empty; }
+        }
+        if let Some(contexts) = &mut self.media_batch_tail_contexts {
+            contexts.retain(|context| !contains(*context));
+        }
+        self.heap.free(pointer)
+    }
+
     /// Avisa o jogo de que um som começou ou chegou ao fim.
     ///
     /// O aviso é o que fecha o ciclo de quem toca uma coisa de cada vez: sem ele o jogo fica
@@ -1440,7 +1462,8 @@ impl<C: CpuBackend> Machine<C> {
     /// O `AEEMediaCmdNotify` é escrito **na hora de cada chamada**, num bloco só: um `START` e um
     /// `DONE` na mesma volta, escritos na entrada, diriam os dois `DONE`.
     pub fn entrega_avisos_de_midia(&mut self, budget: u64) -> Result<Vec<Outcome>, CpuError> {
-        if self.avisos_de_midia.is_empty() || self.trecho_interrompido.is_some() {
+        if self.avisos_de_midia.is_empty() || self.trecho_interrompido.is_some()
+            || self.media_batch_tail_contexts.is_some() {
             return Ok(Vec::new());
         }
         if self.bloco_de_aviso_de_midia == 0 {
@@ -1451,13 +1474,20 @@ impl<C: CpuBackend> Machine<C> {
             self.avisos_de_midia.clear();
             return Ok(Vec::new());
         }
-        let mut outcomes = Vec::new();
         // Se há ISound no lote, qualquer callback anterior pode cancelar seu aviso.
         // Conservar a cauda na fila visível até para um callback de IMedia/SoundPlayer.
         let cancellable_sound_batch = self.avisos_de_midia.iter().any(|(owner, _, _, _)|
             matches!(self.objects.kind_of(*owner), Some(Interface::Sound | Interface::SoundLegacy)));
         let mut pending = std::mem::take(&mut self.avisos_de_midia).into_iter();
+        // Um conjunto por lote evita reexaminar toda a cauda a cada callback.
+        // Novos avisos continuam separados em self.avisos_de_midia.
+        self.media_batch_tail_contexts = Some(pending.as_slice().iter()
+            .map(|(_, _, _, notify)| notify.context).collect());
+        let result = (|| -> Result<Vec<Outcome>, CpuError> {
+        let mut outcomes = Vec::new();
         while let Some((this, cmd, status, notify)) = pending.next() {
+            if !self.media_batch_tail_contexts.as_ref()
+                .is_some_and(|contexts| contexts.contains(&notify.context)) { continue; }
             let args = if cmd & MEDIA_NATIVE_SOUND_COMMAND != 0 {
                 let kind = cmd & 0xffff;
                 if kind == AEE_SOUND_VOLUME_CB { [notify.context, kind, AEE_SOUND_SUCCESS, status] }
@@ -1480,7 +1510,7 @@ impl<C: CpuBackend> Machine<C> {
                 // O callback pode liberar o som ou trocar seu registro. Devolver a cauda
                 // antes de chamá-lo conserva seu cancelamento; avisos novos ficam para a
                 // próxima volta, sem alterar o lote de IMedia.
-                let mut remaining: Vec<_> = pending.collect();
+                let mut remaining: Vec<_> = pending.by_ref().collect();
                 remaining.append(&mut self.avisos_de_midia);
                 self.avisos_de_midia = remaining;
                 outcomes.push(self.call_guest(notify.function, args, budget)?);
@@ -1491,13 +1521,19 @@ impl<C: CpuBackend> Machine<C> {
             outcomes.push(outcome);
             if incomplete {
                 // O callback ainda lê este bloco; o próximo aviso só pode reusá-lo no retorno.
-                let mut remaining: Vec<_> = pending.collect();
-                remaining.append(&mut self.avisos_de_midia);
-                self.avisos_de_midia = remaining;
                 break;
             }
         }
         Ok(outcomes)
+        })();
+        // Executa também após erro de memória, Fault ou Budget. Filtrar apenas a
+        // cauda original preserva um registro novo no mesmo endereço reutilizado.
+        let contexts = self.media_batch_tail_contexts.take().unwrap_or_default();
+        let mut remaining: Vec<_> = pending
+            .filter(|(_, _, _, notify)| contexts.contains(&notify.context)).collect();
+        remaining.append(&mut self.avisos_de_midia);
+        self.avisos_de_midia = remaining;
+        result
     }
 
     /// Reconhece a entrega de um som que o jogo gera enquanto toca, e guarda o formato dele.

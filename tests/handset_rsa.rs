@@ -25,7 +25,7 @@ impl Harness {
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
-        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir(&work).unwrap();
         let storage = StoragePaths::from_root(work.join("runtime"));
         storage.create_dirs().unwrap();
         let mut code = vec![0u8; 0x100];
@@ -391,12 +391,12 @@ fn rsa_callback_budget_and_reused_callback_keep_one_completion() {
 fn current_net_class_creates_existing_offline_manager_instead_of_null() {
     let mut h = Harness::new();
     let net = h.create(0x0100102e);
-    assert_eq!(
-        h.rsa(net, 5, &[1]),
-        0,
-        "OpenSocket offline devolve ponteiro nulo"
-    );
-    assert_eq!(h.rsa(net, 4, &[]), 0x216, "GetLastError descreve NETDOWN");
+    let socket = h.rsa(net, 5, &[1]);
+    assert_ne!(socket, 0, "o invólucro existe antes de abrir a rede");
+    assert_eq!(h.rsa(net, 4, &[]), 0);
+    assert_eq!(h.rsa(socket, 1, &[]), 0);
+    assert_eq!(h.rsa(net, 5, &[2]), 0, "tipo não suportado não cria socket");
+    assert_eq!(h.rsa(net, 4, &[]), 0x207, "ESOCKNOSUPPORT específico");
     h.machine.cpu_mut().write_mem(OUTPUT, &[0xa5; 36]).unwrap();
     assert_eq!(h.rsa(net, 6, &[OUTPUT]), 4);
     let mut data = [0; 36];
@@ -455,5 +455,156 @@ fn rsa_requeued_callback_cannot_starve_another_object_even_after_restore() {
         );
         assert_eq!(h.machine.cpu().read_u32(result_b).unwrap(), 0);
         assert_eq!(h.machine.cpu().read_u32(OUTPUT).unwrap(), 1);
+    }
+}
+
+impl Harness {
+    fn no_padding_request(
+        &mut self,
+        rsa: u32,
+        slot: u32,
+        input_size: u32,
+        capacity: u32,
+        padding: u32,
+    ) {
+        self.machine
+            .cpu_mut()
+            .write_mem(OUTPUT, &[0xa5; 12])
+            .unwrap();
+        self.machine.cpu_mut().write_u32(LENGTH, capacity).unwrap();
+        self.machine
+            .cpu_mut()
+            .write_u32(RESULT, 0xdeadbeef)
+            .unwrap();
+        self.machine.cpu_mut().write_u32(MARKER, 0).unwrap();
+        self.machine.cpu_mut().write_mem(CB, &[0; 28]).unwrap();
+        self.machine
+            .cpu_mut()
+            .write_u32(CB + 16, loader::MODULE_BASE + 0x20)
+            .unwrap();
+        self.machine.cpu_mut().write_u32(CB + 20, MARKER).unwrap();
+        self.rsa(
+            rsa,
+            slot,
+            &[SIG, input_size, OUTPUT + 4, LENGTH, padding, RESULT, CB],
+        );
+        assert_eq!(self.machine.cpu().read_u32(RESULT).unwrap(), 0xdeadbeef);
+        assert_eq!(self.machine.cpu().read_u32(MARKER).unwrap(), 0);
+        assert_eq!(
+            self.output_guard(),
+            [0xa5; 12],
+            "nenhuma escrita antes da conclusão"
+        );
+    }
+
+    fn output_guard(&self) -> [u8; 12] {
+        let mut bytes = [0; 12];
+        self.machine.cpu().read_mem(OUTPUT, &mut bytes).unwrap();
+        bytes
+    }
+}
+
+#[test]
+fn rsa_no_padding_encrypt_and_decrypt_use_caller_buffers_and_big_endian_keys() {
+    // RSA didático: n=3233, e=17, d=2753. 65^17 mod n=2790; 2790^d mod n=65.
+    for (slot, exponent, input, expected) in [
+        (5, &[0x11][..], [0, 65], [0x0a, 0xe6]),
+        (6, &[0x0a, 0xc1][..], [0x0a, 0xe6], [0, 65]),
+    ] {
+        let mut h = Harness::new();
+        let rsa = h.create(0x0100101a);
+        assert_eq!(h.key(rsa, &[0x0c, 0xa1], exponent), 0);
+        h.machine.cpu_mut().write_mem(SIG, &input).unwrap();
+        h.no_padding_request(rsa, slot, 2, 4, 4);
+        assert_eq!(h.machine.cpu().read_u32(LENGTH).unwrap(), 4);
+        h.machine.deliver_signals(10000).unwrap();
+        assert_eq!(h.machine.cpu().read_u32(RESULT).unwrap(), 0);
+        assert_eq!(h.machine.cpu().read_u32(LENGTH).unwrap(), 2);
+        let mut guarded = [0xa5; 12];
+        guarded[4..6].copy_from_slice(&expected);
+        assert_eq!(h.output_guard(), guarded, "pbOut é byte*, nunca byte**");
+        assert_eq!(h.machine.cpu().read_u32(MARKER).unwrap(), 1);
+        h.machine.cpu_mut().write_u32(MARKER, 0).unwrap();
+        h.machine.deliver_signals(10000).unwrap();
+        assert_eq!(h.machine.cpu().read_u32(MARKER).unwrap(), 0);
+    }
+}
+
+#[test]
+fn rsa_no_padding_reports_real_key_size_capacity_and_padding_errors_without_output() {
+    for slot in [5, 6] {
+        // Casos independentes: não usar resultado fixo nem aceitar dado >= módulo.
+        for (initialized, input, input_size, capacity, padding, error) in [
+            (false, [0, 65], 2, 2, 4, 0x603),
+            (true, [0, 65], 1, 2, 4, 0x609),
+            (true, [0, 65], u32::MAX, 2, 4, 0x609),
+            (true, [0x0c, 0xa1], 2, 2, 4, 0x609),
+            (true, [0, 65], 2, 0, 4, 0x607),
+            (true, [0, 65], 2, 1, 4, 0x607),
+            (true, [0, 65], 2, 2, 99, 0x604),
+            (true, [0, 65], 2, 2, 1, 20),
+        ] {
+            let mut h = Harness::new();
+            let rsa = h.create(0x0100101a);
+            if initialized {
+                assert_eq!(h.key(rsa, &[0x0c, 0xa1], &[17]), 0);
+            }
+            h.machine.cpu_mut().write_mem(SIG, &input).unwrap();
+            h.no_padding_request(rsa, slot, input_size, capacity, padding);
+            h.machine.deliver_signals(10000).unwrap();
+            assert_eq!(h.machine.cpu().read_u32(RESULT).unwrap(), error);
+            assert_eq!(h.machine.cpu().read_u32(MARKER).unwrap(), 1);
+            assert_eq!(h.output_guard(), [0xa5; 12]);
+        }
+    }
+}
+
+#[test]
+fn rsa_no_padding_cancel_and_release_prevent_late_writes_and_callbacks() {
+    for slot in [5, 6] {
+        for release in [false, true] {
+            let mut h = Harness::new();
+            let rsa = h.create(0x0100101a);
+            assert_eq!(h.key(rsa, &[0x0c, 0xa1], &[17]), 0);
+            h.machine.cpu_mut().write_mem(SIG, &[0, 65]).unwrap();
+            h.no_padding_request(rsa, slot, 2, 2, 4);
+            if release {
+                h.rsa(rsa, 1, &[]);
+            } else {
+                let cancel = h.machine.cpu().read_u32(CB + 8).unwrap();
+                assert_ne!(cancel, 0);
+                assert!(matches!(
+                    h.machine.call_guest(cancel, [CB, 0, 0, 0], 1000).unwrap(),
+                    Outcome::Returned { .. }
+                ));
+            }
+            let saved = h.machine.grava_estado();
+            h.machine.restaura_estado(&saved).unwrap();
+            h.machine.deliver_signals(10000).unwrap();
+            assert_eq!(h.machine.cpu().read_u32(RESULT).unwrap(), 0xdeadbeef);
+            assert_eq!(h.machine.cpu().read_u32(MARKER).unwrap(), 0);
+            assert_eq!(h.output_guard(), [0xa5; 12]);
+        }
+    }
+}
+
+#[test]
+fn rsa_no_padding_pending_buffers_and_completion_survive_save_restore() {
+    for slot in [5, 6] {
+        let mut h = Harness::new();
+        let rsa = h.create(0x0100101a);
+        assert_eq!(h.key(rsa, &[0x0c, 0xa1], &[17]), 0);
+        h.machine.cpu_mut().write_mem(SIG, &[0, 65]).unwrap();
+        h.no_padding_request(rsa, slot, 2, 2, 4);
+        let saved = h.machine.grava_estado();
+        h.machine.deliver_signals(10000).unwrap();
+        assert_eq!(h.machine.cpu().read_u32(RESULT).unwrap(), 0);
+        h.machine.restaura_estado(&saved).unwrap();
+        assert_eq!(h.machine.cpu().read_u32(RESULT).unwrap(), 0xdeadbeef);
+        assert_eq!(h.output_guard(), [0xa5; 12]);
+        h.machine.deliver_signals(10000).unwrap();
+        assert_eq!(h.machine.cpu().read_u32(RESULT).unwrap(), 0);
+        assert_eq!(h.machine.cpu().read_u32(MARKER).unwrap(), 1);
+        assert_eq!(&h.output_guard()[4..6], &[0x0a, 0xe6]);
     }
 }

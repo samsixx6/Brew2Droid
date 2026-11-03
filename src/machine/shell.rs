@@ -6,6 +6,34 @@ use super::*;
 const DEVICEITEM_FSSPACE_ROOT: u32 = 65;
 
 impl<C: CpuBackend> Machine<C> {
+    /// AEEShell.h: consulta de grupo/privilegio do applet, sem criar a classe.
+    pub(super) fn shell_check_privilege(&mut self) -> u32 {
+        let wanted = self.cpu.read_reg(Reg::R1);
+        let query_only = self.cpu.read_reg(Reg::R2) != 0;
+        let granted = if wanted == 0 || (self.applet_class != 0 && wanted == self.applet_class) {
+            true
+        } else if wanted <= u16::MAX as u32 {
+            // Formato observado nos MIFs móveis: IDB_MIF_MODINFO (binário 0),
+            // versão 0x1002, 40 bytes, máscara PL_* em +24. Não adivinhar outras versões.
+            let mask = self.applet_resources.as_ref().and_then(|(_, res)| res.get(0x5000, 0))
+                .filter(|data| data.len() == 40 && data[..4] == 0x1002u32.to_le_bytes())
+                .map(|data| u32::from_le_bytes(data[24..28].try_into().unwrap()))
+                .filter(|mask| *mask <= u16::MAX as u32).unwrap_or(0);
+            // PL_NETWORK também dá acesso ao grupo PL_WEB, conforme o SDK.
+            let effective = mask | if mask & 2 != 0 { 8 } else { 0 };
+            effective & wanted == wanted
+        } else {
+            self.applet_manifest.as_ref().and_then(|(data, _)| {
+                crate::loader::miffile::MifFile::parse(data).ok()
+            }).is_some_and(|mif| mif.classes.contains(&wanted))
+        };
+        if !granted && !query_only {
+            self.applet_fechado = true;
+            self.applet_privilege_denied = true;
+        }
+        u32::from(granted)
+    }
+
     /// Os três métodos de timer do `IShell`, todos com a assinatura
     /// `(IShell *, [int32 dwMsecs,] PFNNOTIFY pfn, void *pUser)`.
     ///
@@ -194,7 +222,7 @@ impl<C: CpuBackend> Machine<C> {
         }
         let image = self.new_object(Interface::Image)?;
         if image != 0 {
-            self.images.insert(image, std::rc::Rc::new(decoded));
+            self.install_decoded_image(image, decoded)?;
         }
         Ok(image)
     }
@@ -211,7 +239,11 @@ impl<C: CpuBackend> Machine<C> {
         if let Some(gif) = crate::video::gif::decodifica(bytes) {
             return Some(tira_de_quadros(&gif));
         }
-        let image = crate::video::icon::decode(bytes).ok()?;
+        let (image, frame_width) = if bytes.starts_with(b"SAF\0") {
+            crate::video::saf::decode_frames(bytes).ok()?
+        } else {
+            (crate::video::icon::decode(bytes).ok()?, 0)
+        };
         let count = image.width * image.height;
         let mut pixels = Vec::with_capacity(count);
         for at in (0..count * 4).step_by(4) {
@@ -230,7 +262,7 @@ impl<C: CpuBackend> Machine<C> {
             pixels,
             opaque: vec![true; count],
             alfa: Vec::new(),
-            frame_width: 0,
+            frame_width: frame_width as u16,
         })
     }
 
@@ -244,6 +276,15 @@ impl<C: CpuBackend> Machine<C> {
         &mut self,
         pointer: u32,
     ) -> Option<&crate::loader::resfile::ResFile> {
+        if pointer != 0 {
+            if let Some((selected, resources)) = &self.applet_resources {
+                if !selected.is_empty() && self.cpu.read_cbytes(pointer, 4097) == selected.as_bytes() {
+                    // O MIF pode estar fora do diretório do .mod. Este é o par
+                    // escolhido pelo launcher, servido sem procurar um vizinho.
+                    return Some(resources);
+                }
+            }
+        }
         let path = match pointer {
             0 => self.default_res_file()?,
             _ => {
@@ -320,6 +361,7 @@ impl<C: CpuBackend> Machine<C> {
         let Some(text) = self.open_res_file(file).and_then(|res| res.string(id)) else {
             return Ok(0);
         };
+        let Some(text) = self.encode_guest_aechar_units(&text) else { return Ok(0); };
         if buffer == 0 || capacity < 2 {
             return Ok(0);
         }
@@ -473,6 +515,9 @@ impl<C: CpuBackend> Machine<C> {
         let mut requested = [0u8; 2];
         self.cpu.read_mem(info + 44, &mut requested)?;
         let requested = u16::from_le_bytes(requested) as u32;
+        if self.serial.is_some() {
+            self.registra_serial(format!("<GetDeviceInfo info={info:#x} wStructSize={requested} sp={:#x}>", self.cpu.read_reg(Reg::Sp)));
+        }
 
         // Zera até `dwLang`, o último campo antes da parte que o chamador preenche.
         self.cpu.write_mem(info, &[0u8; 44])?;
@@ -483,7 +528,7 @@ impl<C: CpuBackend> Machine<C> {
             0, // cxAltScreen: o Zeebo não tem segunda tela
             0, // cyAltScreen
             8, // cxScrollBar
-            AEE_ENC_ISOLATIN1,
+            self.native_device_encoding(),
             0, // wMenuTextScroll
             COLOR_DEPTH,
         ];
@@ -503,17 +548,36 @@ impl<C: CpuBackend> Machine<C> {
                 0
             };
         self.cpu.write_u32(info + 28, capabilities)?;
+        // AEEShell.h define dwLang como ISO 639-1, com os códigos de AEELngCode.h.
+        // Zero não nomeia idioma: Mobi Escape só escolhe seu BAR ao receber en/zh,
+        // e com zero acabava chamando um IImage nulo. Os padrões acompanham o
+        // aparelho móvel em inglês e o console em português, sem depender da UI host.
+        let language = if self.handset_clock.is_some() {
+            0x2020_6e65 // LNG_ENGLISH: "en  "
+        } else {
+            0x2020_7470 // LNG_PORTUGUESE: "pt  "
+        };
+        self.cpu.write_u32(info + 40, language)?;
         // `dwRAM` — a documentação chama de "tamanho inicial do heap do BREW".
         self.cpu.write_u32(info + 24, loader::HEAP_SIZE as u32)?;
 
-        if requested >= DEVICE_INFO_SIZE {
+        // AEEShell.h exige wStructSize igual a sizeof(AEEDeviceInfo) para os campos
+        // estendidos. Um valor indefinido numa estrutura antiga não é uma capacidade:
+        // aceitar qualquer valor maior também zerava o r4 salvo após buffers de 60 bytes.
+        if requested == DEVICE_INFO_SIZE {
             self.cpu
                 .write_mem(info + 44, &(DEVICE_INFO_SIZE as u16).to_le_bytes())?;
             self.cpu.write_u32(info + 48, 0)?; // dwNetLinger: sem rede, nada a manter aberto
             self.cpu.write_u32(info + 52, 0)?; // dwSleepDefer: o console não dorme
             self.cpu
                 .write_mem(info + 56, &(AEE_MAX_FILE_NAME as u16).to_le_bytes())?;
-            self.cpu.write_u32(info + 60, 0)?; // dwPlatformID: não sabemos o do Zeebo
+            // Um par auditado reserva somente 60 bytes e deixa wStructSize sem
+            // inicializar; o lixo pode coincidir com 64. Não existe tamanho de
+            // buffer separado na ABI. O perfil exato conserva o r4 salvo em +60,
+            // sem reduzir a struct dos chamadores modernos que realmente pedem 64.
+            if !self.legacy_device_info {
+                self.cpu.write_u32(info + 60, 0)?; // dwPlatformID desconhecido
+            }
         }
         Ok(SUCCESS)
     }
@@ -576,6 +640,7 @@ impl<C: CpuBackend> Machine<C> {
     }
 
     /// Manda `EVT_APP_START` para o applet, que é o que dá partida no jogo.
+    /// A capacidade explícita de janela negocia EVT_APP_START_WINDOW antes desse evento.
     ///
     /// `boolean IAPPLET_HandleEvent(IApplet *po, AEEEvent evt, uint16 wParam, uint32 dwParam)`
     /// — slot 2 da vtable de `IApplet`. Em `EVT_APP_START`, `dwParam` aponta para um
@@ -586,18 +651,20 @@ impl<C: CpuBackend> Machine<C> {
         clsid: u32,
         budget: u64,
     ) -> Result<Outcome, CpuError> {
+        if self.handset_clock.is_some() && self.window_start_capable {
+            return self.start_window_capable_applet(applet, clsid, budget);
+        }
         let vtable = self.cpu.read_u32(applet)?;
         let handle_event = self.cpu.read_u32(vtable + 2 * 4)?;
         // A partir daqui `GetAppInstance` tem o que devolver — e passa a responder sem sair
         // da CPU.
         self.current_applet = applet;
+        self.applet_class = clsid;
+        if !self.app_history.managed { self.app_history.shared.lock().unwrap_or_else(|e|e.into_inner()).classes=vec![clsid]; }
+        self.applet_em_background = false;
         self.install_app_instance_stub(applet)?;
 
-        let display = self.objects.create(Interface::Display).unwrap_or(0);
-        if display != 0 {
-            self.cpu
-                .write_u32(display, loader::vtable_addr(Interface::Display))?;
-        }
+        let display=self.default_applet_display()?;
 
         // AEEAppStart: error, clsApp, pDisplay, rc (4 × int16), pszArgs = 24 bytes.
         let start = self.heap.alloc(24).unwrap_or(0);
@@ -788,12 +855,15 @@ impl<C: CpuBackend> Machine<C> {
             }
             super::copyright::CopyrightInput::Pass => {}
         }
+        if let Some(code) = self.window_input(code, w, dw)? {
+            return Ok(Outcome::Returned { code });
+        }
         self.call_guest(handler, [applet, code, w, dw], budget)
     }
 
     /// O host troca de sessão depois que a chamada do guest terminou.
     pub fn take_launch_request(&mut self) -> Option<u32> {
-        self.pending_launch.take()
+        (self.handset_event_ready()&&!self.pediu_para_fechar()).then(|| self.pending_launch.take()).flatten()
     }
 
     // O SDK dá à versão 3.1.3 outro ClassID, com a mesma vtable de IFileMgr.
@@ -807,11 +877,14 @@ impl<C: CpuBackend> Machine<C> {
     // documentada do BREW.
     fn native_class(clsid: u32) -> Option<Interface> {
         Some(match clsid {
+            0x0100_1000 => Interface::Shell,
             AEECLSID_DISPLAY | AEECLSID_DISPLAY1 => Interface::Display,
             AEECLSID_FILEMGR | 0x0102_d575 => Interface::FileMgr,
             AEECLSID_HID => Interface::Hid,
             AEECLSID_SIGNAL_CB_FACTORY => Interface::SignalCbFactory,
-            AEECLSID_GRAPHICS => Interface::Graphics,
+            // AEEGraphics_BREW.bid oferece o mesmo IGraphics de dois slots IBASE;
+            // é a implementação por software, não uma interface com QI adicional.
+            AEECLSID_GRAPHICS | 0x0102_fb92 => Interface::Graphics,
             AEECLSID_SOUND => Interface::Sound,
             0x0100_100b => Interface::SoundLegacy,
             AEECLSID_SOUNDPLAYER => Interface::SoundPlayer,
@@ -833,10 +906,13 @@ impl<C: CpuBackend> Machine<C> {
             AEECLSID_GL => Interface::GlLegacy,
             AEECLSID_MEDIAUTIL => Interface::MediaUtil,
             AEECLSID_WEB => Interface::Web,
+            0x0100_103e => Interface::Registry,
             0x0100_1105 | 0x0100_102e => Interface::NetLegacy,
             0x0100_1007 => Interface::TapiLegacy,
             0x0100_5001 => Interface::WebUtil,
-            AEECLSID_COLLECTION => Interface::Collection,
+            AEECLSID_COLLECTION => Interface::AppHistory,
+            0x0106_e415 => Interface::MemCache1,
+            0x0107_1647 => Interface::PimContacts,
             AEECLSID_SQLMGR => Interface::SqlMgr,
             0x0100_1008 => Interface::DBMgrLegacy,
             AEECLSID_SOURCEUTIL => Interface::SourceUtil,
@@ -899,14 +975,23 @@ impl<C: CpuBackend> Machine<C> {
         }
         Ok(u32::from(
             Self::native_class(class).is_some()
+                || class == super::regional_model::CLASS_ID
                 || self.tem_extensao_para(class)
                 || crate::machine::font::CLASSES_DE_FONTE.contains(&class)
                 || matches!(
                     class,
-                    0x01003000
+                    0x01002017
+                        | 0x01001028
+                        | 0x01003000
                         | 0x01003001
                         | 0x01003100
                         | 0x01003101
+                        | 0x01003002
+                        | 0x01003102
+                        | 0x01003003
+                        | 0x01003103
+                        | 0x01003005
+                        | 0x01003007
                         | 0x01003009
                         | 0x0100100a
                         | 0x0100110a
@@ -931,18 +1016,49 @@ impl<C: CpuBackend> Machine<C> {
             self.registra_serial(format!("<classe {clsid:#010x}>"));
         }
 
+        // Esta classe usa os erros nativos do Brew MP, inclusive AEE_ENOMEMORY=2.
+        if clsid == 0x0107_1647 {
+            return self.create_pim_contacts(out);
+        }
+        match clsid {
+            super::viewport::CLASS_ID => return self.create_viewport(out),
+            super::scrollbar::CLASS_ID => return self.create_scrollbar(out),
+            super::static_widget::CLASS_ID => return self.create_static_widget(out),
+            super::softkey_widget::CLASS_ID => return self.create_softkey_widget(out),
+            super::button_widget::CLASS_ID => return self.cria_button_widget(out),
+            super::text_model::CLASS_ID => return self.create_text_model(out),
+            super::text_layout::CLASS_ID => return self.create_text_layout(out),
+            super::root_container::CLASS_ID => return self.create_root_container(out),
+            super::display_canvas::CLASS_ID => return self.create_display_canvas(out),
+            super::value_model::CLASS_ID => return self.create_value_model(out),
+            super::modern_font::TYPEFACE_CLASS => return self.create_modern_typeface(out),
+            super::modern_font::VIRTUAL_FONT_CLASS => return self.create_modern_hfont(out, 0, 16, 0, 0, false),
+            super::font_map_model::CLASS_ID => return self.create_font_map(out),
+            _ => {}
+        }
+
         let iface = match Self::native_class(clsid) {
             Some(iface) => iface,
             None => match clsid {
+                super::image_widget::CLASS_ID => return self.create_image_widget(out),
+                super::xy_container::CLASS_ID => return self.create_xy_container(out),
+                super::window_manager::MANAGER_CLASS => return self.create_window_manager(out),
+                super::window_manager::DISPLAY_CLASS => return self.create_display_widget(out),
+                0x0100_3005 => return self.create_temporal_control(Interface::DateLegacy, out),
+                0x0100_3007 => return self.create_temporal_control(Interface::ClockLegacy, out),
+                0x0100_2017 => return self.cria_addrbook_legado(out),
+                0x0100_1028 => return self.cria_sprite_legado(out),
                 // AEEMenu.h conserva os 26 slots originais antes das extensões 1.NNN.
                 // As classes 1.0 usam a mesma ABI; LOTR ainda as pede ao abrir o menu.
                 0x0100_3000 | 0x0100_3001 | 0x0100_3100 | 0x0100_3101 | 0x0100_3009
-                | 0x0100_100a | 0x0100_110a => {
+                | 0x0100_3002 | 0x0100_3102 | 0x0100_3003 | 0x0100_3103 | 0x0100_100a | 0x0100_110a => {
                     use super::legacy_controls::LegacyControlKind;
                     let kind = match clsid {
                         0x0100_3000 | 0x0100_3100 => LegacyControlKind::Menu,
                         0x0100_3001 | 0x0100_3101 => LegacyControlKind::Softkey,
                         0x0100_3009 => LegacyControlKind::Text100,
+                        0x0100_3002 | 0x0100_3102 => LegacyControlKind::List,
+                        0x0100_3003 | 0x0100_3103 => LegacyControlKind::IconView,
                         _ => LegacyControlKind::Static,
                     };
                     return self.cria_controle_legado(kind, out);
@@ -992,6 +1108,14 @@ impl<C: CpuBackend> Machine<C> {
                         self.cpu.write_u32(out, objeto)?;
                     }
                     return Ok(SUCCESS);
+                }
+                // O provedor ARM acima é autoritativo, inclusive quando falha. Este fallback
+                // entrega só o campo local de modelo virtual verificado nos consumidores.
+                super::regional_model::CLASS_ID => {
+                    if !self.regional_model_output_fits(out, 4) {
+                        return Ok(super::regional_model::BAD_PARAMETER);
+                    }
+                    Interface::RegionalModelInfo
                 }
                 // **`AEECLSID_DOWNLOAD`.** Ver [`AEECLSID_DOWNLOAD`]: a classe do `IDownload`, que
                 // o SDK lista como `AEECLSID_PRIV` (= `QVERSION` = `0x01000000`). Atendida pela
@@ -1050,10 +1174,17 @@ impl<C: CpuBackend> Machine<C> {
             },
         };
 
+        if iface == Interface::Registry {
+            self.registry_load();
+        }
         let Some(obj) = self.objects.create(iface) else {
             return Ok(ENOMEMORY);
         };
         self.cpu.write_u32(obj, loader::vtable_addr(iface))?;
+        if iface == Interface::Web {
+            self.cpu.write_mem(obj + 4, &[0; 60])?;
+            self.cpu.write_u32(obj + 12, 1)?; // XOPT_COPYOPTS vem habilitado.
+        }
         self.transparency.remove(&obj);
         if iface == Interface::Rsa {
             self.rsas.insert(obj, rsa::RsaState::default());
@@ -1070,6 +1201,9 @@ impl<C: CpuBackend> Machine<C> {
         // Uma coleção nasce vazia e com o cursor no começo. Sem esse registro ela não existiria
         // para os métodos, e um `AtEnd` numa coleção desconhecida responderia "acabou" por
         // acaso — a resposta certa pelo motivo errado.
+        if iface == Interface::AppHistory {
+            self.app_history.created(obj);
+        }
         if iface == Interface::Collection {
             self.collections.insert(obj, (Vec::new(), 0));
         }
@@ -1163,13 +1297,35 @@ impl<C: CpuBackend> Machine<C> {
         // `IModule::CreateInstance(po, shell, clsid, &saida)` — o slot 2, o mesmo do applet.
         let vtable = self.cpu.read_u32(modulo)?;
         let create_instance = self.cpu.read_u32(vtable + 2 * 4)?;
-        let saida = out_module + 4;
+        // A Summus escreve *ppObj antes de criar os componentes do objeto. Uma
+        // saída compartilhada por módulo deixava a fábrica interna substituir o
+        // objeto externo ainda em construção. A reserva vive nesta chamada, abaixo
+        // da pilha corrente; chamadas internas recebem outras reservas mais abaixo.
+        let sp = self.cpu.read_reg(Reg::Sp);
+        let Some(novo_sp) = sp.checked_sub(8).map(|value| value & !7) else {
+            return Ok(0);
+        };
+        let base_pilha = if (loader::STACK_BASE..=loader::STACK_BASE + loader::STACK_SIZE as u32)
+            .contains(&sp) {
+            Some(loader::STACK_BASE)
+        } else {
+            // Threads e jogos que trocam a própria pilha usam blocos vivos da heap.
+            sp.checked_sub(1).and_then(|top| self.heap.bloco_que_contem(top)).map(|(base, _)| base)
+        };
+        if base_pilha.is_none_or(|base| novo_sp < base) {
+            return Ok(0);
+        }
+        let saida = novo_sp + 4;
         self.cpu.write_u32(saida, 0)?;
+        self.cpu.write_reg(Reg::Sp, novo_sp);
         let desfecho = self.call_guest_aninhado(
             create_instance,
             [modulo, self.module.shell, clsid, saida],
             budget,
-        )?;
+        );
+        // Restaurar também em erro/Budget: não há continuação desta chamada síncrona.
+        self.cpu.write_reg(Reg::Sp, sp);
+        let desfecho = desfecho?;
         if !matches!(desfecho, Outcome::Returned { code: 0 }) {
             return Ok(0);
         }

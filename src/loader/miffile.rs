@@ -28,17 +28,18 @@
 //! que a engenharia reversa da firmware do Zeebo registrou para o Media Player, e
 //! `274755.mif` (o Z-Wheel) devolve `0x01070798`, o App ID que a firmware chama de "TECTOY".
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 const MAGIC: u16 = 0x0011;
 /// Tamanho do registro que descreve um applet.
 const APPLET_RECORD_LEN: u32 = 20;
-/// Tamanho do registro que cita uma classe: `<u32 ClassID> <u32 zero>`.
+/// Forma legada de uma lista com uma classe: `<u32 ClassID> <u32 zero>`.
 ///
 /// Ele aparece nos dois lados da mesma relação, com **bytes idênticos**: no `.mif` do jogo, que
 /// declara a classe de que depende, e no `.mif` do módulo que a fornece. Quem distingue não é o
 /// registro, é o arquivo em volta — ver [`MifFile::extensao`].
 const CLASS_RECORD_LEN: u32 = 8;
+const RESTYPE_BINARY: u16 = 0x5000;
 /// Palavras do registro de applet que são sempre zero.
 ///
 /// O registro é `ClassID`, um zero, um número, outro zero e um campo que varia. São esses dois
@@ -108,7 +109,7 @@ impl MifFile {
             .map(|w| (w[0], w[1].saturating_sub(w[0])))
             .collect();
 
-        let applets = sections
+        let applets: Vec<u32> = sections
             .iter()
             .filter(|&&(_, len)| len == APPLET_RECORD_LEN)
             .filter(|&&(offset, _)| is_applet_record(data, offset as usize))
@@ -116,17 +117,22 @@ impl MifFile {
             .filter(|&id| id != 0)
             .collect();
 
-        let classes = sections
-            .iter()
-            .filter(|&&(_, len)| len == CLASS_RECORD_LEN)
-            .filter_map(|&(offset, _)| {
-                let clsid = read_u32(data, offset as usize).ok()?;
-                // O registro termina em zero, e há um de 8 bytes **todo** zerado nos arquivos
-                // reais — recusar os dois é o que impede uma lista com um `0x0` dentro.
-                let resto = read_u32(data, offset as usize + 4).ok()?;
-                (clsid != 0 && resto == 0).then_some(clsid)
-            })
-            .collect();
+        let index_count = read_u16(data, 6)? as usize;
+        let classes = if index_count == 0 {
+            // Fixtures e manifestos legados sem índice conservam a forma conhecida.
+            // Um índice presente, porém inválido, nunca cai nesta inferência por tamanho.
+            sections
+                .iter()
+                .filter(|&&(_, len)| len == CLASS_RECORD_LEN)
+                .filter_map(|&(offset, _)| {
+                    let clsid = read_u32(data, offset as usize).ok()?;
+                    let resto = read_u32(data, offset as usize + 4).ok()?;
+                    (clsid != 0 && resto == 0).then_some(clsid)
+                })
+                .collect()
+        } else {
+            indexed_classes(data, &sections, index_count, !applets.is_empty()).unwrap_or_default()
+        };
 
         Ok(Self {
             applets,
@@ -180,6 +186,85 @@ impl MifFile {
             &[]
         }
     }
+}
+
+/// Listas binárias 1 (exportações) e 3 (dependências), não qualquer seção de mesmo tamanho.
+/// No corpus local, 402 listas têm `(contagem + 1) * 4` bytes e NUL final. No ModInfo
+/// 0x1000/0x1002 de 40 bytes, as contagens uint16 ficam em +26 e +30, respectivamente.
+/// Ler só oito bytes descartava as duas dependências reais da lista de 12 bytes.
+fn indexed_classes(
+    data: &[u8],
+    sections: &[(u32, u32)],
+    index_count: usize,
+    has_applet: bool,
+) -> Option<Vec<u32>> {
+    let offset = read_u32(data, 8).ok()? as usize;
+    if offset < 32 {
+        return None;
+    }
+    let end = offset.checked_add(index_count.checked_mul(8)?)?;
+    let index = data.get(offset..end)?;
+    // O mesmo módulo pode oferecer serviços e também consumir outros. A lista de
+    // quem fornece não pode virar uma dependência, nem uma importação virar exportação.
+    let (resource_id, count_offset) = if has_applet { (3, 30) } else { (1, 26) };
+    let payload = indexed_binary(data, sections, index, resource_id)?;
+    if payload.len() < 4 || payload.len() % 4 != 0 {
+        return None;
+    }
+    // O formato0x1000 do bf2gen e do Texas Hold'em conserva estes campos.
+    // Ignorá-lo apagava tanto as dezesseis exportações quanto as seis importações,
+    // impedindo que a busca de extensões encontrasse o provedor original da Summus.
+    let declared = indexed_binary(data, sections, index, 0)
+        .filter(|info| info.len() == 40 && matches!(read_u32(info, 0), Ok(0x1000 | 0x1002)))
+        .and_then(|info| read_u16(info, count_offset).ok());
+    match declared {
+        Some(count) if payload.len() == (usize::from(count) + 1) * 4 => {}
+        // A forma de uma única classe já era aceita antes deste formato de ModInfo.
+        None if payload.len() == CLASS_RECORD_LEN as usize => {}
+        _ => return None,
+    }
+    let prefix = payload.len() - 4;
+    if read_u32(payload, prefix).ok()? != 0 {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut classes = Vec::new();
+    for bytes in payload[..prefix].chunks_exact(4) {
+        let class = u32::from_le_bytes(bytes.try_into().ok()?);
+        if class == 0 {
+            // Não anunciar uma lista parcial quando o terminador contradiz a contagem.
+            return None;
+        }
+        if seen.insert(class) {
+            classes.push(class);
+        }
+    }
+    Some(classes)
+}
+
+fn indexed_binary<'a>(
+    data: &'a [u8],
+    sections: &[(u32, u32)],
+    index: &[u8],
+    id: u16,
+) -> Option<&'a [u8]> {
+    for entry in index.chunks_exact(8) {
+        if read_u16(entry, 0).ok()? != RESTYPE_BINARY {
+            continue;
+        }
+        let first = read_u16(entry, 2).ok()?;
+        let Some(delta) = id.checked_sub(first) else {
+            continue;
+        };
+        if delta > read_u16(entry, 4).ok()? {
+            continue;
+        }
+        let section = usize::from(read_u16(entry, 6).ok()?).checked_add(usize::from(delta))?;
+        let &(offset, length) = sections.get(section)?;
+        let start = offset as usize;
+        return data.get(start..start.checked_add(length as usize)?);
+    }
+    None
 }
 
 /// Se a seção de 20 bytes em `offset` tem a forma de um registro de applet.
@@ -386,3 +471,77 @@ mod tests {
         ));
     }
 }
+#[cfg(test)]
+mod legacy_modinfo_contracts {
+    use super::MifFile;
+
+    // O bf2gen da Summus usa ModInfo0x1000 de40bytes e dezesseis exportações.
+    // O Texas Hold'em usa a mesma estrutura para as seis importações reais.
+    fn indexed(version: u32, classes: &[u32], applet: bool) -> Vec<u8> {
+        let count = if applet {3usize} else {2};
+        let table = 0x20 + count * 8;
+        let start = table + (count + 1) * 4;
+        let mut info = vec![0u8;40];
+        info[..4].copy_from_slice(&version.to_le_bytes());
+        let at = if applet {30} else {26};
+        info[at..at+2].copy_from_slice(&(classes.len() as u16).to_le_bytes());
+        let mut list: Vec<u8> = classes.iter().chain(std::iter::once(&0)).flat_map(|id|id.to_le_bytes()).collect();
+        let mut parts = vec![info,std::mem::take(&mut list)];
+        if applet { let mut record=vec![0u8;20];record[..4].copy_from_slice(&0x0101f197u32.to_le_bytes());parts.push(record); }
+        let total = start + parts.iter().map(Vec::len).sum::<usize>();
+        let mut data=vec![0u8;total];
+        data[..2].copy_from_slice(&0x11u16.to_le_bytes());
+        data[2..4].copy_from_slice(&1u16.to_le_bytes());
+        data[6..8].copy_from_slice(&(count as u16).to_le_bytes());
+        data[8..12].copy_from_slice(&0x20u32.to_le_bytes());
+        data[12..16].copy_from_slice(&((count*8) as u32).to_le_bytes());
+        data[16..20].copy_from_slice(&(table as u32).to_le_bytes());
+        data[20..24].copy_from_slice(&(count as u32).to_le_bytes());
+        let ids = if applet {vec![0u16,3,2]} else {vec![0u16,1]};
+        let mut cursor=start;
+        for (i,part) in parts.iter().enumerate() {
+            let at=0x20+i*8;
+            data[at..at+2].copy_from_slice(&0x5000u16.to_le_bytes());
+            data[at+2..at+4].copy_from_slice(&ids[i].to_le_bytes());
+            data[at+6..at+8].copy_from_slice(&(i as u16).to_le_bytes());
+            data[table+i*4..table+i*4+4].copy_from_slice(&(cursor as u32).to_le_bytes());
+            data[cursor..cursor+part.len()].copy_from_slice(part);cursor+=part.len();
+        }
+        data[table+count*4..table+count*4+4].copy_from_slice(&(cursor as u32).to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn modinfo_1000_preserva_dezesseis_exportacoes() {
+        let classes:Vec<_>=(0x010179be..0x010179ce).collect();
+        let mif=MifFile::parse(&indexed(0x1000,&classes,false)).unwrap();
+        assert_eq!(mif.extensao(),classes);
+    }
+    #[test]
+    fn modinfo_1000_preserva_importacoes_sem_exportar_o_applet() {
+        let classes=[0x010179c8,0x010179c7,0x010179c3,0x010179c1,0x010179c0,0x010179be];
+        let mif=MifFile::parse(&indexed(0x1000,&classes,true)).unwrap();
+        assert_eq!(mif.classes,classes);assert!(mif.extensao().is_empty());
+    }
+    #[test]
+    fn modinfo_1002_conserva_a_lista_com_contagem() {
+        let classes=[0x010179c1,0x010179c0];
+        assert_eq!(MifFile::parse(&indexed(0x1002,&classes,false)).unwrap().extensao(),classes);
+    }
+    #[test]
+    fn modinfo_1000_recusa_contagem_divergente_e_lista_sem_nul() {
+        let mut data=indexed(0x1000,&[0x010179c1,0x010179c0],false);
+        let table=u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let info=u32::from_le_bytes(data[table..table+4].try_into().unwrap()) as usize;
+        data[info+26..info+28].copy_from_slice(&3u16.to_le_bytes());
+        assert!(MifFile::parse(&data).unwrap().classes.is_empty());
+        data[info+26..info+28].copy_from_slice(&2u16.to_le_bytes());
+        let end=data.len();data[end-4..].copy_from_slice(&0x010179beu32.to_le_bytes());
+        assert!(MifFile::parse(&data).unwrap().classes.is_empty());
+    }
+    #[test]
+    fn versao_desconhecida_nao_autoriza_lista_de_multiplas_classes() {
+        assert!(MifFile::parse(&indexed(0x1001,&[0x010179c1,0x010179c0],false)).unwrap().classes.is_empty());
+    }
+}
+

@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "kind": "unmodified redistributable fallback fonts",
+  "fonts": [
+    {
+      "file": "neodgm-v1.601.ttf.gz",
+      "family": "NeoDunggeunmo",
+      "version": "1.601",
+      "source_url": "https://github.com/neodgm/neodgm/releases/download/v1.601/neodgm.ttf",
+      "raw_bytes": 651044,
+      "gzip_bytes": 146535,
+      "raw_sha256": "77305267996073aae07bad9313dad2e306a4128e55bfafbed4c41558fee57b4d",
+      "gzip_sha256": "8490b8482a8837d0225a572f0c50c4fc4d764b413234d663769386c4e0c2668f",
+      "license_file": "../licenses/NeoDunggeunmo-OFL.txt",
+      "modified_font": false
+    },
+    {
+      "file": "misaki_gothic.ttf.gz",
+      "family": "MisakiGothic",
+      "version": "2021-05-05",
+      "source_url": "https://littlelimit.net/arc/misaki/misaki_ttf_2021-05-05.zip",
+      "raw_bytes": 1171204,
+      "gzip_bytes": 251511,
+      "raw_sha256": "0963e11e89d5fa409a7a048a52e8ea2d623d764a7998488f8a4291111611c4e1",
+      "gzip_sha256": "288f71b69de1f169898021f08b35dd424f4370d3783ef1b9b9087119d1de5d22",
+      "license_file": "../licenses/Misaki-LICENSE.txt",
+      "modified_font": false
+    }
+  ],
+  "combined_gzip_bytes": 398046,
+  "combined_raw_bytes": 1822248,
+  "verification": "Each gzip was decompressed and compared byte-for-byte with its official downloaded TTF; original names retained."
+}

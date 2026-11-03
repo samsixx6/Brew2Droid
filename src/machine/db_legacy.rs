@@ -90,11 +90,24 @@ fn native_seed(bytes: &[u8]) -> Option<NativeSeed> {
         }
         spans.push((offset, end));
         let mut at = offset + 4;
-        let mut fields = Vec::new();
+        let mut fields: Vec<Field> = Vec::new();
         while at < end {
             let kind = bytes[at];
-            if kind == 0 && at + 1 == end {
-                break;
+            if kind == 0 {
+                if at + 1 == end {
+                    break;
+                }
+                // No OEM observado, um binário pode ter um zero de enquadramento
+                // fora de wDataLen antes do próximo campo. Não é padding genérico:
+                // aceitar só um byte, após binário e antes de outro tipo conhecido;
+                // o próximo ciclo ainda valida cabeçalho e dados dentro do registro.
+                if fields.last().is_some_and(|field| field.kind == 5)
+                    && matches!(bytes.get(at + 1), Some(1..=8))
+                {
+                    at += 1;
+                    continue;
+                }
+                return None;
             }
             let name = *bytes.get(at + 1)?;
             at += 2;

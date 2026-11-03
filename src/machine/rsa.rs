@@ -7,6 +7,8 @@ const CANCEL_STUB: u32 = loader::STUB_BASE + 0xa0;
 const INVALID_KEY: u32 = 0x603;
 const INVALID_SIZE: u32 = 0x609;
 const INVALID_PADDING: u32 = 0x604;
+const BUFFER_TOO_SMALL: u32 = 0x607;
+const SDK_BAD_PARAM: u32 = 14;
 #[derive(Debug, Clone)]
 pub(super) struct Pending {
     kind: u32,
@@ -122,6 +124,52 @@ impl<C: CpuBackend> Machine<C> {
         self.cpu.write_mem(pointer, bytes)?;
         Ok(Ok(pointer))
     }
+
+    fn rsa_no_padding(&mut self, owner: u32, args: [u32; 7]) -> Result<u32, CpuError> {
+        let state = &self.rsas[&owner];
+        if !math::valid_key(&state.modulus, &state.exponent) {
+            return Ok(INVALID_KEY);
+        }
+        if !(1..=6).contains(&args[4]) {
+            return Ok(INVALID_PADDING);
+        }
+        if args[4] != 4 {
+            // Os outros envelopes são válidos no SDK, mas ainda não implementados.
+            return Ok(EUNSUPPORTED);
+        }
+        let width = state.modulus.len() as u32;
+        if args[0] == 0
+            || args[2] == 0
+            || args[3] == 0
+            || args[0].checked_add(width).is_none()
+            || args[2].checked_add(width).is_none()
+            || args[3].checked_add(4).is_none()
+        {
+            return Ok(SDK_BAD_PARAM);
+        }
+        // AEERSA.h: NO_PADDING exige a largura exata do módulo; o tamanho do
+        // destino é int de entrada/saída, não uma alocação a ser feita pelo serviço.
+        if args[1] != width {
+            return Ok(INVALID_SIZE);
+        }
+        let capacity = self.cpu.read_u32(args[3])? as i32;
+        if capacity < width as i32 {
+            return Ok(BUFFER_TOO_SMALL);
+        }
+        // Encrypt e Decrypt diferem no expoente fornecido pelo chamador. Sem
+        // envelope, ambos aplicam a mesma exponenciação modular big-endian real.
+        // Ler agora respeita a operação assíncrona: pbIn não foi copiado na chamada.
+        match self.rsa_raw(owner, args[0], args[1])? {
+            Err(code) => Ok(code),
+            Ok(bytes) => {
+                // Estes slots recebem byte*, ao contrário de RSA/ModExp (byte**).
+                self.cpu.write_mem(args[2], &bytes)?;
+                self.cpu.write_u32(args[3], bytes.len() as u32)?;
+                Ok(SUCCESS)
+            }
+        }
+    }
+
     pub(super) fn rsa_call(&mut self, slot: u32) -> Result<u32, CpuError> {
         let owner = self.arg(0);
         if self.objects.kind_of(owner) != Some(Interface::Rsa) {
@@ -290,6 +338,7 @@ impl<C: CpuBackend> Machine<C> {
                         .map_or_else(error_code, |_| SUCCESS)
                 }
             }
+            5 | 6 => self.rsa_no_padding(owner, a)?,
             // Os modos com outros envelopes ficam explícitos, nunca sucesso fictício.
             _ => EUNSUPPORTED,
         };

@@ -134,6 +134,14 @@ impl ObjectStore {
         }
     }
 
+    /// Snapshot ordenado para provedores que mantêm relações entre objetos vivos.
+    pub(crate) fn addresses(&self, iface: Interface) -> Vec<u32> {
+        let mut addresses: Vec<_> = self.kinds.iter()
+            .filter_map(|(&address, &kind)| (kind == iface).then_some(address)).collect();
+        addresses.sort_unstable();
+        addresses
+    }
+
     pub fn live_count(&self) -> usize {
         self.kinds.len()
     }

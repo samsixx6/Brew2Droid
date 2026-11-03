@@ -14,9 +14,9 @@ const META: u32 = OUT + 0x600;
 fn work() -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("local-tests")
+        .join("local-tests/splinter-render-20261021/large-games-research/db-tests")
         .join(format!(
-            "db-test-{}-{}",
+            "{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
@@ -481,6 +481,65 @@ fn malformed_native_database_is_rejected_before_creating_an_overlay() {
         assert_eq!(open(&mut m,mgr,&name,true),0,"não converter índice/campo inválido");
         assert!(!root.join("save-overlay").join(&name).exists());
         assert_eq!(std::fs::read(root.join("content").join(&name)).unwrap(),bad);
+    }
+    clean(root);
+}
+
+fn framed_native_binary(body: &[u8]) -> Vec<u8> {
+    let index = 12 + body.len() as u32;
+    let mut seed = vec![1, 0, 1, 0];
+    seed.extend_from_slice(&index.to_le_bytes());
+    seed.extend_from_slice(&[1, 0]);
+    seed.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    seed.extend_from_slice(body);
+    seed.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0]);
+    seed
+}
+
+#[test]
+fn native_database_binary_separator_preserves_payload_and_following_field() {
+    let root = work();
+    // Sintético: não incorporar o wizfs do pacote. O zero entre o binário e o
+    // próximo campo não integra seus três bytes, nem encerra o registro OEM.
+    let seed = framed_native_binary(&[5, 1, 3, 0, b'a', b'b', b'c', 0, 2, 2, 0x34, 0x12, 0]);
+    std::fs::write(root.join("content/framed.db"), &seed).unwrap();
+    let mut m = machine(&root);
+    let mgr = manager(&mut m);
+    let db = open(&mut m, mgr, "framed.db", false);
+    assert_ne!(db, 0, "separador binário OEM entre campos válidos");
+    let rec = call(&mut m, db, 5, 1, 0, 0);
+    assert_ne!(rec, 0);
+    assert_eq!(call(&mut m, rec, 6, META, META + 2, 0), 5);
+    assert_eq!(bytes(&m, META + 2, 2), 3u16.to_le_bytes());
+    let value = call(&mut m, rec, 7, 0, 0, 0);
+    assert_eq!(bytes(&m, value, 3), b"abc");
+    assert_eq!(call(&mut m, rec, 6, META, META + 2, 0), 2);
+    assert_eq!(call(&mut m, rec, 8, META + 8, 0, 0), 1);
+    assert_eq!(bytes(&m, META + 8, 2), [0x34, 0x12]);
+    assert_eq!(call(&mut m, rec, 6, 0, 0, 0), 0);
+    assert_eq!(std::fs::read(root.join("content/framed.db")).unwrap(), seed);
+    drop(m);
+    clean(root);
+}
+
+#[test]
+fn native_database_binary_separator_rejects_corruption_and_truncated_headers() {
+    let root = work();
+    for (n, body) in [
+        vec![5, 1, 3, 0, b'a', b'b', b'c', 9, 2, 2, 0x34, 0x12, 0],
+        vec![5, 1, 3, 0, b'a', b'b', b'c', 0, 0, 2, 2, 0x34, 0x12, 0],
+        vec![5, 1, 3, 0, b'a', b'b', b'c', 0, 4],
+        vec![5, 1, 99, 0, b'a', b'b', b'c', 0, 2, 2, 0x34, 0x12, 0],
+        vec![2, 1, 0x34, 0x12, 0, 5, 2, 1, 0, b'a', 0],
+    ].into_iter().enumerate() {
+        let seed = framed_native_binary(&body);
+        let name = format!("bad-frame-{n}.db");
+        std::fs::write(root.join("content").join(&name), &seed).unwrap();
+        let mut m = machine(&root);
+        let mgr = manager(&mut m);
+        assert_eq!(open(&mut m, mgr, &name, true), 0);
+        assert!(!root.join("save-overlay").join(&name).exists());
+        assert_eq!(std::fs::read(root.join("content").join(&name)).unwrap(), seed);
     }
     clean(root);
 }

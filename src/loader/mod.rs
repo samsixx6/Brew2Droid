@@ -13,6 +13,7 @@ pub mod archive;
 pub mod sete_z;
 pub mod miffile;
 pub mod modfile;
+mod flash_dump;
 pub mod resfile;
 
 use crate::brew::aee::{self, Interface};

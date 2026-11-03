@@ -64,7 +64,8 @@ fn six_hundred_cached_rows_follow_default_linked_and_custom_resolutions_without_
 fn missing_cached_content_identity_requires_one_refresh_then_reuses_metadata(){
  let f=Fixture::new();let games=f.root.join("games");let art=f.root.join("art");let displays=f.private.join("handset-displays");std::fs::create_dir(&games).unwrap();std::fs::write(games.join("single.mod"),b"synthetic cache identity").unwrap();
  model::library_refresh(&games,&art,&displays,false).unwrap();
- let index=std::fs::read_dir(&art).unwrap().map(|e|e.unwrap().path()).find(|p|p.file_name().unwrap().to_string_lossy().starts_with("library-v5-")).unwrap();
+ let indexes:Vec<_>=std::fs::read_dir(&art).unwrap().map(|e|e.unwrap().path()).filter(|p|p.file_name().unwrap().to_string_lossy().starts_with("library-v")&&p.extension().and_then(|e|e.to_str())==Some("json")).collect();
+ assert_eq!(indexes.len(),1,"the refresh must create one library index");let index=&indexes[0];
  let mut raw:Value=serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();for row in raw["entries"].as_object_mut().unwrap().values_mut(){row["row"].as_object_mut().unwrap().remove("content_id");}
  std::fs::write(&index,serde_json::to_vec(&raw).unwrap()).unwrap();
  assert_eq!(model::library_cached(&games,&art).unwrap()["cached"],false);

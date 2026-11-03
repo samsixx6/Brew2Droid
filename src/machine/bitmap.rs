@@ -90,37 +90,23 @@ impl<C: CpuBackend> Machine<C> {
             return Ok(());
         }
 
-        // A origem é uma superfície nossa, criada só para esta chamada.
-        let source = self.new_object(Interface::Bitmap)?;
+        // O IImage possui sua origem. Um BltIn pode retê-la e o consumidor pode
+        // retirar esse membro antes de soltar a imagem; uma origem temporária
+        // destruía ambos os casos, mesmo quando o guest tinha dado AddRef.
+        let source = self.bitmap_from_image(blit.image)?;
         if source == 0 {
             return Ok(());
         }
-        let mut surface = Framebuffer::new(largura, altura);
-        for row in 0..altura {
-            for column in 0..largura {
-                let index =
-                    ((row + src_y) * info.width + column + src_x + offset) as usize;
-                let opaque = info.opaque.get(index).copied().unwrap_or(true);
-                let pixel = match (opaque, info.pixels.get(index)) {
-                    (true, Some(&pixel)) => pixel,
-                    // Sem canal alfa no destino, o transparente vira uma cor reservada — é
-                    // como o BREW resolve, e o `BltIn` respeita a `ncTransparent` do `IDIB`.
-                    _ => TRANSPARENT_KEY,
-                };
-                surface.set_pixel_native(column as i32, row as i32, pixel);
-            }
+        if !self.dib_do_decodificador.contains_key(&source) {
+            self.publica_origem_888(source, &info, info.width, info.height, 0, 0)?;
         }
-        self.bitmaps.insert(source, surface);
-        self.transparency.insert(source, TRANSPARENT_KEY);
-        self.publica_origem_888(source, &info, largura, altura, src_x + offset, src_y)?;
-
         let vtable = self.cpu.read_u32(blit.target)?;
         let blt_in = self.cpu.read_u32(vtable + BITMAP_BLT_IN_SLOT * 4)?;
         // BltIn(po, xDst, yDst, dx, dy, pSrc, xSrc, ySrc, rop)
         let outcome = self.call_guest_with_stack(
             blt_in,
             [blit.target, blit.x as u32, blit.y as u32, largura],
-            &[altura, source, 0, 0, blit.rop],
+            &[altura, source, src_x + offset, src_y, blit.rop],
             budget,
         )?;
         if !matches!(outcome, Outcome::Returned { code: 0 }) {
@@ -128,17 +114,6 @@ impl<C: CpuBackend> Machine<C> {
                 .insert("o BltIn de uma superfície do jogo recusou o desenho");
         }
 
-        self.objects.release(source);
-        self.bitmaps.remove(&source);
-        // **O buffer volta para a região pelo caminho normal.** Tirando só o `dib_buffers` aqui,
-        // a capacidade anotada ficava para trás: o próximo bitmap a nascer neste endereço via a
-        // anotação, concluía que o buffer dele já cabia e publicava um `IDIB` com `pBmp` nulo. O
-        // Bejeweled Twist morria nisso — o `BltIn` dele monta a tabela de linhas a partir do
-        // `pBmp`, e sem ela o objeto de origem ficava sem pixels e o jogo caía no primeiro
-        // desenho.
-        self.solta_dib(source);
-        self.cpu.unwatch_dirty(source);
-        self.transparency.remove(&source);
         Ok(())
     }
 
@@ -647,6 +622,9 @@ impl<C: CpuBackend> Machine<C> {
                 let restantes = self.objects.release(this);
                 if restantes == 0 {
                     self.solta_dib(this);
+                    self.bitmaps.remove(&this);
+                    self.transparency.remove(&this);
+                    self.cpu.unwatch_dirty(this);
                 }
                 restantes
             }
@@ -659,6 +637,22 @@ impl<C: CpuBackend> Machine<C> {
                 let out = self.cpu.read_reg(Reg::R2);
                 let answer = match requested {
                     AEEIID_IBITMAP => Some(this),
+                    // AEECLSID_AEEDIB = CORE+35, AEEBitmap.h: a estrutura antiga
+                    // é o IDIB sem a vtable. É uma vista emprestada do bitmap,
+                    // sem Release próprio: repetir a consulta não cria referências.
+                    0x0100_1023 => {
+                        if self.objects.kind_of(this) != Some(Interface::Bitmap)
+                            || self.objects.contagem(this) == 0
+                            || !(self.bitmaps.contains_key(&this)
+                                || self.dib_do_decodificador.contains_key(&this))
+                        {
+                            if out != 0 { self.cpu.write_u32(out, 0)?; }
+                            return Ok(Some(ECLASSNOTSUPPORT));
+                        }
+                        self.expose_dib(this)?;
+                        if out != 0 { self.cpu.write_u32(out, this + 4)?; }
+                        return Ok(Some(SUCCESS));
+                    }
                     // Um `IDIB` *é* um `IBitmap` — a struct começa com a vtable de `IBitmap` e
                     // só acrescenta campos públicos. Então o próprio objeto serve, desde que
                     // os campos estejam preenchidos.
@@ -1328,6 +1322,9 @@ impl<C: CpuBackend> Machine<C> {
         if self.raw_dib(src) {
             return self.blit_raw_dib(dst, dst_pos, size, src, src_pos, rop);
         }
+        if self.descritor_oem_565 && !self.bitmaps.contains_key(&src) {
+            return self.blit_descritor_oem_565(dst, dst_pos, size, src, src_pos, rop);
+        }
         if self.bitmap_nativo_565
             && (loader::HEAP_BASE..loader::HEAP_BASE + loader::HEAP_SIZE as u32).contains(&src)
         {
@@ -1345,6 +1342,36 @@ impl<C: CpuBackend> Machine<C> {
         // pede 4 para os sprites magenta; o alias pertence ao display, não ao IBitmap.
         let rop = if rop == 4 { AEE_RO_TRANSPARENT } else { rop };
         self.blit(dst, dst_pos, size, src, src_pos, rop)
+    }
+
+    /// Variante OEM comprovada: altura32, largura32 e pixels RGB565 em self+12.
+    /// O contrato pertence ao IDisplay dos pares selecionados, não ao IBitmap.
+    fn blit_descritor_oem_565(
+        &mut self, dst: u32, dst_pos: (i32, i32), size: (i32, i32),
+        src: u32, src_pos: (i32, i32), rop: u32,
+    ) -> Result<u32, CpuError> {
+        if rop != AEE_RO_COPY { return Ok(EUNSUPPORTED); }
+        // Um jogo pode subalocar dentro do bloco AEE, mas o descritor e todo o
+        // raster precisam caber juntos em uma alocação ainda viva.
+        let Some((base, capacity)) = self.heap.bloco_que_contem(src) else {
+            return Ok(EBADPARM);
+        };
+        let Some(end) = base.checked_add(capacity) else { return Ok(EBADPARM); };
+        let Some(pixels) = src.checked_add(12).filter(|&p| p <= end) else {
+            return Ok(EBADPARM);
+        };
+        let height = self.cpu.read_u32(src)?;
+        let width = self.cpu.read_u32(src + 4)?;
+        let declared_pixels = self.cpu.read_u32(src + 8)?;
+        if !(1..=1024).contains(&width) || !(1..=1024).contains(&height)
+            || declared_pixels != pixels {
+            return Ok(EBADPARM);
+        }
+        let Some(raster_end) = width.checked_mul(height).and_then(|n| n.checked_mul(2))
+            .and_then(|n| pixels.checked_add(n)) else { return Ok(EBADPARM); };
+        if raster_end > end { return Ok(EBADPARM); }
+        self.blit_raster_legado(dst, dst_pos, size, src, src_pos, rop,
+            (width as u16, height as u16), true)
     }
 
     /// Copia superfícies IBitmap; ponteiros de pixels do contrato OEM não são objetos.
@@ -1519,6 +1546,71 @@ mod testes_dib_criado {
             Outcome::Returned { code } => code,
             other => panic!("{name}: {other:?}"),
         }
+    }
+
+    fn descritor_oem(machine: &mut Machine<BackendPadrao>) -> u32 {
+        let descriptor = machine.heap.alloc(24).unwrap();
+        for (offset, value) in [(0, 2), (4, 3), (8, descriptor + 12)] {
+            machine.cpu.write_u32(descriptor + offset, value).unwrap();
+        }
+        machine.cpu.write_mem(descriptor + 12, &[0,248,224,7,31,0,255,255,0,0,31,248]).unwrap();
+        descriptor
+    }
+
+    #[test]
+    fn descritor_oem_565_selecionado_copia_linhas_origem_e_recorte() {
+        let (mut machine, _root) = machine();
+        machine.descritor_oem_565 = true;
+        let source = descritor_oem(&mut machine);
+        let display = loader::OBJECT_BASE + 0x10;
+        call(&mut machine, Interface::Display, "BitBlt", [display,1,1,2], &[2,source,1,0,AEE_RO_COPY]);
+        assert_eq!((1..3).map(|x| machine.screen().get_pixel(x,1)).collect::<Vec<_>>(), [0x07e0,0x001f]);
+        assert_eq!((1..3).map(|x| machine.screen().get_pixel(x,2)).collect::<Vec<_>>(), [0,0xf81f]);
+        call(&mut machine, Interface::Display, "BitBlt", [display,u32::MAX,4,3], &[1,source,0,0,AEE_RO_COPY]);
+        assert_eq!((0..2).map(|x| machine.screen().get_pixel(x,4)).collect::<Vec<_>>(), [0x07e0,0x001f]);
+    }
+
+    #[test]
+    fn descritor_oem_565_aceita_subalocacao_delimitada_na_heap() {
+        let (mut machine, _root) = machine();
+        machine.descritor_oem_565 = true;
+        // Siberian Strike usa seu alocador dentro de um bloco maior do AEE.
+        let allocation = machine.heap.alloc(128).unwrap();
+        let source = allocation + 16;
+        for (offset, value) in [(0, 1), (4, 2), (8, source + 12)] {
+            machine.cpu.write_u32(source + offset, value).unwrap();
+        }
+        machine.cpu.write_mem(source + 12, &[0,248,224,7]).unwrap();
+        let display = loader::OBJECT_BASE + 0x10;
+        call(&mut machine, Interface::Display, "BitBlt", [display,0,0,2], &[1,source,0,0,AEE_RO_COPY]);
+        assert_eq!(machine.screen().get_pixel(0,0), 0xf800);
+        assert_eq!(machine.screen().get_pixel(1,0), 0x07e0);
+        machine.heap.free(allocation);
+        call(&mut machine, Interface::Display, "BitBlt", [display,2,0,2], &[1,source,0,0,AEE_RO_COPY]);
+        assert_eq!(machine.screen().get_pixel(2,0), 0);
+    }
+
+    #[test]
+    fn descritor_oem_565_recusa_ponteiros_falsos_e_nao_altera_ibitmap() {
+        for (offset, value) in [(0, 0), (0, u32::MAX), (4, 1025), (4, 1024), (8, 0), (8, 0xdeadbeef)] {
+            let (mut machine, _root) = machine();
+            machine.descritor_oem_565 = true;
+            let source = descritor_oem(&mut machine);
+            machine.cpu.write_u32(source + offset, value).unwrap();
+            let display = loader::OBJECT_BASE + 0x10;
+            call(&mut machine, Interface::Display, "BitBlt", [display,1,1,2], &[2,source,0,0,AEE_RO_COPY]);
+            assert_eq!(machine.screen().get_pixel(1,1), 0);
+        }
+        let (mut machine, _root) = machine();
+        let source = descritor_oem(&mut machine);
+        let display = loader::OBJECT_BASE + 0x10;
+        call(&mut machine, Interface::Display, "BitBlt", [display,1,1,2], &[2,source,0,0,AEE_RO_COPY]);
+        assert_eq!(machine.screen().get_pixel(1,1), 0, "perfil desativado");
+        machine.descritor_oem_565 = true;
+        machine.blit(display,(1,1),(2,2),source,(0,0),AEE_RO_COPY).unwrap();
+        assert_eq!(machine.screen().get_pixel(1,1), 0, "IBitmap não recebe o contrato OEM");
+        call(&mut machine, Interface::Display, "BitBlt", [display,1,1,2], &[2,source,0,0,4]);
+        assert_eq!(machine.screen().get_pixel(1,1), 0, "ROP não comprovado");
     }
 
     #[test]

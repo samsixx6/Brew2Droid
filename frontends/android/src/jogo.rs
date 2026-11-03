@@ -17,11 +17,78 @@ use zeebx::velocidade::rewind::Leitura;
 
 use crate::Emulador;
 use crate::estado;
+use crate::sistema;
 use zeebx::session::FATIA_MAXIMA;
 
 impl Emulador {
     pub(crate) fn avanca_jogo(&mut self) -> Step {
-        let handset_game = self.sessao.as_ref().is_some_and(zeebx::session::Session::is_handset);
+        if !self.pausado && !self.confirmando && !self.audio_focus_paused {
+            if let Some(session) = self.sessao.as_mut() {
+                if let Err(error) = session.notify_top_launch() {
+                    self.erro = Some(error);
+                    self.finaliza_jogo();
+                    return Step::Stopped;
+                }
+            }
+        }
+        if let Some(error) = self
+            .sessao
+            .as_mut()
+            .and_then(crate::native_session::Session::installed_mut)
+            .and_then(|runtime| runtime.take_launch_failure())
+        {
+            sistema::mostra_erro_de_launch(&self.app, &error);
+            self.estado_mensagem = Some(error);
+        }
+        let pending = if self.pausado || self.confirmando || self.audio_focus_paused {
+            None
+        } else {
+            self.sessao
+                .as_ref()
+                .and_then(crate::native_session::Session::installed)
+                .and_then(|runtime| {
+                    runtime
+                        .pending_handoff()
+                        .map(|request| request.target.module.clone())
+                })
+        };
+        if let Some(target) = pending {
+            self.abre_instalado(&target, true, false);
+            if let Some(error) = self.erro.take() {
+                let recovered = self
+                    .sessao
+                    .as_mut()
+                    .and_then(crate::native_session::Session::installed_mut)
+                    .is_some_and(|runtime| runtime.reject_handoff(error.clone()).is_ok());
+                if recovered {
+                    sistema::mostra_erro_de_launch(&self.app, &error);
+                    self.estado_mensagem = Some(error);
+                } else {
+                    self.erro = Some(error);
+                    self.finaliza_jogo();
+                    return Step::Stopped;
+                }
+            }
+        }
+        let changed = self
+            .sessao
+            .as_ref()
+            .and_then(crate::native_session::Session::installed)
+            .filter(|runtime| !runtime.is_transitioning() && runtime.pending_handoff().is_none())
+            .map(|runtime| runtime.foreground_entry().module.clone())
+            .filter(|path| {
+                self.caminho_aberto
+                    .as_ref()
+                    .is_none_or(|old| old.canonicalize().ok() != path.canonicalize().ok())
+            });
+        if let Some(path) = changed {
+            self.abre_instalado(&path, false, true);
+            if self.erro.is_some() {
+                self.finaliza_jogo();
+                return Step::Stopped;
+            }
+        }
+        let handset_game = self.sessao.as_ref().is_some_and(|s| s.is_handset());
         let Some(sessao) = self.sessao.as_mut() else {
             return Step::Stopped;
         };
@@ -58,9 +125,12 @@ impl Emulador {
             if voltar && self.settings.velocidade.rewind.ligado {
                 sessao.retoma_o_contexto();
             }
-            let leitura =
-                self.rewind
-                    .le(sessao, voltar, self.pausado, &self.settings.velocidade.rewind);
+            let leitura = self.rewind.le(
+                sessao,
+                voltar,
+                self.pausado,
+                &self.settings.velocidade.rewind,
+            );
             if leitura == Leitura::Soltou {
                 self.ultimo = Instant::now();
             }
@@ -68,7 +138,8 @@ impl Emulador {
 
         // Com a pergunta na tela, em pausa ou voltando, o jogo fica parado — inclusive o relógio,
         // para ele não gastar o orçamento todo de uma vez quando voltar.
-        let parado = self.confirmando || self.pausado || self.audio_focus_paused || self.rewind.voltando();
+        let parado =
+            self.confirmando || self.pausado || self.audio_focus_paused || self.rewind.voltando();
         let mut passo = Step::Ahead;
         // O som para junto, menos no rewind, que já o cala e troca pelo de cada ponto. Ver
         // `Session::congela_o_som`.
@@ -94,7 +165,9 @@ impl Emulador {
             sessao.set_port_pad(0, pad);
             // O turbo do jogador 1: quais botões pulsam sai daqui, e quando, do relógio do jogo.
             let pulsando = match jogador {
-                Some(j) => self.turbo.pulsando(j.turbo, &j.botao_do_turbo, &pad, turbo_apertado),
+                Some(j) => self
+                    .turbo
+                    .pulsando(j.turbo, &j.botao_do_turbo, &pad, turbo_apertado),
                 None => 0,
             };
             sessao.define_toques_do_turbo(self.settings.velocidade.turbo_por_segundo);
@@ -103,11 +176,15 @@ impl Emulador {
             // da placa não sabe: sem avisar, o jogo desenharia com o viewport, a tesoura e a
             // mistura que a janela deixou. Ver `Session::retoma_o_contexto`.
             sessao.retoma_o_contexto();
-            let avancando = self.avanco.atualiza(avancar, self.settings.velocidade.avanco.modo);
+            let avancando = self
+                .avanco
+                .atualiza(avancar, self.settings.velocidade.avanco.modo);
             let ritmo = self.settings.velocidade.ritmo_com(avancando);
             self.avancando = avancando;
             passo = sessao.anda(passou, &ritmo);
-            if !handset_game { self.rewind.acompanha(sessao); }
+            if !handset_game {
+                self.rewind.acompanha(sessao);
+            }
             if passo == Step::Stopped {
                 let motivo = sessao.stopped_reason().unwrap_or_default();
                 let normal = sessao.saiu_normalmente();
@@ -118,10 +195,7 @@ impl Emulador {
                 // tinha dado errado o que tinha dado certo. A mensagem fica para o que quebra --
                 // API que não existe, ponteiro vazio.
                 if !normal {
-                    self.erro = Some(
-                        self.catalogo
-                            .format("play.failed", &[("reason", &motivo)]),
-                    );
+                    self.erro = Some(self.catalogo.format("play.failed", &[("reason", &motivo)]));
                 }
                 self.finaliza_jogo();
                 return Step::Stopped;
@@ -138,15 +212,34 @@ impl Emulador {
     }
 
     pub(crate) fn jogo(&mut self, ctx: &egui::Context) {
-        let handset_game = self.sessao.as_ref().is_some_and(zeebx::session::Session::is_handset);
+        let handset_game = self.sessao.as_ref().is_some_and(|s| s.is_handset());
         // Handset anda uma vez por poll, fora dos repasses do egui. Em pausa ainda precisa
         // congelar/reancorar o relógio; os demais frontends mantêm o caminho herdado.
-        if !handset_game || self.confirmando || self.pausado || self.audio_focus_paused { self.avanca_jogo(); }
+        if !handset_game || self.confirmando || self.pausado || self.audio_focus_paused {
+            self.avanca_jogo();
+        }
         if handset_game && self.zeebo_mode {
-            if crate::zeebo_art::paint(&mut self.zeebo_controls,&mut self.zeebo_input,ctx,self.keypad_settings.transparency){self.sync_handset_keys();}
-        }else if handset_game && self.handset_keys.is_enabled() { crate::handset::paint_layout(&mut self.handset_keys, ctx,self.keypad_settings.transparency,&self.keypad_layout); }
-        let Some(sessao) = self.sessao.as_mut() else { return; };
-        let parado = self.confirmando || self.pausado || self.audio_focus_paused || self.rewind.voltando();
+            if crate::zeebo_art::paint(
+                &mut self.zeebo_controls,
+                &mut self.zeebo_input,
+                ctx,
+                self.keypad_settings.transparency,
+            ) {
+                self.sync_handset_keys();
+            }
+        } else if handset_game && self.handset_keys.is_enabled() {
+            crate::handset::paint_layout(
+                &mut self.handset_keys,
+                ctx,
+                self.keypad_settings.transparency,
+                &self.keypad_layout,
+            );
+        }
+        let Some(sessao) = self.sessao.as_mut() else {
+            return;
+        };
+        let parado =
+            self.confirmando || self.pausado || self.audio_focus_paused || self.rewind.voltando();
 
         let suave = self.settings.graphics.smooth;
         // Com o 3D na placa, o quadro que vai à tela **não** é o `screen()`: é a textura que o
@@ -160,11 +253,16 @@ impl Emulador {
         let tela = sessao.screen();
         let (largura, altura) = (tela.width() as usize, tela.height() as usize);
         if self.settings.debug.fps_counter {
-            self.fps.prepare((!parado).then(|| zeebx::handset::fps::FrameStamp {
-                cpu_series: tela.serie(),
-                cpu_writes: tela.escritas(),
-                gpu_frames: if quadro_gl.is_some() { sessao.rendered_gl_frames() } else { 0 },
-            }));
+            self.fps
+                .prepare((!parado).then(|| zeebx::handset::fps::FrameStamp {
+                    cpu_series: tela.serie(),
+                    cpu_writes: tela.escritas(),
+                    gpu_frames: if quadro_gl.is_some() {
+                        sessao.rendered_gl_frames()
+                    } else {
+                        0
+                    },
+                }));
         }
         // Sem 3D na tela — um menu, uma abertura — a placa desenha o quadro do aparelho, em
         // RGB565, que é o formato em que ele já está. A janela repinta mais vezes que o jogo
@@ -178,8 +276,11 @@ impl Emulador {
                     .as_ref()
                     .is_none_or(|(serie, escritas, _)| (*serie, *escritas) != chave);
                 if mudou {
-                    self.quadro_565 =
-                        Some((chave.0, chave.1, std::sync::Arc::from(tela.to_rgb565_bytes())));
+                    self.quadro_565 = Some((
+                        chave.0,
+                        chave.1,
+                        std::sync::Arc::from(tela.to_rgb565_bytes()),
+                    ));
                 }
                 self.quadro_565
                     .as_ref()
@@ -283,14 +384,22 @@ impl Emulador {
                 let (lg, at) = (largura as i32, altura as i32);
                 let area = ui.available_rect_before_wrap();
                 let remaining = (area.height() - tamanho.y).max(0.0);
-                let offset = match gravity { crate::game_options::ScreenGravity::Top => 0.0,
+                let offset = match gravity {
+                    crate::game_options::ScreenGravity::Top => 0.0,
                     crate::game_options::ScreenGravity::Center => remaining / 2.0,
-                    crate::game_options::ScreenGravity::Bottom => remaining };
-                let rect = egui::Rect::from_min_size(egui::pos2(area.center().x - tamanho.x / 2.0, area.top() + offset), tamanho);
+                    crate::game_options::ScreenGravity::Bottom => remaining,
+                };
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(area.center().x - tamanho.x / 2.0, area.top() + offset),
+                    tamanho,
+                );
                 ui.allocate_rect(rect, egui::Sense::hover());
                 if handset_game && !parado {
-                    self.handset_touch.viewport = Some(([rect.min.x,rect.min.y],
-                        [rect.max.x,rect.max.y],[largura as u16,altura as u16]));
+                    self.handset_touch.viewport = Some((
+                        [rect.min.x, rect.min.y],
+                        [rect.max.x, rect.max.y],
+                        [largura as u16, altura as u16],
+                    ));
                 }
                 ui.painter().add(egui::PaintCallback {
                     rect,
@@ -317,15 +426,7 @@ impl Emulador {
                                 Some(quadro) => pintor.desenha_textura(gl, quadro, vp, suave),
                                 None => {
                                     if let Some((chave, bytes)) = &quadro_2d {
-                                        pintor.desenha_quadro(
-                                            gl,
-                                            bytes,
-                                            lg,
-                                            at,
-                                            *chave,
-                                            vp,
-                                            suave,
-                                        );
+                                        pintor.desenha_quadro(gl, bytes, lg, at, *chave, vp, suave);
                                     }
                                 }
                             }
@@ -338,19 +439,32 @@ impl Emulador {
             if let Some(textura) = &self.textura {
                 let area = ui.available_rect_before_wrap();
                 let remaining = (area.height() - tamanho.y).max(0.0);
-                let offset = match gravity { crate::game_options::ScreenGravity::Top => 0.0,
+                let offset = match gravity {
+                    crate::game_options::ScreenGravity::Top => 0.0,
                     crate::game_options::ScreenGravity::Center => remaining / 2.0,
-                    crate::game_options::ScreenGravity::Bottom => remaining };
-                let rect = egui::Rect::from_min_size(egui::pos2(area.center().x-tamanho.x/2.0,area.top()+offset),tamanho);
-                ui.allocate_rect(rect,egui::Sense::hover());
-                egui::Image::new((textura.id(), tamanho)).fit_to_exact_size(tamanho).paint_at(ui,rect);
+                    crate::game_options::ScreenGravity::Bottom => remaining,
+                };
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(area.center().x - tamanho.x / 2.0, area.top() + offset),
+                    tamanho,
+                );
+                ui.allocate_rect(rect, egui::Sense::hover());
+                egui::Image::new((textura.id(), tamanho))
+                    .fit_to_exact_size(tamanho)
+                    .paint_at(ui, rect);
                 if handset_game && !parado {
-                    self.handset_touch.viewport = Some(([rect.min.x,rect.min.y],[rect.max.x,rect.max.y],[largura as u16,altura as u16]));
+                    self.handset_touch.viewport = Some((
+                        [rect.min.x, rect.min.y],
+                        [rect.max.x, rect.max.y],
+                        [largura as u16, altura as u16],
+                    ));
                 }
             }
         });
 
-        if !handset_game { self.desenha_sobreposicao(ctx); }
+        if !handset_game {
+            self.desenha_sobreposicao(ctx);
+        }
         self.desenha_indicadores(ctx);
         if self.settings.debug.fps_counter {
             self.fps.paint(ctx);
@@ -362,30 +476,69 @@ impl Emulador {
     }
 
     /// O popup pertence ao Android; esta linha mantém a pausa e aplica somente suas ações.
-    pub(crate) fn apply_native_menu(&mut self,ctx:&egui::Context,actions:u32){
+    pub(crate) fn apply_native_menu(&mut self, ctx: &egui::Context, actions: u32) {
         use crate::input_dispatch::*;
-        if actions==0||!self.native_menu_shown{return;}
-        if actions&MENU_EXIT!=0{self.native_menu_shown=false;self.confirmando=false;self.finaliza_jogo();return;}
-        if actions&MENU_COUNTER!=0{
-            let counter=actions&MENU_COUNTER_VALUE!=0;
-            if counter!=self.settings.debug.fps_counter{
-                match crate::native_ui_model::update(&self.arquivo,&self.roms(),&serde_json::json!({"debug":{"fps_counter":counter}})){
-                    Ok(_)=>{self.settings.debug.fps_counter=counter;self.fps.reset();},Err(error)=>log::warn!("contador FPS: {error}"),
+        if actions == 0 || !self.native_menu_shown {
+            return;
+        }
+        if actions & MENU_EXIT != 0 {
+            self.native_menu_shown = false;
+            self.confirmando = false;
+            self.finaliza_jogo();
+            return;
+        }
+        if actions & MENU_COUNTER != 0 {
+            let counter = actions & MENU_COUNTER_VALUE != 0;
+            if counter != self.settings.debug.fps_counter {
+                match crate::native_ui_model::update(
+                    &self.arquivo,
+                    &self.roms(),
+                    &serde_json::json!({"debug":{"fps_counter":counter}}),
+                ) {
+                    Ok(_) => {
+                        self.settings.debug.fps_counter = counter;
+                        self.fps.reset();
+                    }
+                    Err(error) => log::warn!("contador FPS: {error}"),
                 }
             }
         }
-        if actions&MENU_KEYPAD!=0{self.handset_keys.set_enabled(actions&MENU_KEYPAD_VALUE!=0);self.zeebo_controls.set_enabled(actions&MENU_KEYPAD_VALUE!=0);self.sync_handset_keys();self.handset_routes.clear();self.handset_touch.cancel();self.handset_touch.viewport=None;}
-        if actions&MENU_DISMISSED!=0{self.confirmando=false;self.native_menu_shown=false;self.ultimo=std::time::Instant::now();self.fps.reset();}
+        if actions & MENU_KEYPAD != 0 {
+            self.handset_keys
+                .set_enabled(actions & MENU_KEYPAD_VALUE != 0);
+            self.zeebo_controls
+                .set_enabled(actions & MENU_KEYPAD_VALUE != 0);
+            self.sync_handset_keys();
+            self.handset_routes.clear();
+            self.handset_touch.cancel();
+            self.handset_touch.viewport = None;
+        }
+        if actions & MENU_DISMISSED != 0 {
+            self.confirmando = false;
+            self.native_menu_shown = false;
+            self.ultimo = std::time::Instant::now();
+            self.fps.reset();
+        }
         ctx.request_repaint();
     }
-    fn menu_handset(&mut self,_ctx:&egui::Context){
-        if !self.native_menu_shown{self.native_menu_shown=true;crate::sistema::menu_do_jogo(&self.app,self.settings.debug.fps_counter,self.handset_keys.is_enabled());}
+    fn menu_handset(&mut self, _ctx: &egui::Context) {
+        if !self.native_menu_shown {
+            self.native_menu_shown = true;
+            crate::sistema::menu_do_jogo(
+                &self.app,
+                self.settings.debug.fps_counter,
+                self.handset_keys.is_enabled(),
+            );
+        }
     }
 
     /// A pergunta do "voltar": fechar o jogo, pausar, ou continuar de onde parou.
     fn pergunta(&mut self, ctx: &egui::Context) {
-        let handset_game = self.sessao.as_ref().is_some_and(zeebx::session::Session::is_handset);
-        if handset_game { self.menu_handset(ctx); return; }
+        let handset_game = self.sessao.as_ref().is_some_and(|s| s.is_handset());
+        if handset_game {
+            self.menu_handset(ctx);
+            return;
+        }
         // A cortina escurece o jogo e, mais importante, come o toque: sem ela um dedo fora da
         // caixa iria parar no jogo atrás.
         egui::Area::new(egui::Id::new("cortina"))
@@ -467,99 +620,101 @@ impl Emulador {
                 ui.separator();
                 // O relógio monotônico e a fila móvel ainda não fazem parte do save state.
                 if !handset_game {
-                ui.heading(&estados_titulo);
-                if !estados_disponiveis {
-                    ui.label(&indisponivel);
-                }
-                if let Some(mensagem) = &mensagem {
-                    ui.label(mensagem);
-                }
-                ui.add_space(4.0);
+                    ui.heading(&estados_titulo);
+                    if !estados_disponiveis {
+                        ui.label(&indisponivel);
+                    }
+                    if let Some(mensagem) = &mensagem {
+                        ui.label(mensagem);
+                    }
+                    ui.add_space(4.0);
 
-                egui::ScrollArea::vertical()
-                    // Em 960x544, a regra de escala do frontend deixa cerca de 340 pontos de
-                    // altura. Duas linhas visíveis e rolagem cabem junto do título e dos botões
-                    // de sair; 300 pontos aqui empurrariam metade da janela para fora da tela.
-                    .max_height(170.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for (slot, (titulo, status, ocupado)) in linhas.iter().enumerate() {
-                            ui.group(|ui| {
-                                ui.set_min_width(540.0);
-                                ui.horizontal(|ui| {
-                                    let tamanho = egui::vec2(96.0, 72.0);
-                                    match miniaturas[slot] {
-                                        Some(id) => {
-                                            ui.add(
-                                                egui::Image::new((id, tamanho))
-                                                    .fit_to_exact_size(tamanho),
-                                            );
-                                        }
-                                        None => {
-                                            let (rect, _) =
-                                                ui.allocate_exact_size(tamanho, egui::Sense::hover());
-                                            ui.painter().rect_filled(
-                                                rect,
-                                                4.0,
-                                                egui::Color32::from_gray(18),
-                                            );
-                                        }
-                                    }
-
-                                    ui.vertical(|ui| {
-                                        ui.strong(titulo);
-                                        ui.label(status);
-                                        if confirmando_slot == Some(slot) {
-                                            ui.small(&substituir_aviso);
-                                        }
-                                    });
-
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            let load = ui.add_enabled(
-                                                estados_disponiveis && *ocupado,
-                                                egui::Button::new(&carregar_rotulo)
-                                                    .min_size(egui::vec2(88.0, 44.0)),
-                                            );
-                                            if load.clicked() {
-                                                carregar_slot = Some(slot);
+                    egui::ScrollArea::vertical()
+                        // Em 960x544, a regra de escala do frontend deixa cerca de 340 pontos de
+                        // altura. Duas linhas visíveis e rolagem cabem junto do título e dos botões
+                        // de sair; 300 pontos aqui empurrariam metade da janela para fora da tela.
+                        .max_height(170.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (slot, (titulo, status, ocupado)) in linhas.iter().enumerate() {
+                                ui.group(|ui| {
+                                    ui.set_min_width(540.0);
+                                    ui.horizontal(|ui| {
+                                        let tamanho = egui::vec2(96.0, 72.0);
+                                        match miniaturas[slot] {
+                                            Some(id) => {
+                                                ui.add(
+                                                    egui::Image::new((id, tamanho))
+                                                        .fit_to_exact_size(tamanho),
+                                                );
                                             }
+                                            None => {
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    tamanho,
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    4.0,
+                                                    egui::Color32::from_gray(18),
+                                                );
+                                            }
+                                        }
 
-                                            let rotulo =
-                                                match (*ocupado, confirmando_slot == Some(slot)) {
+                                        ui.vertical(|ui| {
+                                            ui.strong(titulo);
+                                            ui.label(status);
+                                            if confirmando_slot == Some(slot) {
+                                                ui.small(&substituir_aviso);
+                                            }
+                                        });
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let load = ui.add_enabled(
+                                                    estados_disponiveis && *ocupado,
+                                                    egui::Button::new(&carregar_rotulo)
+                                                        .min_size(egui::vec2(88.0, 44.0)),
+                                                );
+                                                if load.clicked() {
+                                                    carregar_slot = Some(slot);
+                                                }
+
+                                                let rotulo = match (
+                                                    *ocupado,
+                                                    confirmando_slot == Some(slot),
+                                                ) {
                                                     (_, true) => &confirmar_rotulo,
                                                     (true, false) => &substituir_rotulo,
                                                     (false, false) => &salvar_rotulo,
                                                 };
-                                            if ui
-                                                .add_enabled(
-                                                    estados_disponiveis,
-                                                    egui::Button::new(rotulo)
-                                                        .min_size(egui::vec2(120.0, 44.0)),
-                                                )
-                                                .clicked()
-                                            {
-                                                if *ocupado && confirmando_slot != Some(slot) {
-                                                    armar_sobrescrita = Some(slot);
-                                                } else {
-                                                    salvar_slot = Some(slot);
+                                                if ui
+                                                    .add_enabled(
+                                                        estados_disponiveis,
+                                                        egui::Button::new(rotulo)
+                                                            .min_size(egui::vec2(120.0, 44.0)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if *ocupado && confirmando_slot != Some(slot) {
+                                                        armar_sobrescrita = Some(slot);
+                                                    } else {
+                                                        salvar_slot = Some(slot);
+                                                    }
                                                 }
-                                            }
-                                        },
-                                    );
+                                            },
+                                        );
+                                    });
                                 });
-                            });
-                            ui.add_space(4.0);
-                        }
-                    });
-
+                                ui.add_space(4.0);
+                            }
+                        });
                 }
                 ui.separator();
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    let seguir =
-                        ui.add_sized([150.0, 48.0], egui::Button::new(&continuar_rotulo));
+                    let seguir = ui.add_sized([150.0, 48.0], egui::Button::new(&continuar_rotulo));
                     let pausa = ui.add_sized([110.0, 48.0], egui::Button::new(&pausa_rotulo));
                     let recomeca =
                         ui.add_sized([110.0, 48.0], egui::Button::new(&reiniciar_rotulo));
@@ -584,9 +739,7 @@ impl Emulador {
         }
         if let Some(slot) = salvar_slot {
             let resultado = match (self.estado_id.as_deref(), self.sessao.as_mut()) {
-                (Some(id), Some(sessao)) => {
-                    estado::salva(&self.estados_raiz, id, slot, sessao)
-                }
+                (Some(id), Some(sessao)) => estado::salva(&self.estados_raiz, id, slot, sessao),
                 _ => Err("save state indisponível".to_string()),
             };
             match resultado {
@@ -612,9 +765,7 @@ impl Emulador {
         }
         if let Some(slot) = carregar_slot {
             let resultado = match (self.estado_id.as_deref(), self.sessao.as_mut()) {
-                (Some(id), Some(sessao)) => {
-                    estado::carrega(&self.estados_raiz, id, slot, sessao)
-                }
+                (Some(id), Some(sessao)) => estado::carrega(&self.estados_raiz, id, slot, sessao),
                 _ => Err("save state indisponível".to_string()),
             };
             match resultado {
@@ -674,9 +825,7 @@ fn textura_de_estado(
 ) -> egui::TextureHandle {
     let mut rgba = Vec::with_capacity(miniatura.largura * miniatura.altura * 4);
     for pixel in miniatura.rgb565.chunks_exact(2) {
-        let cor = zeebx::video::display::Rgb::from_rgb565(u16::from_le_bytes([
-            pixel[0], pixel[1],
-        ]));
+        let cor = zeebx::video::display::Rgb::from_rgb565(u16::from_le_bytes([pixel[0], pixel[1]]));
         rgba.extend_from_slice(&[cor.r, cor.g, cor.b, 255]);
     }
     let imagem =
@@ -732,7 +881,11 @@ impl Emulador {
             false => "◀◀".to_string(),
         });
         let avanco = (self.avancando)
-            .then(|| self.sessao.as_ref().map(|sessao| sessao.velocidade_alcancada()))
+            .then(|| {
+                self.sessao
+                    .as_ref()
+                    .map(|sessao| sessao.velocidade_alcancada())
+            })
             .flatten()
             .map(|alcancada| {
                 zeebx::velocidade::rotulo_do_avanco(
@@ -741,7 +894,10 @@ impl Emulador {
                     virgula,
                 )
             });
-        let turbo = self.turbo.ligado().then(|| self.catalogo.get("turbo.on_screen").to_string());
+        let turbo = self
+            .turbo
+            .ligado()
+            .then(|| self.catalogo.get("turbo.on_screen").to_string());
         let texto: Vec<String> = rewind.into_iter().chain(avanco).chain(turbo).collect();
         if texto.is_empty() {
             return;

@@ -69,6 +69,26 @@ pub const MODULE: &[&str] = &["AddRef", "Release", "CreateInstance", "FreeResour
 /// Métodos de `IApplet` (3 slots).
 pub const APPLET: &[&str] = &["AddRef", "Release", "HandleEvent"];
 
+/// AEEIMemCache1.h: IQI mais ClearCache e GetCacheInfo.
+pub const MEM_CACHE_1: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "ClearCache", "GetCacheInfo",
+];
+
+/// pim_IContacts.h do Brew MP: todas as posições pertencem ao ABI público.
+pub const PIM_CONTACTS: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "CreateRecord", "AddRecord", "UpdateRecord",
+    "GetRecord", "RemoveRecord", "RemoveAllRecords", "GetGroupName", "GetGroupInfo",
+    "SetGroupInfo", "CreateCustomGroup", "RemoveCustomGroup", "GetNumGroups", "GetNumFields",
+    "GetFieldName", "GetFieldInfo", "CreateCustomField", "RemoveCustomField", "Search",
+    "SearchCount", "BeginTransaction", "CommitTransaction", "RollbackTransaction", "OnChange",
+    "GetLastChangeSeqNum", "GetMaxRecords", "GetMaxRecordSize",
+];
+
+/// pim_IContactsResults.h: fim da enumeração usa AEE_ENOMORE, não sucesso com nulo.
+pub const PIM_CONTACTS_RESULTS: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "GetNext", "Reset",
+];
+
 /// Métodos de `IFileMgr` (21 slots).
 pub const FILEMGR: &[&str] = &[
     "AddRef",
@@ -162,16 +182,7 @@ pub const BITMAP: &[&str] = &[
 
 /// Métodos do canvas `0x0101e443`. Só o slot 7 é chamado; os outros ficam como marcador para
 /// que uma chamada inesperada apareça no relatório.
-pub const CANVAS: &[&str] = &[
-    "AddRef",
-    "Release",
-    "QueryInterface",
-    "slot3",
-    "slot4",
-    "slot5",
-    "slot6",
-    "GetDisplay",
-];
+pub const CANVAS: &[&str] = &["AddRef","Release","QueryInterface","GetBitmap","SetBitmap","GetClipRect","SetClipRect","GetDisplay","SetDisplay"];
 
 /// Métodos de `ITransform` (5 slots), de `AEETransform.h`.
 pub const TRANSFORM: &[&str] = &[
@@ -984,19 +995,16 @@ pub const GL_LEGACY: &[&str] = &[
 ///
 /// Os que continuam sem nome não apareceram em uso nem foram desmontados.
 pub const WEB: &[&str] = &[
-    "AddRef",
-    "Release",
-    "QueryInterface",
-    "AddOpt",
-    "slot4",
-    "slot5",
-    "AddOptBuffer",
-    "slot7",
-    "slot8",
-    "slot9",
-    "slot10",
-    "GetResponse",
-    "slot12",
+    "AddRef", "Release", "QueryInterface", "AddOpt", "RemoveOpt", "GetOpt",
+    "GetResponse", "GetResponseV",
+    // Entradas adicionais observadas no firmware legado; o slot11 conserva
+    // seu caminho antigo sem deslocar a ABI pública dos SDKs.
+    "slot8", "slot9", "slot10", "GetResponse", "slot12",
+];
+
+/// AEEIWebResp.h: IxOpts seguido de WebRespInfo* GetInfo().
+pub const WEB_RESP: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "AddOpt", "RemoveOpt", "GetOpt", "GetInfo",
 ];
 
 /// Métodos de `ISQLMgr` (`AEECLSID_SQLMGR = 0x0102c4e8`), o gerenciador de bancos do console.
@@ -1423,6 +1431,27 @@ pub const NET_LEGACY: &[&str] = &[
     "NetStatus", "GetMyIPAddr", "SetLinger", "OnEvent", "SetOpt", "GetOpt",
 ];
 
+/// AEENet.h: ISocket herda IAStream, com IBase de dois slots e sem QueryInterface.
+pub const SOCKET_LEGACY: &[&str] = &[
+    "AddRef", "Release", "Readable", "Read", "Cancel", "GetPeerName", "GetLastError",
+    "Connect", "Bind", "Write", "WriteV", "ReadV", "SendTo", "RecvFrom", "Writeable", "IOCtl",
+];
+
+/// AEEDate.h: DECLARE_IBASE + DECLARE_ICONTROL, sem QueryInterface.
+pub const DATE_LEGACY: &[&str] = &[
+    "AddRef", "Release", "HandleEvent", "Redraw", "SetActive", "IsActive", "SetRect",
+    "GetRect", "SetProperties", "GetProperties", "Reset", "SetTitle", "SetJulianDay",
+    "GetJulianDay", "SetDate", "GetDate", "GetDayOfWeek", "GetDayString", "GetMonthString",
+    "GetDateString", "EnableCommand", "SetActiveDayMask", "SetFont", "GetFont", "SizeToFit",
+];
+
+/// AEETime.h: ITimeCtl serve ao relógio; SetTime contém bIncUpdate na ABI.
+pub const CLOCK_LEGACY: &[&str] = &[
+    "AddRef", "Release", "HandleEvent", "Redraw", "SetActive", "IsActive", "SetRect",
+    "GetRect", "SetProperties", "GetProperties", "Reset", "SetTime", "GetTime",
+    "EnableCommand", "GetTimeString", "SetIncrement", "SetEditField", "SetFont", "GetFont", "SizeToFit",
+];
+
 /// `sdk/inc/AEEWeb.h`: serviço separado de IWeb, herdando os três slots de IQI.
 pub const WEB_UTIL: &[&str] = &[
     "AddRef", "Release", "QueryInterface", "ParseUrl", "MakeUrl", "UrlEncode", "UrlDecode",
@@ -1435,5 +1464,135 @@ pub const TAPI_LEGACY: &[&str] = &[
     "GetCallerID", "OnCallStatus", "IsVoiceCall", "IsDataSupported", "SendSMS",
 ];
 
+/// AEESprite.h: IQI e os seis métodos de composição.
+pub const SPRITE: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "SetTransformTable", "SetSpriteBuffer",
+    "SetTileBuffer", "SetDestination", "DrawSprites", "DrawTiles",
+];
+
+/// AEEAddrBook.h 2.1: IBase de dois slots, sem QueryInterface.
+pub const ADDRBOOK_LEGACY: &[&str] = &[
+    "AddRef", "Release", "EnumCategoryInit", "EnumNextCategory", "EnumFieldsInfoInit",
+    "EnumNextFieldsInfo", "CreateRec", "GetNumRecs", "RemoveAllRecs", "GetRecByID",
+    "EnumRecInit", "EnumNextRec", "GetLastError", "SetProperties", "GetProperties",
+    "GetCategoryName", "GetFieldName",
+];
+
 /// IRSA herda IBase (dois slots), conforme INHERIT_IRSA do AEERSA.h.
 pub const RSA: &[&str] = &["AddRef", "Release", "Init", "RSA", "ModExp", "Encrypt", "Decrypt", "VerifySig"];
+
+/// AEERegistry.h: IBase seguido de GetHandler, SetHandler e Enum síncrono.
+pub const REGISTRY: &[&str] = &["AddRef", "Release", "GetHandler", "SetHandler", "Enum"];
+
+/// IDecorator herda IWidget, cujo GetModel está no slot12 (AEEIWidget.h).
+pub const IMAGE_WIDGET: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "HandleEvent", "SetHandler",
+    "GetPreferredExtent", "GetExtent", "SetExtent", "GetParent", "SetParent",
+    "Draw", "IntersectOpaque", "GetModel", "SetModel", "SetWidget", "GetWidget",
+];
+/// AEEIInterfaceModel.h; CancelListener é só a entrada PFNLISTENERCANCEL.
+pub const INTERFACE_MODEL: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "AddListener", "Notify", "SetIPtr", "GetIPtr",
+    "CancelListener",
+];
+
+/// AEEIXYContainer.h: IQI, IContainer e os dois métodos de posição.
+pub const XY_CONTAINER: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "Invalidate", "Locate", "Insert",
+    "Remove", "GetWidget", "SetPos", "GetPos",
+];
+/// AEEIWidget.h; DefaultHandleEvent é só a entrada privada de PFNHANDLER.
+pub const XY_CONTAINER_WIDGET: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "HandleEvent", "SetHandler",
+    "GetPreferredExtent", "GetExtent", "SetExtent", "GetParent", "SetParent",
+    "Draw", "IntersectOpaque", "GetModel", "SetModel", "DefaultHandleEvent",
+];
+
+/// AEEIWindowMgr.h; Complete é apenas a entrega assíncrona interna.
+pub const WINDOW_MGR: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "CreateWindow", "SetWindowProps",
+    "CheckCapabilities", "GetCapabilities", "CloseWindow", "Complete",
+];
+/// AEEIWidget.h aplicado ao CDisplayWidget, sem IContainer ou IDecorator.
+pub const DISPLAY_WIDGET: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "HandleEvent", "SetHandler",
+    "GetPreferredExtent", "GetExtent", "SetExtent", "GetParent", "SetParent",
+    "Draw", "IntersectOpaque", "GetModel", "SetModel", "DefaultHandleEvent",
+];
+pub const WINDOW_VIEW_MODEL: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "AddListener", "Notify", "CancelListener",
+];
+
+/// AEEITypeface.h: IQI e fábricas públicas de IHFont.
+pub const MODERN_TYPEFACE: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "NewFontFromFile", "NewFontFromMemory",
+    "NewFontFromClassID", "NewFontFromMimeType",
+];
+/// AEEIFont.h moderno seguido de AEEIHFont.h.
+pub const MODERN_HFONT: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "DrawText", "MeasureText", "GetInfo", "HandleEvent",
+];
+/// IListModel e IFontMapModel; CancelListener é uma entrada PFNLISTENERCANCEL.
+pub const FONT_MAP_MODEL: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "AddListener", "Notify", "Size", "GetAt",
+    "GetByName", "Insert", "Delete", "DeleteAll", "CancelListener",
+];
+
+/// AEEIWidget.h; últimos dois slots são somente callbacks privados de handler/modelo.
+pub const STATIC_WIDGET: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "HandleEvent", "SetHandler",
+    "GetPreferredExtent", "GetExtent", "SetExtent", "GetParent", "SetParent",
+    "Draw", "IntersectOpaque", "GetModel", "SetModel", "DefaultHandleEvent", "ModelChanged", "DefaultDraw",
+];
+/// AEEIValueModel.h, CancelListener como entrada PFNLISTENERCANCEL privada.
+pub const VALUE_MODEL: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "AddListener", "Notify", "SetValue",
+    "GetValue", "AdaptGet", "AdaptSet", "CancelListener",
+];
+
+/// AEEIDrawHandler.h: IQI e troca do descritor de desenho.
+pub const DRAW_HANDLER: &[&str] = &["AddRef", "Release", "QueryInterface", "SetDraw"];
+/// IDecorator; callback privado do handler depois do prefixo público.
+pub const VIEWPORT: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "HandleEvent", "SetHandler",
+    "GetPreferredExtent", "GetExtent", "SetExtent", "GetParent", "SetParent",
+    "Draw", "IntersectOpaque", "GetModel", "SetModel", "SetWidget", "GetWidget", "DefaultHandleEvent",
+];
+/// IDecorator do scrollbar e callbacks privados de handler/modelo.
+pub const SCROLLBAR: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "HandleEvent", "SetHandler",
+    "GetPreferredExtent", "GetExtent", "SetExtent", "GetParent", "SetParent",
+    "Draw", "IntersectOpaque", "GetModel", "SetModel", "SetWidget", "GetWidget", "DefaultHandleEvent", "ModelChanged",
+];
+/// AEEIContainer.h, distinto do prefixo IWidget/IDecorator.
+pub const DECORATOR_CONTAINER: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "Invalidate", "Locate", "Insert", "Remove", "GetWidget",
+];
+
+/// CSoftkeyWidget IWidget; IContainer privado em vtable distinta no heap.
+pub const SOFTKEY_WIDGET: &[&str] = &[
+    "AddRef", "Release", "QueryInterface", "HandleEvent", "SetHandler",
+    "GetPreferredExtent", "GetExtent", "SetExtent", "GetParent", "SetParent",
+    "Draw", "IntersectOpaque", "GetModel", "SetModel", "DefaultHandleEvent",
+    "ContainerAddRef", "ContainerRelease", "ContainerQueryInterface",
+    "ContainerInvalidate", "ContainerLocate", "ContainerInsert", "ContainerRemove", "ContainerGetWidget",
+];
+
+/// AEEITextModel herda IModel; cancelamento privado de listener ao final.
+pub const TEXT_MODEL: &[&str] = &[
+ "AddRef", "Release", "QueryInterface", "AddListener", "Notify", "ReplaceSel",
+ "GetSelText", "GetTextInfo", "SetSel", "CancelListener",
+];
+/// IRichTextModel compartilha o dono, mas nao a ABI de texto simples.
+pub const RICH_TEXT_MODEL: &[&str] = &[
+ "AddRef", "Release", "QueryInterface", "AddListener", "Notify", "GetMarkupText", "SetMarkupText",
+ "TagsAdd", "TagsSize", "TagsGetAt", "TagsDeleteAt", "TagsDeleteAll",
+];
+
+/// AEEITextLayout.h: IQI e layout/desenho/consultas tipadas.
+pub const TEXT_LAYOUT:&[&str]=&["AddRef","Release","QueryInterface","HandleEvent","GetPreferredExtent","Layout","Draw","GetLayoutSize","GetLineFromIndex","GetLineStartIndex","GetCaretInfo","GetCaretAfterMove","ComputeScrollOffset"];
+
+/// IRootContainer herda IXYContainer; callback de pintura privado ao final.
+pub const ROOT_CONTAINER:&[&str]=&["AddRef","Release","QueryInterface","Invalidate","Locate","Insert","Remove","GetWidget","SetPos","GetPos","SetCanvas","GetCanvas","PaintCallback"];
+/// IWidget distinto do RootContainer; handler privado encadeavel.
+pub const ROOT_WIDGET:&[&str]=&["AddRef","Release","QueryInterface","HandleEvent","SetHandler","GetPreferredExtent","GetExtent","SetExtent","GetParent","SetParent","Draw","IntersectOpaque","GetModel","SetModel","DefaultHandleEvent"];

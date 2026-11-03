@@ -28,6 +28,7 @@ impl<C: CpuBackend> Machine<C> {
     pub fn set_applet_mif(&mut self, bytes: &[u8], class: u32) -> bool {
         self.copyright_text.clear();
         self.applet_manifest = None;
+        self.applet_resources = None;
         if bytes.len() < 32 || bytes.len() > 2 * 1024 * 1024 {
             return false;
         }
@@ -60,6 +61,7 @@ impl<C: CpuBackend> Machine<C> {
                 }
             }
         }
+        self.applet_resources = Some((String::new(), resources));
         true
     }
 
@@ -71,6 +73,12 @@ impl<C: CpuBackend> Machine<C> {
         if name.len() > 4096 || name.contains('\0') {
             return false;
         }
+        // QueryClass entrega um caminho BREW. Baseball/Stock Car extraem o nome
+        // depois da última barra; um basename sozinho fazia strrchr retornar NULL.
+        // A raiz virtual não revela o caminho do host nem escolhe outro manifesto.
+        let normalized = name.replace('\\', "/");
+        let name = if normalized.contains('/') { normalized } else { format!("fs:/~/{normalized}") };
+        if name.len() > 4096 { return false; }
         let Ok(pointer) = self.malloc(name.len() as u32 + 1) else {
             return false;
         };
@@ -84,6 +92,9 @@ impl<C: CpuBackend> Machine<C> {
         }
         if let Some((_, stored)) = &mut self.applet_manifest {
             *stored = pointer;
+        }
+        if let Some((selected, _)) = &mut self.applet_resources {
+            *selected = name;
         }
         true
     }

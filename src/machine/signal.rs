@@ -253,6 +253,12 @@ impl<C: CpuBackend> Machine<C> {
             outcomes.push(outcome);
             if incomplete { return Ok(outcomes); }
         }
+        // ISocket termina a operação fora da chamada que a registrou. A entrega
+        // usa uma fotografia das inscrições para que rearmar não cause reentrância.
+        outcomes.extend(self.deliver_legacy_socket_callbacks(budget)?);
+        if outcomes.iter().any(|outcome| !matches!(outcome, Outcome::Returned { .. })) {
+            return Ok(outcomes);
+        }
         let mut pending = std::mem::take(&mut self.pending_signals).into_iter();
         while let Some(callback) = pending.next() {
             if callback.function == 0 {

@@ -34,16 +34,15 @@ pub fn vibration_press(keys:&TouchKeypad,event:&InputEvent,scale:f32,enabled:boo
 }
 
 pub fn geometry(path: &std::path::Path, profiles: &std::path::Path) -> Result<DisplayGeometry, String> {
-    let mif=zeebx::library::resolve_mif(path)?;
-    let package = zeebx::handset::package::read_module_pair(path, &mif)
+    let package = zeebx::handset::launch::read(path)
         .map_err(|error| error.to_string())?;
-    Ok(zeebx::handset::display::resolve_hash(path,profiles,&package.report.module_sha256)?.geometry)
+    Ok(zeebx::handset::display::resolve_hash(path,profiles,&package.module_sha256)?.geometry)
 }
 
 #[cfg(target_os="android")]
 pub fn profile_geometry(path:&std::path::Path,resolution:Option<DisplayGeometry>)->Result<DisplayGeometry,String>{
-    let mif=zeebx::library::resolve_mif(path)?;let package=zeebx::handset::package::read_module_pair(path,&mif).map_err(|e|e.to_string())?;
-    Ok(crate::profile_runtime::geometry(path,&package.report.module_sha256,resolution))
+    let package=zeebx::handset::launch::read(path).map_err(|e|e.to_string())?;
+    Ok(crate::profile_runtime::geometry(path,&package.module_sha256,resolution))
 }
 
 pub fn receive(keys: &mut TouchKeypad, mapping: &mut InputMap, event: &InputEvent, scale: f32) -> bool {

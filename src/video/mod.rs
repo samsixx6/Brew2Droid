@@ -12,3 +12,4 @@ pub mod gles;
 pub mod icon;
 pub mod paltex;
 pub mod rasterizer;
+pub(crate) mod saf;

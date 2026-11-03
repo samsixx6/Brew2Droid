@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use zeebx::session::Session;
+use crate::native_session::Session;
 use zeebx::video::display::Framebuffer;
 
 pub const SLOTS: usize = 5;

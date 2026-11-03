@@ -57,8 +57,8 @@ impl<C: CpuBackend> Machine<C> {
                             self.cpu.write_u32(cb + 16, 0)?;
                             self.cpu.write_u32(cb + 20, 0)?;
                         }
-                        self.heap.free(cb);
-                        self.heap.free(state.stack);
+                        self.free_guest_allocation(cb);
+                        self.free_guest_allocation(state.stack);
                     }
                 }
                 remaining
@@ -71,7 +71,7 @@ impl<C: CpuBackend> Machine<C> {
             }
             "Malloc" => self.malloc(a1)?,
             "Free" => {
-                self.heap.free(a1);
+                self.free_guest_allocation(a1);
                 SUCCESS
             }
             // O pool de recursos existe para liberar tudo junto no fim da thread; a nossa heap
@@ -191,7 +191,7 @@ impl<C: CpuBackend> Machine<C> {
         state.exit_code = code;
         let stack = std::mem::take(&mut state.stack);
         let joiners = std::mem::take(&mut state.joiners);
-        self.heap.free(stack);
+        self.free_guest_allocation(stack);
         self.pending_threads.retain(|&t| t != thread);
         for (call, out) in joiners {
             if out != 0 {
@@ -288,9 +288,9 @@ impl<C: CpuBackend> Machine<C> {
             "AddRef" => self.objects.add_ref(this),
             "Release" => self.objects.release(this),
             "Malloc" => self.malloc(a1 & !ALLOC_NO_ZMEM)?,
-            "Realloc" => self.realloc(a1, a2 & !ALLOC_NO_ZMEM)?,
+            "Realloc" => self.realloc(a1, a2)?,
             "Free" => {
-                self.heap.free(a1);
+                self.free_guest_allocation(a1);
                 SUCCESS
             }
             "StrDup" => {
@@ -350,12 +350,16 @@ impl<C: CpuBackend> Machine<C> {
         // Tamanho zero é `FREE`: o bloco sai e o ponteiro vira nulo. Entregar um bloco novo de
         // oito bytes deixava o `ERR_REALLOC(0, &p)` com `p` não nulo, e um jogo que confia no
         // nulo nunca o devolvia.
-        if size == 0 {
+        let requested = size & !ALLOC_NO_ZMEM;
+        if requested == 0 {
             self.solta_bitmap_nativo(ptr);
-            self.heap.free(ptr);
+            self.free_guest_allocation(ptr);
             return Ok(0);
         }
-        let old_size = self.heap.size_of(ptr).unwrap_or(0);
+        // A folga de MALLOC não é conteúdo do guest. Copiá-la sobre a expansão zerada
+        // quebrava o terminador UTF16 dos nomes de missão de Tank Raid. Só estados
+        // anteriores à contabilidade lógica conservam a extensão física histórica.
+        let old_size = self.heap.requested_size_of(ptr).or_else(|| self.heap.size_of(ptr)).unwrap_or(0);
         let new_ptr = self.malloc(size)?;
         // Sem espaço, o bloco antigo fica como estava: é o que o `realloc` promete, e o jogo
         // que confere o nulo ainda tem os dados dele.
@@ -363,10 +367,10 @@ impl<C: CpuBackend> Machine<C> {
             return Ok(0);
         }
         if old_size > 0 {
-            self.copy_guest(new_ptr, ptr, old_size.min(size))?;
+            self.copy_guest(new_ptr, ptr, old_size.min(requested))?;
         }
-        self.realoca_bitmap_nativo(ptr, new_ptr, size & !ALLOC_NO_ZMEM);
-        self.heap.free(ptr);
+        self.realoca_bitmap_nativo(ptr, new_ptr, requested);
+        self.free_guest_allocation(ptr);
         Ok(new_ptr)
     }
 
@@ -380,7 +384,14 @@ impl<C: CpuBackend> Machine<C> {
         let zero = size & ALLOC_NO_ZMEM == 0;
         let size = size & !ALLOC_NO_ZMEM;
         // Um byte a mais, que vira a folga depois do bloco: ver `FOLGA_DO_BLOCO`.
-        let Some(addr) = self.heap.alloc(size.saturating_add(1)) else {
+        let mut allocation = self.heap.alloc_with_padding(size, 1);
+        if allocation.is_none() && self.deliver_low_ram(2)? {
+            allocation = self.heap.alloc_with_padding(size, 1);
+        }
+        if allocation.is_none() && self.deliver_low_ram(7)? {
+            allocation = self.heap.alloc_with_padding(size, 1);
+        }
+        let Some(addr) = allocation else {
             // Registrado: uma recusa silenciosa vira "o jogo não funciona" sem pista nenhuma no
             // relatório. `lr` diz quem pediu.
             self.alocacoes_recusadas
@@ -394,6 +405,12 @@ impl<C: CpuBackend> Machine<C> {
         let bloco = self.heap.size_of(addr).unwrap_or(size);
         self.cpu
             .write_mem(addr + size, &vec![FOLGA_DO_BLOCO; (bloco - size) as usize])?;
+        if !self.system_callbacks.is_empty() && self.heap.retrato().livre < callback::LOW_RAM_THRESHOLD {
+            self.deliver_low_ram(2)?;
+            if self.heap.retrato().livre < callback::LOW_RAM_THRESHOLD {
+                self.deliver_low_ram(7)?;
+            }
+        }
         Ok(addr)
     }
 
@@ -416,3 +433,4 @@ impl<C: CpuBackend> Machine<C> {
         self.heap.retrato()
     }
 }
+

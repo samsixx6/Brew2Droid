@@ -106,6 +106,42 @@ pub fn de_codigo(valor: u32) -> Option<Interface> {
         73 => Interface::StaticLegacy,
         74 => Interface::TapiLegacy,
         75 => Interface::Rsa,
+        76 => Interface::Sprite,
+        77 => Interface::AddrBookLegacy,
+        78 => Interface::SocketLegacy,
+        79 => Interface::DateLegacy,
+        80 => Interface::ClockLegacy,
+        81 => Interface::Registry,
+        82 => Interface::RegionalModelInfo,
+        83 => Interface::AppHistory,
+        84 => Interface::MemCache1,
+        85 => Interface::ImageWidget,
+        86 => Interface::InterfaceModel,
+        87 => Interface::PimContacts,
+        88 => Interface::PimContactsResults,
+        89 => Interface::WebResp,
+        90 => Interface::XYContainer,
+        91 => Interface::XYContainerWidget,
+        92 => Interface::WindowMgr,
+        93 => Interface::DisplayWidget,
+        94 => Interface::WindowViewModel,
+        95 => Interface::ModernTypeface,
+        96 => Interface::ModernHFont,
+        97 => Interface::FontMapModel,
+        98 => Interface::StaticWidget,
+        99 => Interface::ValueModel,
+        100 => Interface::Viewport,
+        101 => Interface::Scrollbar,
+        102 => Interface::StaticDrawHandler,
+        103 => Interface::ViewportContainer,
+        104 => Interface::ScrollbarContainer,
+        105 => Interface::SoftkeyWidget,
+        106 => Interface::TextModel,
+        107 => Interface::RichTextModel,
+        108 => Interface::TextLayout,
+        109 => Interface::RootContainer,
+        110 => Interface::RootContainerWidget,
+        111 => Interface::ButtonWidget,
         _ => return None,
     })
 }
@@ -120,7 +156,7 @@ mod testes_da_codificacao {
     /// a contagem abaixo não bate e o teste falha **antes** de um save state ficar ilegível.
     #[test]
     fn toda_interface_tem_numero_e_volta() {
-        let todas: [(u32, &str); 76] = [
+        let todas: [(u32, &str); 112] = [
         (0, "Shell"),
         (1, "Module"),
         (2, "Applet"),
@@ -197,6 +233,42 @@ mod testes_da_codificacao {
         (73, "StaticLegacy"),
         (74, "TapiLegacy"),
         (75, "Rsa"),
+        (76, "Sprite"),
+        (77, "AddrBookLegacy"),
+        (78, "SocketLegacy"),
+        (79, "DateLegacy"),
+        (80, "ClockLegacy"),
+        (81, "Registry"),
+        (82, "RegionalModelInfo"),
+        (83, "AppHistory"),
+        (84, "MemCache1"),
+        (85, "ImageWidget"),
+        (86, "InterfaceModel"),
+        (87, "PimContacts"),
+        (88, "PimContactsResults"),
+        (89, "WebResp"),
+        (90, "XYContainer"),
+        (91, "XYContainerWidget"),
+        (92, "WindowMgr"),
+        (93, "DisplayWidget"),
+        (94, "WindowViewModel"),
+        (95, "ModernTypeface"),
+        (96, "ModernHFont"),
+        (97, "FontMapModel"),
+        (98, "StaticWidget"),
+        (99, "ValueModel"),
+        (100, "Viewport"),
+        (101, "Scrollbar"),
+        (102, "StaticDrawHandler"),
+        (103, "ViewportContainer"),
+        (104, "ScrollbarContainer"),
+        (105, "SoftkeyWidget"),
+        (106, "TextModel"),
+        (107, "RichTextModel"),
+        (108, "TextLayout"),
+        (109, "RootContainer"),
+        (110, "RootContainerWidget"),
+        (111, "ButtonWidget"),
         ];
         for (valor, nome) in todas {
             let iface = de_codigo(valor).unwrap_or_else(|| panic!("{nome} ({valor}) não voltou"));
@@ -545,6 +617,79 @@ pub enum Interface {
     TapiLegacy = 74,
     /// IRSA legado: exponenciação modular e verificação de assinaturas.
     Rsa = 75,
+    /// Composição de sprites e mapas de blocos de AEESprite.h.
+    Sprite = 76,
+    /// Agenda virtual móvel de AEEAddrBook.h, sem integração com contatos do host.
+    AddrBookLegacy = 77,
+    /// ISocket de AEENet.h: invólucro independente da conexão de rede.
+    SocketLegacy = 78,
+    /// IDateCtl de AEEDate.h, com época própria em dias desde1969-12-28.
+    DateLegacy = 79,
+    /// ITimeCtl do relógio móvel: a ABI não inclui QueryInterface.
+    ClockLegacy = 80,
+    /// Registro de handlers MIME de AEERegistry.h.
+    Registry = 81,
+    /// Contrato parcial observado de0x018000fe: modelo local no início do buffer.
+    /// Os nomes originais da interface/método não constam do SDK disponível.
+    RegionalModelInfo = 82,
+    /// Histórico real de aplicativos visíveis e suspensos (AEEIAppHistory.h).
+    AppHistory = 83,
+    /// IMemCache1 do Brew MP: manutenção de cache da memória, não cache de conteúdo.
+    MemCache1 = 84,
+    /// IDecorator do CImageWidget, com modelo de imagem tipado.
+    ImageWidget = 85,
+    /// IInterfaceModel: identidade, posse e listeners próprios.
+    InterfaceModel = 86,
+    /// Agenda virtual vazia pela interface pública do Brew MP.
+    PimContacts = 87,
+    /// Enumeração independente dos resultados da agenda virtual.
+    PimContactsResults = 88,
+    /// IWebResp público, com informação de resposta e posse da transação.
+    WebResp = 89,
+    /// Facet IXYContainer/IContainer do CXYContainer público.
+    XYContainer = 90,
+    /// Facet IWidget do mesmo CXYContainer, com vtable distinta.
+    XYContainerWidget = 91,
+    /// Sistema público de janelas do Brew MP.
+    WindowMgr = 92,
+    /// IDisplay envolvido por um IWidget com bitmap próprio.
+    DisplayWidget = 93,
+    /// IModel tipado que notifica alterações de extensão.
+    WindowViewModel = 94,
+    /// ITypeface público do Brew MP, separado da fábrica legada.
+    ModernTypeface = 95,
+    /// IHFont/IFont com o ABI moderno e raster tipográfico real.
+    ModernHFont = 96,
+    /// IListModel/IFontMapModel público, com nomes e fontes possuídos.
+    FontMapModel = 97,
+    /// IWidget de texto estático, com IValueModel próprio.
+    StaticWidget = 98,
+    /// IValueModel público, com valor opaco e adaptadores.
+    ValueModel = 99,
+    /// IDecorator do viewport Brew MP; fábrica só quando o módulo estiver pronto.
+    Viewport = 100,
+    /// IDecorator do scrollbar Brew MP.
+    Scrollbar = 101,
+    /// IDrawHandler separado do IWidget do CStaticWidget.
+    StaticDrawHandler = 102,
+    /// Facet IContainer do viewport.
+    ViewportContainer = 103,
+    /// Facet IContainer do scrollbar.
+    ScrollbarContainer = 104,
+    /// IWidget público do CSoftkeyWidget.
+    SoftkeyWidget = 105,
+    /// IModel/ITextModel com prefixo publico herdado.
+    TextModel = 106,
+    /// IRichTextModel com vtable propria.
+    RichTextModel = 107,
+    /// ITextLayout moderno do dispositivo virtual.
+    TextLayout = 108,
+    /// IRootContainer, prefixo IXYContainer.
+    RootContainer = 109,
+    /// IWidget comprovado no teste primario AsChild.
+    RootContainerWidget = 110,
+    /// IDecorator público do CButtonWidget e seu IContainer privado distinto.
+    ButtonWidget = 111,
 }
 
 impl Interface {
@@ -554,7 +699,7 @@ impl Interface {
     /// as duas coisas precisam concordar — daí a lista existir num lugar só, com teste que
     /// confere a correspondência. Quando elas divergiram, um objeto recebeu a vtable de outra
     /// interface e a chamada foi parar no método errado, com sintoma a quilômetros da causa.
-    pub const ALL: [Interface; 76] = [
+    pub const ALL: [Interface; 112] = [
         Self::Shell,
         Self::Module,
         Self::Applet,
@@ -631,6 +776,42 @@ impl Interface {
         Self::StaticLegacy,
         Self::TapiLegacy,
         Self::Rsa,
+        Self::Sprite,
+        Self::AddrBookLegacy,
+        Self::SocketLegacy,
+        Self::DateLegacy,
+        Self::ClockLegacy,
+        Self::Registry,
+        Self::RegionalModelInfo,
+        Self::AppHistory,
+        Self::MemCache1,
+        Self::ImageWidget,
+        Self::InterfaceModel,
+        Self::PimContacts,
+        Self::PimContactsResults,
+        Self::WebResp,
+        Self::XYContainer,
+        Self::XYContainerWidget,
+        Self::WindowMgr,
+        Self::DisplayWidget,
+        Self::WindowViewModel,
+        Self::ModernTypeface,
+        Self::ModernHFont,
+        Self::FontMapModel,
+        Self::StaticWidget,
+        Self::ValueModel,
+        Self::Viewport,
+        Self::Scrollbar,
+        Self::StaticDrawHandler,
+        Self::ViewportContainer,
+        Self::ScrollbarContainer,
+        Self::SoftkeyWidget,
+        Self::TextModel,
+        Self::RichTextModel,
+        Self::TextLayout,
+        Self::RootContainer,
+        Self::RootContainerWidget,
+        Self::ButtonWidget,
     ];
 
     /// Nome usado nos logs — casa com a nomenclatura do SDK.
@@ -663,6 +844,42 @@ impl Interface {
             Self::StaticLegacy => "IStatic",
             Self::TapiLegacy => "ITAPI",
             Self::Rsa => "IRSA",
+            Self::Sprite => "ISprite",
+            Self::AddrBookLegacy => "IAddrBook",
+            Self::SocketLegacy => "ISocket",
+            Self::DateLegacy => "IDateCtl",
+            Self::ClockLegacy => "ITimeCtl",
+            Self::Registry => "IRegistry",
+            Self::RegionalModelInfo => "RegionalModelInfo",
+            Self::AppHistory => "IAppHistory",
+            Self::MemCache1 => "IMemCache1",
+            Self::ImageWidget => "CImageWidget",
+            Self::InterfaceModel => "IInterfaceModel",
+            Self::PimContacts => "pim_IContacts",
+            Self::PimContactsResults => "pim_IContactsResults",
+            Self::WebResp => "IWebResp",
+            Self::XYContainer => "IXYContainer",
+            Self::XYContainerWidget => "CXYContainer.IWidget",
+            Self::WindowMgr => "IWindowMgr",
+            Self::DisplayWidget => "IDisplayWidget.IWidget",
+            Self::WindowViewModel => "IDisplayWidget.IModel",
+            Self::ModernTypeface => "ITypeface.BrewMP",
+            Self::ModernHFont => "IHFont",
+            Self::FontMapModel => "IFontMapModel",
+            Self::StaticWidget => "CStaticWidget",
+            Self::ValueModel => "IValueModel",
+            Self::Viewport => "CViewportWidget",
+            Self::Scrollbar => "CScrollbarWidget",
+            Self::StaticDrawHandler => "CStaticWidget.IDrawHandler",
+            Self::ViewportContainer => "CViewportWidget.IContainer",
+            Self::ScrollbarContainer => "CScrollbarWidget.IContainer",
+            Self::SoftkeyWidget => "CSoftkeyWidget",
+            Self::TextModel => "CTextModel.ITextModel",
+            Self::RichTextModel => "CTextModel.IRichTextModel",
+            Self::TextLayout => "CBTFETextLayout",
+            Self::RootContainer => "CRootContainer",
+            Self::RootContainerWidget => "CRootContainer.IWidget",
+            Self::ButtonWidget => "CButtonWidget",
             Self::License => "ILicense",
             Self::MemAStream => "IMemAStream",
             Self::Image => "IImage",
@@ -744,6 +961,47 @@ impl Interface {
             Self::StaticLegacy => aee_slots::STATIC_LEGACY,
             Self::TapiLegacy => aee_slots::TAPI_LEGACY,
             Self::Rsa => aee_slots::RSA,
+            Self::Sprite => aee_slots::SPRITE,
+            Self::AddrBookLegacy => aee_slots::ADDRBOOK_LEGACY,
+            Self::SocketLegacy => aee_slots::SOCKET_LEGACY,
+            Self::DateLegacy => aee_slots::DATE_LEGACY,
+            Self::ClockLegacy => aee_slots::CLOCK_LEGACY,
+            Self::Registry => aee_slots::REGISTRY,
+            Self::RegionalModelInfo => &["AddRef", "Release", "ReadModel"],
+            Self::AppHistory => &["AddRef","Release","QueryInterface","Forward","Back","Top","Insert","GetClass","GetArgs","GetData","SetData","Current","Remove","Move","GetReason","SetReason"],
+            Self::MemCache1 => aee_slots::MEM_CACHE_1,
+            Self::ImageWidget => aee_slots::IMAGE_WIDGET,
+            Self::InterfaceModel => aee_slots::INTERFACE_MODEL,
+            Self::PimContacts => aee_slots::PIM_CONTACTS,
+            Self::PimContactsResults => aee_slots::PIM_CONTACTS_RESULTS,
+            Self::WebResp => aee_slots::WEB_RESP,
+            Self::XYContainer => aee_slots::XY_CONTAINER,
+            Self::XYContainerWidget => aee_slots::XY_CONTAINER_WIDGET,
+            Self::WindowMgr => aee_slots::WINDOW_MGR,
+            Self::DisplayWidget => aee_slots::DISPLAY_WIDGET,
+            Self::WindowViewModel => aee_slots::WINDOW_VIEW_MODEL,
+            Self::ModernTypeface => aee_slots::MODERN_TYPEFACE,
+            Self::ModernHFont => aee_slots::MODERN_HFONT,
+            Self::FontMapModel => aee_slots::FONT_MAP_MODEL,
+            Self::StaticWidget => aee_slots::STATIC_WIDGET,
+            Self::SoftkeyWidget => aee_slots::SOFTKEY_WIDGET,
+            Self::TextModel => aee_slots::TEXT_MODEL,
+            Self::RichTextModel => aee_slots::RICH_TEXT_MODEL,
+            Self::TextLayout => aee_slots::TEXT_LAYOUT,
+            Self::RootContainer => aee_slots::ROOT_CONTAINER,
+            Self::RootContainerWidget => aee_slots::ROOT_WIDGET,
+            Self::ButtonWidget => &[
+                "AddRef", "Release", "QueryInterface", "HandleEvent", "SetHandler",
+                "GetPreferredExtent", "GetExtent", "SetExtent", "GetParent", "SetParent",
+                "Draw", "IntersectOpaque", "GetModel", "SetModel", "SetWidget", "GetWidget",
+                "DefaultHandleEvent", "ContainerAddRef", "ContainerRelease", "ContainerQueryInterface",
+                "ContainerInvalidate", "ContainerLocate", "ContainerInsert", "ContainerRemove", "ContainerGetWidget",
+            ],
+            Self::ValueModel => aee_slots::VALUE_MODEL,
+            Self::Viewport => aee_slots::VIEWPORT,
+            Self::Scrollbar => aee_slots::SCROLLBAR,
+            Self::StaticDrawHandler => aee_slots::DRAW_HANDLER,
+            Self::ViewportContainer | Self::ScrollbarContainer => aee_slots::DECORATOR_CONTAINER,
             Self::License => aee_slots::LICENSE,
             Self::MemAStream => aee_slots::MEMASTREAM,
             Self::Image => aee_slots::IMAGE,
@@ -869,6 +1127,42 @@ impl Interface {
             73 => Self::StaticLegacy,
             74 => Self::TapiLegacy,
             75 => Self::Rsa,
+            76 => Self::Sprite,
+            77 => Self::AddrBookLegacy,
+            78 => Self::SocketLegacy,
+            79 => Self::DateLegacy,
+            80 => Self::ClockLegacy,
+            81 => Self::Registry,
+            82 => Self::RegionalModelInfo,
+            83 => Self::AppHistory,
+            84 => Self::MemCache1,
+            85 => Self::ImageWidget,
+            86 => Self::InterfaceModel,
+            87 => Self::PimContacts,
+            88 => Self::PimContactsResults,
+            89 => Self::WebResp,
+            90 => Self::XYContainer,
+            91 => Self::XYContainerWidget,
+            92 => Self::WindowMgr,
+            93 => Self::DisplayWidget,
+            94 => Self::WindowViewModel,
+            95 => Self::ModernTypeface,
+            96 => Self::ModernHFont,
+            97 => Self::FontMapModel,
+            98 => Self::StaticWidget,
+            99 => Self::ValueModel,
+            100 => Self::Viewport,
+            101 => Self::Scrollbar,
+            102 => Self::StaticDrawHandler,
+            103 => Self::ViewportContainer,
+            104 => Self::ScrollbarContainer,
+            105 => Self::SoftkeyWidget,
+            106 => Self::TextModel,
+            107 => Self::RichTextModel,
+            108 => Self::TextLayout,
+            109 => Self::RootContainer,
+            110 => Self::RootContainerWidget,
+            111 => Self::ButtonWidget,
             35 => Self::Probe,
             36 => Self::SqlMgr,
             37 => Self::SqlDatabase,
@@ -975,7 +1269,7 @@ mod tests {
 
     #[test]
     fn endereco_fora_das_interfaces_conhecidas_nao_decodifica() {
-        assert_eq!(decode(API_BASE + 99 * IFACE_STRIDE), None);
+        assert_eq!(decode(API_BASE + 1023 * IFACE_STRIDE), None);
         assert_eq!(decode(0x1000), None);
     }
 

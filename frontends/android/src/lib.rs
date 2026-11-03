@@ -19,36 +19,37 @@
 //! da imagem, sem prometer as melhorias GLES do console para o rasterizador ARM dos jogos.
 
 mod ajustes;
+mod audio_focus;
 mod biblioteca;
+mod button_mapping;
 mod density;
 mod entrada;
-mod input_dispatch;
 mod estado;
 mod fps;
 mod frame_profile;
-mod audio_focus;
+mod game_options;
+mod handset;
+mod input_dispatch;
+mod jogo;
+mod keypad_layout;
+mod native_session;
 mod native_ui;
 mod native_ui_model;
-mod save_storage;
-mod game_options;
-mod button_mapping;
-mod profile_store;
-mod profile_runtime;
-mod keypad_layout;
-mod handset;
-mod zeebo_controls;
-mod zeebo_mapping;
-mod zeebo_art;
-mod zeebo_android;
-mod jogo;
 mod pacing;
 mod probe;
+mod profile_runtime;
+mod profile_store;
+mod save_storage;
 mod seletor;
 mod sistema;
 mod tela;
 mod tema;
 mod toque;
 mod widgets;
+mod zeebo_android;
+mod zeebo_art;
+mod zeebo_controls;
+mod zeebo_mapping;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -56,8 +57,11 @@ use std::time::{Duration, Instant};
 
 use android_activity::{AndroidApp, MainEvent, PollEvent, WindowManagerFlags};
 
+use native_session::Session;
+use zeebx::handset::installed::{InstalledApplet, InstalledCatalog};
 use zeebx::input::Pad;
-use zeebx::session::Session;
+use zeebx::session::Session as CoreSession;
+use zeebx::session::handset_runtime::HandsetRuntime;
 use zeebx::storage::StoragePaths;
 use zeebx::ui::i18n::Catalog;
 use zeebx::ui::library::{self, Game};
@@ -131,12 +135,20 @@ fn android_main(app: AndroidApp) {
 
     let launch = match native_ui::launch(&app) {
         Ok(launch) if launch.game.is_some() || launch.probe => launch,
-        Ok(_) => { native_ui::finish(&app, Some("Choose a game from the native library.")); return; }
-        Err(error) => { native_ui::finish(&app, Some(&error)); return; }
+        Ok(_) => {
+            native_ui::finish(&app, Some("Choose a game from the native library."));
+            return;
+        }
+        Err(error) => {
+            native_ui::finish(&app, Some(&error));
+            return;
+        }
     };
     let gameplay = launch.game.is_some();
     native_ui::GAME_ACTIVE.store(gameplay, std::sync::atomic::Ordering::Release);
-    if gameplay { native_ui_model::begin_gameplay(); }
+    if gameplay {
+        native_ui_model::begin_gameplay();
+    }
 
     // Tela cheia de verdade: num aparelho de mão a barra de status só rouba altura do jogo — e
     // era ela que cobria o caminho no seletor de pastas.
@@ -149,7 +161,9 @@ fn android_main(app: AndroidApp) {
     gira(app, &mut emulador, launch);
     drop(emulador);
     let _ = input_dispatch::take_back();
-    if gameplay { native_ui_model::end_gameplay(); }
+    if gameplay {
+        native_ui_model::end_gameplay();
+    }
     native_ui::GAME_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
 }
 
@@ -160,7 +174,12 @@ fn android_main(app: AndroidApp) {
 fn despeja_o_registro() {
     use zeebx::registro::Nivel;
     for linha in zeebx::registro::drena() {
-        let texto = format!("[{}] {}: {}", linha.nivel.etiqueta(), linha.alvo, linha.texto);
+        let texto = format!(
+            "[{}] {}: {}",
+            linha.nivel.etiqueta(),
+            linha.alvo,
+            linha.texto
+        );
         match linha.nivel {
             Nivel::Depuracao => log::debug!("{texto}"),
             Nivel::Informacao => log::info!("{texto}"),
@@ -191,13 +210,22 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
     let comeco = Instant::now();
     let mut handset_pacer = pacing::HandsetPacer::default();
     input_dispatch::install_waker(&app);
-    let _=input_dispatch::take_menu();
+    let _ = input_dispatch::take_menu();
     let mut idle_wait = Duration::ZERO;
     // Marcador privado da bancada para repetir A/B no mesmo APK, sem mudar o jogo/relógio.
-    let pacing_enabled = !emulador.arquivo.with_file_name(".brew-dev-pacing-baseline").is_file();
-    let mut frame_profile = emulador.arquivo.with_file_name(".brew-dev-frame-profile").is_file()
+    let pacing_enabled = !emulador
+        .arquivo
+        .with_file_name(".brew-dev-pacing-baseline")
+        .is_file();
+    let mut frame_profile = emulador
+        .arquivo
+        .with_file_name(".brew-dev-frame-profile")
+        .is_file()
         .then(|| frame_profile::FrameProfile::new(pacing_enabled));
-    let audio_profile = emulador.arquivo.with_file_name(".brew-dev-audio-profile").is_file();
+    let audio_profile = emulador
+        .arquivo
+        .with_file_name(".brew-dev-audio-profile")
+        .is_file();
     let mut audio_profile_at = Instant::now();
     let mut audio_focus = audio_focus::AudioFocus::default();
 
@@ -216,7 +244,9 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
         app.poll_events(espera, |evento| match evento {
             PollEvent::Main(MainEvent::InitWindow { .. }) => {
                 handset_pacer.reset();
-                if let Some(profile) = &mut frame_profile { profile.reset(); }
+                if let Some(profile) = &mut frame_profile {
+                    profile.reset();
+                }
                 pontos_por_pixel = escala(&app);
                 ctx.set_pixels_per_point(pontos_por_pixel);
                 entrada.define_escala(pontos_por_pixel);
@@ -237,23 +267,35 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
                         // Abertura única, com EGL pronto. Os menus nativos não varrem jogos
                         // em paralelo com a sessão nem atravessam JNI durante os quadros.
                         if let Some(launch) = pending_launch.take() {
-                            if launch.probe { native_ui::finish(&app, None); }
-                            else if let Some(path) = launch.game {
+                            if launch.probe {
+                                native_ui::finish(&app, None);
+                            } else if let Some(path) = launch.game {
                                 emulador.abre(&path);
-                                if emulador.sessao.is_none() { native_ui::finish(&app, emulador.erro.as_deref()); }
+                                if emulador.sessao.is_none() {
+                                    native_ui::finish(&app, emulador.erro.as_deref());
+                                }
                             }
                         }
                     }
-                    Err(erro) => { log::error!("a tela não subiu: {erro}"); native_ui::finish(&app, Some(&erro)); }
+                    Err(erro) => {
+                        log::error!("a tela não subiu: {erro}");
+                        native_ui::finish(&app, Some(&erro));
+                    }
                 }
             }
             PollEvent::Main(MainEvent::TerminateWindow { .. }) => {
-                emulador.handset_routes.clear();emulador.handset_touch.cancel();
+                emulador.handset_routes.clear();
+                emulador.handset_touch.cancel();
                 emulador.handset_touch.viewport = None;
-                emulador.release_zeebo_inputs();emulador.zeebo_controls.resize(0.,0.);
-                if let Some(session) = &mut emulador.sessao { session.release_handset_keys(); }
+                emulador.release_zeebo_inputs();
+                emulador.zeebo_controls.resize(0., 0.);
+                if let Some(session) = &mut emulador.sessao {
+                    session.release_handset_keys();
+                }
                 handset_pacer.reset();
-                if let Some(profile) = &mut frame_profile { profile.reset(); }
+                if let Some(profile) = &mut frame_profile {
+                    profile.reset();
+                }
                 tela = None;
                 emulador.fps.reset();
             }
@@ -261,12 +303,18 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
             | PollEvent::Main(MainEvent::ContentRectChanged { .. })
             | PollEvent::Main(MainEvent::ConfigChanged { .. }) => {
                 // A fila é lida antes da próxima pintura: não usar o retângulo/densidade antigos.
-                emulador.handset_routes.clear();emulador.handset_touch.cancel();
+                emulador.handset_routes.clear();
+                emulador.handset_touch.cancel();
                 emulador.handset_touch.viewport = None;
-                emulador.release_zeebo_inputs();emulador.zeebo_controls.resize(0.,0.);
-                if let Some(session) = &mut emulador.sessao { session.release_handset_keys(); }
+                emulador.release_zeebo_inputs();
+                emulador.zeebo_controls.resize(0., 0.);
+                if let Some(session) = &mut emulador.sessao {
+                    session.release_handset_keys();
+                }
                 handset_pacer.reset();
-                if let Some(profile) = &mut frame_profile { profile.reset(); }
+                if let Some(profile) = &mut frame_profile {
+                    profile.reset();
+                }
                 pontos_por_pixel = escala(&app);
                 ctx.set_pixels_per_point(pontos_por_pixel);
                 entrada.define_escala(pontos_por_pixel);
@@ -276,7 +324,9 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
             }
             PollEvent::Main(MainEvent::Resume { .. }) | PollEvent::Main(MainEvent::GainedFocus) => {
                 handset_pacer.reset();
-                if let Some(profile) = &mut frame_profile { profile.reset(); }
+                if let Some(profile) = &mut frame_profile {
+                    profile.reset();
+                }
                 visivel = true;
                 emulador.fps.reset();
                 if let (Some(placa), Some(tela)) = (&placa, &tela) {
@@ -285,7 +335,9 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
             }
             PollEvent::Main(MainEvent::Pause) | PollEvent::Main(MainEvent::LostFocus) => {
                 handset_pacer.reset();
-                if let Some(profile) = &mut frame_profile { profile.reset(); }
+                if let Some(profile) = &mut frame_profile {
+                    profile.reset();
+                }
                 // O Android pode tirar o foco antes de entregar o KeyUp/MotionEvent final do
                 // controle. Se mantivermos o estado, a direção fica presa quando a atividade
                 // volta. No console, perder o aparelho equivale a soltar tudo.
@@ -293,9 +345,11 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
                 emulador.sobreposicao.solta();
                 emulador.handset_keys.clear();
                 emulador.handset_input.release_all();
-                emulador.handset_routes.clear();emulador.handset_touch.cancel();
+                emulador.handset_routes.clear();
+                emulador.handset_touch.cancel();
                 emulador.handset_touch.viewport = None;
-                emulador.release_zeebo_inputs();emulador.zeebo_controls.resize(0.,0.);
+                emulador.release_zeebo_inputs();
+                emulador.zeebo_controls.resize(0., 0.);
                 if let Some(session) = &mut emulador.sessao {
                     session.release_handset_keys();
                     session.congela_o_som(true);
@@ -312,29 +366,44 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
         if sair {
             break;
         }
-        emulador.apply_native_menu(&ctx,input_dispatch::take_menu());
-        let focus_paused = audio_focus.update(&app,visivel && emulador.onde == Onde::Jogo
-            && emulador.sessao.is_some() && emulador.settings.audio.enabled);
+        emulador.apply_native_menu(&ctx, input_dispatch::take_menu());
+        let focus_paused = audio_focus.update(
+            &app,
+            visivel
+                && emulador.onde == Onde::Jogo
+                && emulador.sessao.is_some()
+                && emulador.settings.audio.enabled,
+        );
         if focus_paused != emulador.audio_focus_paused {
             emulador.audio_focus_paused = focus_paused;
             emulador.handset_keys.clear();
-                emulador.handset_input.release_all();
-            emulador.handset_routes.clear();emulador.handset_touch.cancel();
+            emulador.handset_input.release_all();
+            emulador.handset_routes.clear();
+            emulador.handset_touch.cancel();
             emulador.release_zeebo_inputs();
             if let Some(session) = &mut emulador.sessao {
                 session.release_handset_keys();
-                session.congela_o_som(focus_paused || !visivel || emulador.pausado || emulador.confirmando);
+                session.congela_o_som(
+                    focus_paused || !visivel || emulador.pausado || emulador.confirmando,
+                );
             }
             handset_pacer.reset();
         }
         if audio_profile && audio_profile_at.elapsed() >= Duration::from_secs(5) {
             audio_profile_at = Instant::now();
-            if let Some(snapshot) = emulador.sessao.as_mut().and_then(Session::audio_snapshot) {
+            if let Some(snapshot) = emulador.sessao.as_mut().and_then(|s| s.audio_snapshot()) {
                 use std::io::Write;
-                let path = emulador.arquivo.with_file_name("handset-audio-profile.jsonl");
-                let result = std::fs::OpenOptions::new().append(true).create(true).open(path)
-                    .and_then(|mut file| writeln!(file,"{}",snapshot));
-                if let Err(error) = result { log::warn!("audio profile: {error}"); }
+                let path = emulador
+                    .arquivo
+                    .with_file_name("handset-audio-profile.jsonl");
+                let result = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(path)
+                    .and_then(|mut file| writeln!(file, "{}", snapshot));
+                if let Err(error) = result {
+                    log::warn!("audio profile: {error}");
+                }
             }
         }
 
@@ -346,33 +415,45 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
         let no_jogo = emulador.onde == Onde::Jogo
             && !emulador.confirmando
             && emulador.settings.controles_na_tela.modo != ModoDosControlesNaTela::Nunca;
-        let handset_game = emulador.onde == Onde::Jogo && !emulador.confirmando && !emulador.pausado && !emulador.audio_focus_paused
-            && emulador.sessao.as_ref().is_some_and(Session::is_handset);
+        let handset_game = emulador.onde == Onde::Jogo
+            && !emulador.confirmando
+            && !emulador.pausado
+            && !emulador.audio_focus_paused
+            && emulador.sessao.as_ref().is_some_and(|s| s.is_handset());
         if !handset_game {
             emulador.handset_keys.clear();
-                emulador.handset_input.release_all();
-            emulador.handset_routes.clear();emulador.handset_touch.cancel();
+            emulador.handset_input.release_all();
+            emulador.handset_routes.clear();
+            emulador.handset_touch.cancel();
             emulador.release_zeebo_inputs();
             emulador.handset_touch.viewport = None;
-            if let Some(session) = &mut emulador.sessao { session.release_handset_keys(); }
+            if let Some(session) = &mut emulador.sessao {
+                session.release_handset_keys();
+            }
         }
         if !no_jogo {
             emulador.sobreposicao.solta();
         }
         let removed = button_mapping::take_removed_devices();
         if !removed.is_empty() {
-            for device in removed { emulador.handset_input.release_device(device);emulador.zeebo_input.release_device(device); }
+            for device in removed {
+                emulador.handset_input.release_device(device);
+                emulador.zeebo_input.release_device(device);
+            }
             emulador.handset_input.apply(&mut emulador.handset_keys);
-            if handset_game { emulador.sync_handset_keys(); }
+            if handset_game {
+                emulador.sync_handset_keys();
+            }
         }
         // O Back físico já foi consumido pela Activity; entrega cada borda ao jogo uma vez.
         // O sentinela também vale fora do jogo para impedir teclas presas após perder foco.
         input_dispatch::deliver_physical_back(|device, scan, down| {
             let changed = if device < 0 {
-                emulador.handset_input.release_all();emulador.zeebo_input.release_all();
+                emulador.handset_input.release_all();
+                emulador.zeebo_input.release_all();
                 true
             } else if handset_game && emulador.zeebo_mode {
-                emulador.zeebo_input.physical_back(device,scan,down)
+                emulador.zeebo_input.physical_back(device, scan, down)
             } else if handset_game {
                 emulador.handset_input.physical_back(device, scan, down)
             } else {
@@ -380,42 +461,101 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
             };
             if changed {
                 emulador.handset_input.apply(&mut emulador.handset_keys);
-                if handset_game { emulador.sync_handset_keys(); }
+                if handset_game {
+                    emulador.sync_handset_keys();
+                }
             }
         });
         if let Ok(mut fila) = app.input_events_iter() {
             // Somente o perfil opt-in captura Volume Up/Down durante o jogo ativo.
-            let volume_keys_mappable = handset_game && if emulador.zeebo_mode {emulador.zeebo_input.volume_keys_mappable()}else{emulador.handset_input.volume_keys_mappable()};
-            while fila.next(|evento| input_dispatch::dispatch_with_volume(evento, volume_keys_mappable, || {
-                if handset_game && emulador.zeebo_mode {
-                    if zeebo_android::receive(&mut emulador.zeebo_controls,&mut emulador.zeebo_input,evento,pontos_por_pixel,&app,emulador.keypad_settings.vibration) {emulador.sync_handset_keys();return;}
-                    // Nenhuma entrada do console atravessa os defaults numéricos do telefone.
-                    return;
-                }
-                if handset_game && let Some(pen) = handset::receive_touch(&mut emulador.handset_keys,&mut emulador.handset_touch,&mut emulador.handset_routes,evento,pontos_por_pixel) {
-                    if let Some(event)=pen {
-                        pen_changed=true;
-                        if let Some(session)=&mut emulador.sessao && let Err(error)=session.set_handset_pen(event){
-                            log::warn!("{error}");emulador.handset_routes.clear();emulador.handset_touch.cancel();emulador.handset_routes.clear();session.release_handset_keys();
+            let volume_keys_mappable = handset_game
+                && if emulador.zeebo_mode {
+                    emulador.zeebo_input.volume_keys_mappable()
+                } else {
+                    emulador.handset_input.volume_keys_mappable()
+                };
+            while fila.next(|evento| {
+                input_dispatch::dispatch_with_volume(evento, volume_keys_mappable, || {
+                    if handset_game && emulador.zeebo_mode {
+                        if zeebo_android::receive(
+                            &mut emulador.zeebo_controls,
+                            &mut emulador.zeebo_input,
+                            evento,
+                            pontos_por_pixel,
+                            &app,
+                            emulador.keypad_settings.vibration,
+                        ) {
+                            emulador.sync_handset_keys();
+                            return;
                         }
+                        // Nenhuma entrada do console atravessa os defaults numéricos do telefone.
+                        return;
                     }
-                    if handset::vibration_press(&emulador.handset_keys,evento,pontos_por_pixel,emulador.keypad_settings.vibration){sistema::vibra_teclado(&app);}
-                    emulador.sync_handset_keys();return;
-                }
-                if handset_game && handset::receive_with_app(&mut emulador.handset_keys, &mut emulador.handset_input, evento, pontos_por_pixel, &app) {
-                    if handset::vibration_press(&emulador.handset_keys,evento,pontos_por_pixel,emulador.keypad_settings.vibration){sistema::vibra_teclado(&app);}
-                    emulador.sync_handset_keys();
-                    return;
-                }
-                let sobreposicao = no_jogo.then_some(&mut emulador.sobreposicao);
-                entrada.recebe(evento, &mut emulador.pad, sobreposicao);
-            })) {}
+                    if handset_game
+                        && let Some(pen) = handset::receive_touch(
+                            &mut emulador.handset_keys,
+                            &mut emulador.handset_touch,
+                            &mut emulador.handset_routes,
+                            evento,
+                            pontos_por_pixel,
+                        )
+                    {
+                        if let Some(event) = pen {
+                            pen_changed = true;
+                            if let Some(session) = &mut emulador.sessao
+                                && let Err(error) = session.set_handset_pen(event)
+                            {
+                                log::warn!("{error}");
+                                emulador.handset_routes.clear();
+                                emulador.handset_touch.cancel();
+                                emulador.handset_routes.clear();
+                                session.release_handset_keys();
+                            }
+                        }
+                        if handset::vibration_press(
+                            &emulador.handset_keys,
+                            evento,
+                            pontos_por_pixel,
+                            emulador.keypad_settings.vibration,
+                        ) {
+                            sistema::vibra_teclado(&app);
+                        }
+                        emulador.sync_handset_keys();
+                        return;
+                    }
+                    if handset_game
+                        && handset::receive_with_app(
+                            &mut emulador.handset_keys,
+                            &mut emulador.handset_input,
+                            evento,
+                            pontos_por_pixel,
+                            &app,
+                        )
+                    {
+                        if handset::vibration_press(
+                            &emulador.handset_keys,
+                            evento,
+                            pontos_por_pixel,
+                            emulador.keypad_settings.vibration,
+                        ) {
+                            sistema::vibra_teclado(&app);
+                        }
+                        emulador.sync_handset_keys();
+                        return;
+                    }
+                    let sobreposicao = no_jogo.then_some(&mut emulador.sobreposicao);
+                    entrada.recebe(evento, &mut emulador.pad, sobreposicao);
+                })
+            }) {}
         }
         // O estado dos botões físicos continua disponível ao caminho de entrada.
         emulador.fisicos.clone_from(&entrada.fisicos);
         // O "voltar" do Android vale em qualquer tela. O botão 2 do controle vale em todas menos
         // no jogo, onde ele é do jogador -- ali quem fecha é o "voltar" do aparelho.
-        if input_dispatch::take_back() || entrada.voltar || (entrada.voltar_da_interface && emulador.onde != Onde::Jogo) {
+        if input_dispatch::take_back()
+            || entrada.voltar
+            || (entrada.voltar_da_interface && emulador.onde != Onde::Jogo)
+        {
             emulador.voltar();
         }
 
@@ -427,8 +567,10 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
         }
 
         let active_handset = emulador.onde == Onde::Jogo
-            && !emulador.confirmando && !emulador.pausado && !emulador.audio_focus_paused
-            && emulador.sessao.as_ref().is_some_and(Session::is_handset);
+            && !emulador.confirmando
+            && !emulador.pausado
+            && !emulador.audio_focus_paused
+            && emulador.sessao.as_ref().is_some_and(|s| s.is_handset());
         let mut handset_frame = None;
         if active_handset {
             let work_started = frame_profile.as_ref().map(|_| Instant::now());
@@ -439,7 +581,8 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
             if let Some(session) = emulador.sessao.as_ref() {
                 let screen = session.screen();
                 let frame = zeebx::handset::fps::FrameStamp {
-                    cpu_series: screen.serie(), cpu_writes: screen.escritas(),
+                    cpu_series: screen.serie(),
+                    cpu_writes: screen.escritas(),
                     gpu_frames: session.rendered_gl_frames(),
                 };
                 let now = comeco.elapsed();
@@ -454,7 +597,9 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
             }
         } else {
             handset_pacer.reset();
-            if let Some(profile) = &mut frame_profile { profile.reset(); }
+            if let Some(profile) = &mut frame_profile {
+                profile.reset();
+            }
         }
 
         let [largura, altura] = tela.tamanho;
@@ -474,13 +619,19 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
             ..Default::default()
         };
 
-        let ui_started = frame_profile.as_ref().filter(|_| active_handset).map(|_| Instant::now());
+        let ui_started = frame_profile
+            .as_ref()
+            .filter(|_| active_handset)
+            .map(|_| Instant::now());
         let saida = ctx.run(cru, |ctx| emulador.desenha(ctx));
         let primitivas = ctx.tessellate(saida.shapes, saida.pixels_per_point);
         if let (Some(profile), Some(started)) = (&mut frame_profile, ui_started) {
             profile.ui(started.elapsed());
         }
-        let draw_started = frame_profile.as_ref().filter(|_| active_handset).map(|_| Instant::now());
+        let draw_started = frame_profile
+            .as_ref()
+            .filter(|_| active_handset)
+            .map(|_| Instant::now());
         let presented = placa.pinta(
             tela,
             &primitivas,
@@ -492,13 +643,25 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
             handset_pacer.presented(comeco.elapsed(), frame, presented);
         }
         if let (Some(profile), Some(started)) = (&mut frame_profile, draw_started) {
-            profile.present(comeco.elapsed(), started.elapsed(), presented, handset_frame);
+            profile.present(
+                comeco.elapsed(),
+                started.elapsed(),
+                presented,
+                handset_frame,
+            );
             if let Some(line) = profile.snapshot(comeco.elapsed()) {
                 use std::io::Write;
-                let path = emulador.arquivo.with_file_name("handset-frame-profile.jsonl");
-                let result = std::fs::OpenOptions::new().append(true).create(true).open(path)
+                let path = emulador
+                    .arquivo
+                    .with_file_name("handset-frame-profile.jsonl");
+                let result = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(path)
                     .and_then(|mut file| file.write_all(line.as_bytes()));
-                if let Err(error) = result { log::warn!("frame profile: {error}"); }
+                if let Err(error) = result {
+                    log::warn!("frame profile: {error}");
+                }
             }
         }
         // A taxa pertence ao jogo entregue à janela, não ao número de repaints do Android.
@@ -508,7 +671,7 @@ fn gira(app: AndroidApp, emulador: &mut Emulador, launch: native_ui::Launch) {
     }
 
     input_dispatch::remove_waker(&app);
-    audio_focus.update(&app,false);
+    audio_focus.update(&app, false);
     log::info!("Zeebx encerrando");
 }
 
@@ -564,9 +727,7 @@ pub struct Emulador {
     jogos: Vec<Game>,
     /// Resultado de uma varredura em segundo plano. Enquanto existe, a lista antiga continua
     /// utilizavel e a interface nao trava lendo ZIPs/MIFs.
-    varredura: Option<
-        std::sync::mpsc::Receiver<(PathBuf, Vec<Game>, Vec<(u32, String)>)>,
-    >,
+    varredura: Option<std::sync::mpsc::Receiver<(PathBuf, Vec<Game>, Vec<(u32, String)>)>>,
     /// Títulos normalizados uma vez por varredura, para a busca não refazer lowercase por frame.
     titulos_busca: Vec<String>,
     /// Índices que a busca atual deixou passar.
@@ -664,28 +825,42 @@ pub struct Emulador {
 
 impl Emulador {
     fn release_zeebo_inputs(&mut self) {
-        self.zeebo_controls.clear();self.zeebo_input.release_all();
-        if self.zeebo_mode {self.sync_zeebo_inputs();}
+        self.zeebo_controls.clear();
+        self.zeebo_input.release_all();
+        if self.zeebo_mode {
+            self.sync_zeebo_inputs();
+        }
     }
     fn sync_zeebo_inputs(&mut self) {
-        let pad=zeebo_controls::merge(self.zeebo_input.pad(),self.zeebo_controls.pad());
-        if let Some(session)=&mut self.sessao {
-            session.set_port_pad(0,pad);
-            for down in [false,true] {for (name,avk) in zeebo_controls::KEY_BUTTONS {
-                let i=zeebo_controls::button_index(name).unwrap();
-                if pad.is_down(i)==down && pad.is_down(i)!=self.zeebo_last_pad.is_down(i) {session.set_key(avk,down);}
-            }}
+        let pad = zeebo_controls::merge(self.zeebo_input.pad(), self.zeebo_controls.pad());
+        if let Some(session) = &mut self.sessao {
+            session.set_port_pad(0, pad);
+            for down in [false, true] {
+                for (name, avk) in zeebo_controls::KEY_BUTTONS {
+                    let i = zeebo_controls::button_index(name).unwrap();
+                    if pad.is_down(i) == down && pad.is_down(i) != self.zeebo_last_pad.is_down(i) {
+                        session.set_key(avk, down);
+                    }
+                }
+            }
         }
-        self.zeebo_last_pad=pad;self.pad=pad;
+        self.zeebo_last_pad = pad;
+        self.pad = pad;
     }
     fn sync_handset_keys(&mut self) {
-        if self.zeebo_mode {self.sync_zeebo_inputs();return;}
+        if self.zeebo_mode {
+            self.sync_zeebo_inputs();
+            return;
+        }
 
-        let Some(session) = &mut self.sessao else { return; };
+        let Some(session) = &mut self.sessao else {
+            return;
+        };
         let held = self.handset_keys.held();
         // Soltar antes de apertar evita opostos transitórios ao inverter o eixo.
         for (key, down) in [false, true].into_iter().flat_map(|down| {
-            zeebx::handset::input::Key::ALL.into_iter()
+            zeebx::handset::input::Key::ALL
+                .into_iter()
                 .filter(move |key| (held & (1 << *key as u8) != 0) == down)
                 .map(move |key| (key, down))
         }) {
@@ -717,13 +892,16 @@ impl Emulador {
         if let Err(erro) = storage.create_dirs() {
             log::error!("nao criou o armazenamento persistente: {erro}");
         }
-        let mut settings = native_ui_model::settings_for_android(&arquivo).unwrap_or_else(|error| {
-            log::warn!("configuração Android: {error}");
-            Settings::load_from(&arquivo)
-        });
+        let mut settings =
+            native_ui_model::settings_for_android(&arquivo).unwrap_or_else(|error| {
+                log::warn!("configuração Android: {error}");
+                Settings::load_from(&arquivo)
+            });
         settings.debug.overlay = false;
         let handset_games = minha_pasta.join("handset-games");
-        if settings.roms_dir.is_none() && handset_games.is_dir() { settings.roms_dir = Some(handset_games); }
+        if settings.roms_dir.is_none() && handset_games.is_dir() {
+            settings.roms_dir = Some(handset_games);
+        }
         // Sem pasta escolhida ainda: o padrão, se ele existir, senão o diretório do aplicativo,
         // que sempre existe e nunca pede permissão.
         if settings.roms_dir.is_none() {
@@ -808,7 +986,9 @@ impl Emulador {
             avancando: false,
         };
         // A biblioteca pertence à Activity Java; abrir um jogo não inicia outra varredura.
-        emulador.handset_keys.set_enabled(emulador.settings.controles_na_tela.modo != ModoDosControlesNaTela::Nunca);
+        emulador
+            .handset_keys
+            .set_enabled(emulador.settings.controles_na_tela.modo != ModoDosControlesNaTela::Nunca);
         emulador
     }
 
@@ -833,13 +1013,10 @@ impl Emulador {
                 let jogos = library::scan(&pasta_da_thread);
                 let instalados = jogos
                     .iter()
-                    .filter_map(|jogo| {
-                        Some((jogo.clsid?, library::id_do_modulo(&jogo.path)?))
-                    })
+                    .filter_map(|jogo| Some((jogo.clsid?, library::id_do_modulo(&jogo.path)?)))
                     .collect();
                 let _ = tx.send((pasta_da_thread, jogos, instalados));
-            })
-        {
+            }) {
             Ok(_) => self.varredura = Some(rx),
             Err(erro) => {
                 log::error!("nao iniciou a varredura da biblioteca: {erro}");
@@ -873,12 +1050,7 @@ impl Emulador {
         }
     }
 
-    fn aplica_jogos(
-        &mut self,
-        pasta: PathBuf,
-        jogos: Vec<Game>,
-        instalados: Vec<(u32, String)>,
-    ) {
+    fn aplica_jogos(&mut self, pasta: PathBuf, jogos: Vec<Game>, instalados: Vec<(u32, String)>) {
         self.jogos = jogos;
         self.instalados = instalados;
         self.titulos_busca = self
@@ -924,49 +1096,84 @@ impl Emulador {
 
     /// Abre um jogo, com os ajustes de gráficos e som que estão valendo.
     fn abre(&mut self, caminho: &std::path::Path) {
+        self.abre_instalado(caminho, false, false);
+    }
+
+    /// O alvo tem perfil, armazenamento e áudio próprios antes de START; seguir uma
+    /// retomada conserva a CPU existente e só reassocia a interface do frontend.
+    fn abre_instalado(
+        &mut self,
+        caminho: &std::path::Path,
+        requested: bool,
+        follow_retained: bool,
+    ) {
         self.erro = None;
+        let entry = zeebx::library::resolve_mif(caminho)
+            .ok()
+            .and_then(|mif| InstalledApplet::inspect(caminho, &mif).ok());
+        if requested && entry.is_none() {
+            self.erro = Some("Requested installed applet metadata is unavailable".into());
+            return;
+        }
+        let catalog = if let Some(runtime) = self.sessao.as_ref().and_then(Session::installed) {
+            runtime.catalog().clone()
+        } else {
+            let mut catalog = sistema::pasta_de_cache(&self.app)
+                .and_then(|cache| {
+                    native_ui_model::installed_catalog(&self.roms(), &cache.join("native-art"))
+                })
+                .unwrap_or_else(|error| {
+                    log::warn!("installed catalog: {error}");
+                    InstalledCatalog::default()
+                });
+            if let Some(app) = entry.clone() {
+                catalog = catalog.with(app);
+            }
+            catalog
+        };
+        let resume = requested
+            && self
+                .sessao
+                .as_ref()
+                .and_then(Session::installed)
+                .and_then(|runtime| {
+                    runtime
+                        .pending_handoff()
+                        .map(|request| {
+                            request.resume || runtime.is_live_foreground(&request.target)
+                        })
+                })
+                .unwrap_or(false);
         let content = match self.storage.content_id(caminho) {
             Ok(id) => id,
             Err(erro) => {
                 let motivo = erro.to_string();
                 log::error!("nao identificou o conteudo: {motivo}");
-                self.erro = Some(
-                    self.catalogo
-                        .format("play.failed", &[("reason", &motivo)]),
-                );
+                self.erro = Some(self.catalogo.format("play.failed", &[("reason", &motivo)]));
                 return;
             }
         };
-        let prepared=(||->Result<profile_runtime::Prepared,String>{
-            let public=sistema::pasta_de_perfis(&self.app)?;
-            let private=self.arquivo.parent().ok_or("Settings have no private directory")?;
-            let effective=profile_store::effective(&public,private,&self.arquivo,caminho,&content)?;
-            let mut prepared=profile_runtime::prepare(&effective["values"],&mut self.settings)?;
-            prepared.zeebo=effective["button_type"]=="zeebo";Ok(prepared)
+        let mut target_settings = self.settings.clone();
+        let prepared = (|| -> Result<profile_runtime::Prepared, String> {
+            let public = sistema::pasta_de_perfis(&self.app)?;
+            let private = self
+                .arquivo
+                .parent()
+                .ok_or("Settings have no private directory")?;
+            let effective =
+                profile_store::effective(&public, private, &self.arquivo, caminho, &content)?;
+            let mut prepared =
+                profile_runtime::prepare(&effective["values"], &mut target_settings)?;
+            prepared.zeebo = effective["button_type"] == "zeebo";
+            Ok(prepared)
         })();
-        let prepared=match prepared{Ok(value)=>value,Err(error)=>{self.erro=Some(error);return;}};
-        self.release_zeebo_inputs();self.zeebo_mode=prepared.zeebo;
-        self.zeebo_input=zeebo_mapping::Map::parse(&prepared.zeebo_bindings,prepared.volume_keys_mappable);
-        self.zeebo_controls=Default::default();self.zeebo_last_pad=Default::default();self.pad=Default::default();self.sobreposicao.solta();
-        self.handset_input=button_mapping::InputMap::parse(&serde_json::json!({"version":1,"bindings":&prepared.bindings}).to_string());
-        self.handset_input.set_volume_keys_mappable(prepared.volume_keys_mappable);
-        self.keypad_settings=native_ui_model::keypad_settings(&self.arquivo)
-            .unwrap_or_else(|error|{log::warn!("ajustes globais do teclado: {error}");Default::default()});
-        self.keypad_settings.transparency=prepared.transparency;
-        self.keypad_layout=prepared.layout;
-        self.game_options=prepared.options;
-        self.native_menu_shown=false;
-        let controls = match self.game_options.controls {
-            game_options::OnScreenControls::On => true,
-            game_options::OnScreenControls::Off => false,
-            game_options::OnScreenControls::SystemDefault => self.settings.controles_na_tela.modo != ModoDosControlesNaTela::Nunca,
+        let prepared = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                self.erro = Some(error);
+                return;
+            }
         };
-        self.handset_keys.set_enabled(controls);self.zeebo_controls.set_enabled(controls);
-        sistema::orientacao(&self.app, match self.game_options.orientation {
-            game_options::ScreenOrientation::Auto => -1,
-            game_options::ScreenOrientation::Portrait => 1,
-            game_options::ScreenOrientation::Landscape => 0,
-        });
         let estado_id = Some(content.as_str().to_string());
         let storage_base = self.estados_raiz.join(".config");
         let legacy = StoragePaths::for_frontend(&storage_base, Some(&storage_base));
@@ -974,38 +1181,152 @@ impl Emulador {
             save_storage::prepare_game(&legacy, &data, caminho, &content)
                 .map_err(|e| format!("Could not prepare game saves in {}: {e}", data.display()))
         });
-        match prepared_storage {
-            Ok(storage) => self.storage = storage,
-            Err(error) => { self.erro = Some(error); return; }
-        }
-        zeebx::audio::soundfont::define_banco(self.settings.audio.soundfont.clone());
-        zeebx::audio::soundfont::define_efeitos(self.settings.audio.midi_effects);
-        let graficos = self.settings.graphics.clone();
+        let target_storage = match prepared_storage {
+            Ok(storage) => storage,
+            Err(error) => {
+                self.erro = Some(error);
+                return;
+            }
+        };
+        let graficos = target_settings.graphics.clone();
         // O 3D na placa vale só se houver placa: antes da primeira janela não há contexto, e a
         // sessão aberta sem ele cai no rasterizador de software sozinha.
         let na_placa = graficos.gpu_rasterizer && self.gl.is_some();
-        let geometry = match if prepared.zeebo && prepared.resolution.is_none() {Ok(zeebx::handset::types::DisplayGeometry{width:640,height:480,depth:16})}else{handset::profile_geometry(caminho, prepared.resolution)} {
+        let geometry = match if prepared.zeebo && prepared.resolution.is_none() {
+            Ok(zeebx::handset::types::DisplayGeometry {
+                width: 640,
+                height: 480,
+                depth: 16,
+            })
+        } else {
+            handset::profile_geometry(caminho, prepared.resolution)
+        } {
             Ok(geometry) => geometry,
-            Err(error) => { self.erro = Some(error); return; }
+            Err(error) => {
+                self.erro = Some(error);
+                return;
+            }
         };
-        match Session::start_handset_with_storage(caminho, geometry, &self.storage,
-            self.gl.clone().filter(|_| na_placa)) {
-            Ok(mut sessao) => {
-                log::info!("abriu {}", sessao.title());
-                sessao.define_resolucao_interna(graficos.resolucao_interna as usize);
-                sessao.define_proporcao(graficos.proporcao.aspecto(16.0 / 9.0));
-                sessao.define_melhorias(
-                    graficos.antialias as usize,
-                    graficos.anisotropico as usize,
-                );
-                sessao.define_neblina(graficos.neblina);
-                // Ligar o som aqui é seguro **porque o jogo ainda não começou**: o `start_with`
-                // só prepara, e o `EVT_APP_START` sai na primeira volta do laço.
-                let audio = self.settings.audio.clone();
-                if let Some(erro) = sessao.set_audio(audio.enabled, audio.volume) {
-                    log::error!("sem som: {erro}");
+        let loaded = if follow_retained || resume {
+            Ok(None)
+        } else {
+            CoreSession::start_handset_with_storage_installed(
+                caminho,
+                geometry,
+                &target_storage,
+                self.gl.clone().filter(|_| na_placa),
+                &if entry.is_some() {
+                    catalog.shell_entries()
+                } else {
+                    Vec::new()
+                },
+            )
+            .map(Some)
+        };
+        match loaded {
+            Ok(mut loaded) => {
+                let mut retained_ui = self.sessao.take();
+                if loaded.is_some() || follow_retained {
+                    let sessao: &mut CoreSession = if let Some(session) = loaded.as_mut() {
+                        session
+                    } else {
+                        let Some(session) = retained_ui.as_mut() else {
+                            self.erro = Some("Retained applet owner is unavailable".into());
+                            return;
+                        };
+                        &mut **session
+                    };
+                    log::info!("abriu {}", sessao.title());
+                    sessao.define_resolucao_interna(graficos.resolucao_interna as usize);
+                    sessao.define_proporcao(graficos.proporcao.aspecto(16.0 / 9.0));
+                    sessao.define_melhorias(
+                        graficos.antialias as usize,
+                        graficos.anisotropico as usize,
+                    );
+                    sessao.define_neblina(graficos.neblina);
+                    // Ligar o som aqui é seguro **porque o jogo ainda não começou**: o `start_with`
+                    // só prepara, e o `EVT_APP_START` sai na primeira volta do laço.
+                    let audio = target_settings.audio.clone();
+                    if let Some(erro) = sessao.set_audio(audio.enabled, audio.volume) {
+                        log::error!("sem som: {erro}");
+                    }
                 }
-                self.sessao = Some(sessao);
+                let attached = if requested {
+                    match retained_ui.as_mut().and_then(Session::installed_mut) {
+                        Some(runtime) => runtime.begin_handoff(loaded),
+                        None => Err("No installed applet owner can accept the launch".into()),
+                    }
+                } else if follow_retained {
+                    Ok(())
+                } else {
+                    match loaded.take() {
+                        Some(session) => {
+                            retained_ui = Some(if let Some(app) = entry {
+                                match HandsetRuntime::new(session, app, catalog) {
+                                    Ok(runtime) => Session::Installed(runtime),
+                                    Err(error) => {
+                                        self.erro = Some(error);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                Session::Single(session)
+                            });
+                            Ok(())
+                        }
+                        None => Err("New applet session is unavailable".into()),
+                    }
+                };
+                self.sessao = retained_ui;
+                if let Err(error) = attached {
+                    self.erro = Some(error);
+                    return;
+                }
+                self.settings = target_settings;
+                self.storage = target_storage;
+                zeebx::audio::soundfont::define_banco(self.settings.audio.soundfont.clone());
+                zeebx::audio::soundfont::define_efeitos(self.settings.audio.midi_effects);
+                self.release_zeebo_inputs();
+                self.zeebo_mode = prepared.zeebo;
+                self.zeebo_input = zeebo_mapping::Map::parse(
+                    &prepared.zeebo_bindings,
+                    prepared.volume_keys_mappable,
+                );
+                self.zeebo_controls = Default::default();
+                self.zeebo_last_pad = Default::default();
+                self.pad = Default::default();
+                self.sobreposicao.solta();
+                self.handset_input = button_mapping::InputMap::parse(
+                    &serde_json::json!({"version":1,"bindings":&prepared.bindings}).to_string(),
+                );
+                self.handset_input
+                    .set_volume_keys_mappable(prepared.volume_keys_mappable);
+                self.keypad_settings = native_ui_model::keypad_settings(&self.arquivo)
+                    .unwrap_or_else(|error| {
+                        log::warn!("ajustes globais do teclado: {error}");
+                        Default::default()
+                    });
+                self.keypad_settings.transparency = prepared.transparency;
+                self.keypad_layout = prepared.layout;
+                self.game_options = prepared.options;
+                self.native_menu_shown = false;
+                let controls = match self.game_options.controls {
+                    game_options::OnScreenControls::On => true,
+                    game_options::OnScreenControls::Off => false,
+                    game_options::OnScreenControls::SystemDefault => {
+                        self.settings.controles_na_tela.modo != ModoDosControlesNaTela::Nunca
+                    }
+                };
+                self.handset_keys.set_enabled(controls);
+                self.zeebo_controls.set_enabled(controls);
+                sistema::orientacao(
+                    &self.app,
+                    match self.game_options.orientation {
+                        game_options::ScreenOrientation::Auto => -1,
+                        game_options::ScreenOrientation::Portrait => 1,
+                        game_options::ScreenOrientation::Landscape => 0,
+                    },
+                );
                 self.fps.reset();
                 self.caminho_aberto = Some(caminho.to_path_buf());
                 self.estado_id = estado_id;
@@ -1034,7 +1355,8 @@ impl Emulador {
 
     /// Fecha o jogo e volta para a biblioteca.
     fn fecha(&mut self) {
-        self.release_zeebo_inputs();self.zeebo_mode=false;
+        self.release_zeebo_inputs();
+        self.zeebo_mode = false;
         self.sessao = None;
         self.handset_keys.clear();
         self.handset_input.release_all();
@@ -1075,7 +1397,9 @@ impl Emulador {
         };
         self.fecha();
         self.abre(&caminho);
-        if self.sessao.is_none() { native_ui::finish(&self.app, self.erro.as_deref()); }
+        if self.sessao.is_none() {
+            native_ui::finish(&self.app, self.erro.as_deref());
+        }
     }
 
     /// O botão "voltar" do Android.
@@ -1086,10 +1410,19 @@ impl Emulador {
         self.release_zeebo_inputs();
         self.handset_keys.clear();
         self.handset_input.release_all();
-        self.handset_routes.clear();self.handset_touch.cancel();
-        if let Some(session) = &mut self.sessao { session.release_handset_keys(); }
+        self.handset_routes.clear();
+        self.handset_touch.cancel();
+        if let Some(session) = &mut self.sessao {
+            session.release_handset_keys();
+        }
         match &self.onde {
-            Onde::Jogo if self.confirmando => {self.confirmando=false;if self.native_menu_shown{sistema::fecha_menu_do_jogo(&self.app);self.native_menu_shown=false;}},
+            Onde::Jogo if self.confirmando => {
+                self.confirmando = false;
+                if self.native_menu_shown {
+                    sistema::fecha_menu_do_jogo(&self.app);
+                    self.native_menu_shown = false;
+                }
+            }
             Onde::Jogo => self.confirmando = true,
             // No seletor, subir uma pasta é o que o "voltar" quer dizer; na primeira, sair dele.
             Onde::Seletor(atual) => {
@@ -1125,7 +1458,7 @@ impl Emulador {
             Onde::EditaToque => self.edita_toque(ctx),
             Onde::Seletor(atual) => self.seletor(ctx, &atual),
             Onde::SeletorDeBanco(atual) => self.seletor_de_banco(ctx, &atual),
-            Onde::Biblioteca => {},
+            Onde::Biblioteca => {}
         }
     }
 }
@@ -1140,9 +1473,7 @@ fn escala(app: &AndroidApp) -> f32 {
         .density()
         .map(|dpi| dpi as f32 / 160.0)
         .unwrap_or(2.0);
-    let largura = app
-        .native_window()
-        .map(|janela| janela.width() as f32);
+    let largura = app.native_window().map(|janela| janela.width() as f32);
     density::scale(densidade, largura)
 }
 
@@ -1157,11 +1488,12 @@ fn idioma_do_aparelho(app: &AndroidApp) -> String {
 }
 
 /// Uma imagem do núcleo virando textura do egui.
-fn textura_de(ctx: &egui::Context, nome: &str, imagem: &zeebx::video::icon::Image) -> egui::TextureHandle {
-    let cor = egui::ColorImage::from_rgba_unmultiplied(
-        [imagem.width, imagem.height],
-        &imagem.rgba,
-    );
+fn textura_de(
+    ctx: &egui::Context,
+    nome: &str,
+    imagem: &zeebx::video::icon::Image,
+) -> egui::TextureHandle {
+    let cor = egui::ColorImage::from_rgba_unmultiplied([imagem.width, imagem.height], &imagem.rgba);
     // As capas são ícones de `.mif` ampliados: interpolar é o que evita o bloco gigante.
     ctx.load_texture(nome, cor, egui::TextureOptions::LINEAR)
 }

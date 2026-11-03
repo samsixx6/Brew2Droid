@@ -181,7 +181,9 @@ impl Vfs {
         // Caminho do aparelho (`fs:/` sem `~`) é persistente e compartilhado: não passa pelo
         // overlay do título.
         let normalizado = guest_path.replace('\\', "/");
-        let do_aparelho = normalizado.starts_with("fs:/") && !normalizado.starts_with("fs:/~");
+        let do_aparelho = normalizado.starts_with("fs:/")
+            && !normalizado.starts_with("fs:/~")
+            && self.module_overlay_alias(guest_path).is_none();
         if do_aparelho || self.save.is_none() {
             return self.legacy_target(guest_path, intent);
         }
@@ -223,7 +225,10 @@ impl Vfs {
     fn deletion_marker(&self, guest_path: &str) -> Option<PathBuf> {
         // fs:/ sem ~ pertence ao aparelho compartilhado, não ao overlay do título.
         let normalized = guest_path.replace('\\', "/");
-        if normalized.starts_with("fs:/") && !normalized.starts_with("fs:/~") {
+        if normalized.starts_with("fs:/")
+            && !normalized.starts_with("fs:/~")
+            && self.module_overlay_alias(guest_path).is_none()
+        {
             return None;
         }
         let save = self.save.as_deref()?;
@@ -238,8 +243,12 @@ impl Vfs {
             .replace('\\', "/")
             .to_ascii_lowercase();
         Some(
-            save.join(DELETIONS_DIR)
-                .join(Sha256::digest(key.as_bytes()).iter().map(|byte|format!("{byte:02x}")).collect::<String>()),
+            save.join(DELETIONS_DIR).join(
+                Sha256::digest(key.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            ),
         )
     }
 
@@ -377,7 +386,46 @@ impl Vfs {
             .or(caminho)
     }
 
+    /// Um caminho absoluto da própria instalação pertence ao mesmo overlay do nome relativo.
+    /// Gobak Sodor abre seu seed por fs:/mod/gobaksodor/: o fallback de leitura o encontrava,
+    /// mas a abertura para escrita voltava ao pacote e falhava em instalações somente-leitura.
+    /// Arquivos já persistidos no aparelho mantêm precedência, como na busca histórica.
+    fn module_overlay_alias(&self, guest_path: &str) -> Option<String> {
+        self.save.as_ref()?;
+        let normalized = guest_path.replace('\\', "/");
+        let rest = normalized.strip_prefix("fs:/mod/")?;
+        if self
+            .resolve_inner_plain(guest_path, true)
+            .map(match_case)
+            .is_some_and(|device| device.exists())
+        {
+            return None;
+        }
+        // O fallback e a propriedade usam o mesmo resolvedor: a barra dupla
+        // ancora '..' no módulo, como já exige o caminho dos Zeebo Extreme.
+        let installed = self
+            .resolve_inner_plain(&format!("../{rest}"), true)
+            .map(match_case)?;
+        // O host Windows preserva a caixa do nome pedido quando ele existe.
+        // O namespace BREW não distingue caixa: comparar o nome do módulo antes
+        // de retirar o prefixo, sem canonicalizar saves que ainda não existem.
+        let parent = self.root.parent()?;
+        let mut relative = installed.strip_prefix(parent).ok()?.components();
+        if !relative.next()?.as_os_str().to_str()?
+            .eq_ignore_ascii_case(self.root.file_name()?.to_str()?) {
+            return None;
+        }
+        Some(format!("./{}", relative.as_path().to_str()?.replace('\\', "/")))
+    }
+
     fn resolve_inner(&self, guest_path: &str, allow_root: bool) -> Option<PathBuf> {
+        if let Some(alias) = self.module_overlay_alias(guest_path) {
+            return self.resolve_inner_plain(&alias, allow_root);
+        }
+        self.resolve_inner_plain(guest_path, allow_root)
+    }
+
+    fn resolve_inner_plain(&self, guest_path: &str, allow_root: bool) -> Option<PathBuf> {
         let mut path = guest_path.replace('\\', "/");
         for prefix in PREFIXES {
             if let Some(rest) = path.strip_prefix(prefix) {

@@ -11,17 +11,59 @@ const MAX_ITEMS: usize = 1024;
 const MAX_TEXT: usize = 4096;
 const MAX_MENU_TEXT: usize = 128; // MAX_MENU_TEXT de AEEMenu.h.
 const MP_WRAPSCROLL: u32 = 0x0001_0000;
+const MP_NO_ARROWS: u32 = 0x0002_0000;
 const MP_ALLOW_DUPE_IDS: u32 = 0x0004_0000;
 const MP_NO_REDRAW: u32 = 0x0008_0000;
+const MP_MAXSOFTKEYITEMS: u32 = 0x0010_0000;
+const MP_ICON_TEXT_TOP: u32 = 0x0080_0000;
+const MP_ICON_NO_CENTERSEL: u32 = 0x0100_0000;
+const MP_UNDERLINE_TITLE: u32 = 0x0400_0000;
+const TP_NODRAW: u32 = 0x0010_0000;
 const ST_CENTERTEXT: u32 = 0x0001_0000;
 const ST_CENTERTITLE: u32 = 0x0002_0000;
 const EVT_KEY_LEGACY: u32 = 0x100;
 const EVT_COMMAND_LEGACY: u32 = 0x200; // inc/AEEEvent.h, não um código de tecla.
+const TM_LETTERS: u32 = 3;
+const TM_NUMBERS: u32 = 5;
+const TEXT_MODES: [u32; 2] = [TM_LETTERS, TM_NUMBERS];
+const MULTITAP_MS: u32 = 1000;
+
+fn default_input_mode() -> u32 {
+    TM_LETTERS
+}
+
+fn legacy_letters(key: u16) -> Option<&'static [u8]> {
+    // O mapa do teclado é local ao aparelho; os modos preditivos exigem um dicionário.
+    Some(match key {
+        0xe021 => b" 0",
+        0xe022 => b".,?!1",
+        0xe023 => b"abc2",
+        0xe024 => b"def3",
+        0xe025 => b"ghi4",
+        0xe026 => b"jkl5",
+        0xe027 => b"mno6",
+        0xe028 => b"pqrs7",
+        0xe029 => b"tuv8",
+        0xe02a => b"wxyz9",
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyMultitap {
+    key: u16,
+    cycle: usize,
+    position: usize,
+    character: u16,
+    last_ms: u32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum LegacyControlKind {
     Menu,
+    List,
     Softkey,
+    IconView,
     Text100,
     Static,
 }
@@ -29,7 +71,7 @@ pub(super) enum LegacyControlKind {
 impl LegacyControlKind {
     fn interface(self) -> Interface {
         match self {
-            Self::Menu => Interface::MenuLegacy,
+            Self::Menu | Self::List | Self::IconView => Interface::MenuLegacy,
             Self::Softkey => Interface::SoftkeyLegacy,
             Self::Text100 => Interface::TextLegacy100,
             Self::Static => Interface::StaticLegacy,
@@ -37,7 +79,10 @@ impl LegacyControlKind {
     }
 
     fn is_menu(self) -> bool {
-        matches!(self, Self::Menu | Self::Softkey)
+        matches!(
+            self,
+            Self::Menu | Self::List | Self::Softkey | Self::IconView
+        )
     }
 }
 
@@ -104,8 +149,8 @@ impl LegacyItemStyle {
     fn frame_width(self) -> Option<i32> {
         match self.frame {
             0 => Some(0),
-            1 | 5 => Some(1), // EMPTY / BOX
-            2 => Some(2),     // 3D_EMPTY, como IDisplay::DrawFrame
+            1 | 5 => Some(1),     // EMPTY / BOX
+            2 | 3 | 4 => Some(2), // 3D_EMPTY / RAISED / SUNKEN
             _ => None,
         }
     }
@@ -139,6 +184,12 @@ pub(super) struct LegacyControl {
     normal_style: LegacyItemStyle,
     #[serde(default)]
     selected_style: LegacyItemStyle,
+    #[serde(default = "default_input_mode")]
+    input_mode: u32,
+    #[serde(default)]
+    mode_enum_index: usize,
+    #[serde(default)]
+    multitap: Option<LegacyMultitap>,
 }
 
 impl LegacyControl {
@@ -152,7 +203,7 @@ impl LegacyControl {
             kind,
             rect,
             active: false,
-            properties: if kind == LegacyControlKind::Softkey {
+            properties: if matches!(kind, LegacyControlKind::Softkey | LegacyControlKind::List) {
                 MP_WRAPSCROLL
             } else {
                 0
@@ -172,6 +223,9 @@ impl LegacyControl {
             font_text: 0x8000,
             normal_style: LegacyItemStyle::default(),
             selected_style: LegacyItemStyle::default(),
+            input_mode: TM_LETTERS,
+            mode_enum_index: 0,
+            multitap: None,
             // Cores padrão do aparelho; SetColors substitui apenas os campos de sua máscara.
             colors: [
                 0xffff_ff00,
@@ -194,6 +248,18 @@ impl LegacyControl {
             width: self.rect[2],
             height: self.rect[3],
         }
+    }
+
+    fn valid_multitap(&self) -> bool {
+        self.multitap.as_ref().is_none_or(|tap| {
+            self.kind == LegacyControlKind::Text100
+                && self.input_mode == TM_LETTERS
+                && tap.position.checked_add(1) == Some(self.cursor)
+                && self.text.get(tap.position) == Some(&tap.character)
+                && legacy_letters(tap.key)
+                    .and_then(|letters| letters.get(tap.cycle))
+                    .is_some_and(|letter| u16::from(*letter) == tap.character)
+        })
     }
 }
 
@@ -411,6 +477,7 @@ impl<C: CpuBackend> Machine<C> {
         state.text_capacity = old_capacity.max(needed);
         state.cursor = text.len();
         state.text = text;
+        state.multitap = None;
         Ok(true)
     }
 
@@ -450,6 +517,9 @@ impl<C: CpuBackend> Machine<C> {
             }
             "SetActive" => {
                 self.legacy_controls.get_mut(&this).unwrap().active = a1 != 0;
+                if a1 == 0 {
+                    self.legacy_controls.get_mut(&this).unwrap().multitap = None;
+                }
                 if state.active != (a1 != 0) && state.properties & MP_NO_REDRAW == 0 {
                     self.legacy_redraw(this)?;
                 }
@@ -479,8 +549,28 @@ impl<C: CpuBackend> Machine<C> {
                 SUCCESS
             }
             "SetProperties" => {
+                if state.kind == LegacyControlKind::IconView
+                    && a1
+                        & !(MP_WRAPSCROLL
+                            | MP_ALLOW_DUPE_IDS
+                            | MP_NO_REDRAW
+                            | MP_NO_ARROWS
+                            | MP_MAXSOFTKEYITEMS
+                            | MP_ICON_TEXT_TOP
+                            | MP_ICON_NO_CENTERSEL)
+                        != 0
+                {
+                    // SINGLE_FRAME, animação e estados múltiplos precisam de vistas próprias.
+                    return Ok(None);
+                }
+                // AEEMenu.h limita MAXSOFTKEYITEMS à vista softkey. Preservar esse
+                // bit documentado numa IconView não muda suas células nem a transforma
+                // em SINGLE_FRAME; NO_ARROWS também só atua nesta última modalidade.
                 self.legacy_controls.get_mut(&this).unwrap().properties = a1
-                    | if state.kind == LegacyControlKind::Softkey {
+                    | if matches!(
+                        state.kind,
+                        LegacyControlKind::Softkey | LegacyControlKind::List
+                    ) {
                         MP_WRAPSCROLL
                     } else {
                         0
@@ -499,6 +589,7 @@ impl<C: CpuBackend> Machine<C> {
                 target.items.clear();
                 target.selected = None;
                 target.cursor = 0;
+                target.multitap = None;
                 if state.text_pointer != 0 {
                     self.cpu.write_mem(state.text_pointer, &[0, 0])?;
                 }
@@ -612,7 +703,7 @@ impl<C: CpuBackend> Machine<C> {
                     if image == 0 {
                         return Ok(Some(FALSE));
                     }
-                    self.images.insert(image, std::rc::Rc::new(decoded));
+                    self.install_decoded_image(image, decoded)?;
                     self.recursos_lidos.insert(image_id);
                     image
                 } else {
@@ -788,8 +879,8 @@ impl<C: CpuBackend> Machine<C> {
                         let mut bytes = [0; 8];
                         self.cpu.read_mem(pointer, &mut bytes)?;
                         let value = LegacyItemStyle::from_arm(bytes);
-                        // Não aceitar efeitos 3D/abas como um sucesso sem desenho.
-                        if value.frame_width().is_none() || ![2, 7].contains(&value.image_rop) {
+                        // As abas e os outros efeitos continuam sem anunciar desenho inexistente.
+                        if value.frame_width().is_none() || ![0, 2, 7].contains(&value.image_rop) {
                             return Ok(None);
                         }
                         *style = Some(value);
@@ -933,12 +1024,62 @@ impl<C: CpuBackend> Machine<C> {
             "SetCursorPos" => {
                 let cursor =
                     ((a1 as i32).max(0) as usize).min(self.legacy_current_text(&state)?.len());
-                self.legacy_controls.get_mut(&this).unwrap().cursor = cursor;
+                let target = self.legacy_controls.get_mut(&this).unwrap();
+                target.cursor = cursor;
+                target.multitap = None;
                 SUCCESS
+            }
+            "SetInputMode" => {
+                // AEEText.h devolve o modo realmente selecionado, não um código SUCCESS.
+                // KANJI/RAPID e modos OEM não podem anunciar editores que não existem.
+                let mode = match a1 {
+                    0 => TM_LETTERS,
+                    mode if TEXT_MODES.contains(&mode) => mode,
+                    _ => state.input_mode,
+                };
+                let target = self.legacy_controls.get_mut(&this).unwrap();
+                if mode != target.input_mode {
+                    target.multitap = None;
+                }
+                target.input_mode = mode;
+                mode
+            }
+            "GetInputMode" => {
+                self.legacy_mode_info(a1, state.input_mode)?;
+                state.input_mode
+            }
+            "EnumModeInit" => {
+                self.legacy_controls.get_mut(&this).unwrap().mode_enum_index = 0;
+                SUCCESS
+            }
+            "EnumNextMode" => {
+                let mode = TEXT_MODES.get(state.mode_enum_index).copied().unwrap_or(0);
+                self.legacy_mode_info(a1, mode)?;
+                self.legacy_controls.get_mut(&this).unwrap().mode_enum_index =
+                    (state.mode_enum_index + 1).min(TEXT_MODES.len());
+                mode
             }
             _ => return Ok(None),
         };
         Ok(Some(result))
+    }
+
+    fn legacy_mode_info(&mut self, pointer: u32, mode: u32) -> Result<(), CpuError> {
+        if pointer != 0 {
+            // int32 + AECHAR[15]; os dois bytes finais de alinhamento não são campos.
+            let mut bytes = [0; 34];
+            bytes[..4].copy_from_slice(&mode.to_le_bytes());
+            let name: &[u8] = match mode {
+                TM_LETTERS => b"abc",
+                TM_NUMBERS => b"123",
+                _ => b"",
+            };
+            for (at, character) in name.iter().enumerate() {
+                bytes[4 + at * 2..6 + at * 2].copy_from_slice(&u16::from(*character).to_le_bytes());
+            }
+            self.cpu.write_mem(pointer, &bytes)?;
+        }
+        Ok(())
     }
 
     fn legacy_static_call(
@@ -981,6 +1122,9 @@ impl<C: CpuBackend> Machine<C> {
         _data: u32,
     ) -> Result<u32, CpuError> {
         let state = self.legacy_controls[&this].clone();
+        if state.kind == LegacyControlKind::Text100 {
+            return self.legacy_text_event(this, state, event, key);
+        }
         if !state.active
             || !state.kind.is_menu()
             || event != EVT_KEY_LEGACY
@@ -991,8 +1135,26 @@ impl<C: CpuBackend> Machine<C> {
         let mut selected = state.selected.unwrap_or(0);
         let mut activate = false;
         let direction = match (state.kind, key) {
-            (LegacyControlKind::Menu, 0xe031) | (LegacyControlKind::Softkey, 0xe033) => -1,
-            (LegacyControlKind::Menu, 0xe032) | (LegacyControlKind::Softkey, 0xe034) => 1,
+            (LegacyControlKind::IconView, 0xe031..=0xe034) => {
+                let columns = self.legacy_icon_cell(&state).0;
+                let column = selected % columns;
+                // IconView sempre dá a volta, mesmo sem publicar MP_WRAPSCROLL.
+                // Uma última linha incompleta não muda a coluna ao navegar verticalmente.
+                selected = match key {
+                    0xe031 if selected >= columns => selected - columns,
+                    0xe031 => column + (state.items.len() - 1 - column) / columns * columns,
+                    0xe032 if selected + columns < state.items.len() => selected + columns,
+                    0xe032 => column,
+                    0xe033 if selected > 0 => selected - 1,
+                    0xe033 => state.items.len() - 1,
+                    _ => (selected + 1) % state.items.len(),
+                };
+                0
+            }
+            (LegacyControlKind::Menu | LegacyControlKind::List, 0xe031)
+            | (LegacyControlKind::Softkey, 0xe033) => -1,
+            (LegacyControlKind::Menu | LegacyControlKind::List, 0xe032)
+            | (LegacyControlKind::Softkey, 0xe034) => 1,
             (_, 0xe035) => {
                 activate = true;
                 0
@@ -1036,6 +1198,117 @@ impl<C: CpuBackend> Machine<C> {
         Ok(TRUE)
     }
 
+    fn legacy_text_event(
+        &mut self,
+        this: u32,
+        state: LegacyControl,
+        event: u32,
+        key: u16,
+    ) -> Result<u32, CpuError> {
+        if !state.active || event != EVT_KEY_LEGACY {
+            return Ok(FALSE);
+        }
+        let mut text = self.legacy_current_text(&state)?;
+        let mut cursor = state.cursor.min(text.len());
+        let now = self.now_ms();
+        let mut multitap = None;
+        match key {
+            0xe033 | 0xe034 => {
+                // Não deixar o cursor no meio de um par UTF-16 que veio de SetText.
+                if key == 0xe033 && cursor > 0 {
+                    cursor -= 1;
+                    if cursor > 0
+                        && (0xdc00..=0xdfff).contains(&text[cursor])
+                        && (0xd800..=0xdbff).contains(&text[cursor - 1])
+                    {
+                        cursor -= 1;
+                    }
+                } else if key == 0xe034 && cursor < text.len() {
+                    cursor += 1;
+                    if cursor < text.len()
+                        && (0xd800..=0xdbff).contains(&text[cursor - 1])
+                        && (0xdc00..=0xdfff).contains(&text[cursor])
+                    {
+                        cursor += 1;
+                    }
+                }
+            }
+            0xe030 => {
+                if cursor == 0 {
+                    self.legacy_controls.get_mut(&this).unwrap().multitap = None;
+                    return Ok(FALSE);
+                }
+                let end = cursor;
+                cursor -= 1;
+                if cursor > 0
+                    && (0xdc00..=0xdfff).contains(&text[cursor])
+                    && (0xd800..=0xdbff).contains(&text[cursor - 1])
+                {
+                    cursor -= 1;
+                }
+                text.drain(cursor..end);
+            }
+            0xe021..=0xe02a => {
+                let character = if state.input_mode == TM_NUMBERS {
+                    u16::from(b'0') + key - 0xe021
+                } else {
+                    let letters = legacy_letters(key).expect("dígito do teclado");
+                    // GetTextPtr é gravável. Só substituir o caractere ainda pertencente
+                    // à composição; uma edição do guest já confirmou o anterior.
+                    let previous = state.multitap.as_ref().filter(|tap| {
+                        tap.key == key
+                            && tap.position.checked_add(1) == Some(cursor)
+                            && text.get(tap.position) == Some(&tap.character)
+                            && now.wrapping_sub(tap.last_ms) < MULTITAP_MS
+                    });
+                    let cycle = previous.map_or(0, |tap| (tap.cycle + 1) % letters.len());
+                    let character = u16::from(letters[cycle]);
+                    if let Some(tap) = previous {
+                        text[tap.position] = character;
+                        multitap = Some(LegacyMultitap {
+                            key,
+                            cycle,
+                            position: tap.position,
+                            character,
+                            last_ms: now,
+                        });
+                    } else if text.len() < state.max_size {
+                        text.insert(cursor, character);
+                        multitap = Some(LegacyMultitap {
+                            key,
+                            cycle,
+                            position: cursor,
+                            character,
+                            last_ms: now,
+                        });
+                        cursor += 1;
+                    } else {
+                        return Ok(TRUE);
+                    }
+                    character
+                };
+                if state.input_mode == TM_NUMBERS {
+                    if text.len() >= state.max_size {
+                        return Ok(TRUE);
+                    }
+                    text.insert(cursor, character);
+                    cursor += 1;
+                }
+            }
+            _ => return Ok(FALSE),
+        }
+        if !self.legacy_set_text(this, text, 0)? {
+            return Ok(FALSE);
+        }
+        let target = self.legacy_controls.get_mut(&this).unwrap();
+        target.cursor = cursor;
+        target.multitap = multitap;
+        if state.properties & TP_NODRAW == 0 {
+            self.legacy_redraw(this)?;
+        }
+        Ok(TRUE)
+    }
+
     fn legacy_static_text_x(&self, state: &LegacyControl, text: &[u16], property: u32) -> i32 {
         if state.kind == LegacyControlKind::Static && state.properties & property != 0 {
             // AEEShell.h: título e corpo possuem alinhamento independente. Medir com a
@@ -1063,6 +1336,328 @@ impl<C: CpuBackend> Machine<C> {
         result.map(|_| ())
     }
 
+    fn legacy_menu_frame(
+        &mut self,
+        target: u32,
+        rect: Rect,
+        style: LegacyItemStyle,
+        frame_color: u32,
+    ) {
+        if !matches!(style.frame, 3 | 4 | 5) {
+            return;
+        }
+        for layer in 0..style.frame_width().unwrap_or(0) as i16 {
+            let inner = Rect {
+                x: rect.x.saturating_add(layer),
+                y: rect.y.saturating_add(layer),
+                width: rect.width.saturating_sub(layer * 2),
+                height: rect.height.saturating_sub(layer * 2),
+            };
+            if inner.width <= 0 || inner.height <= 0 {
+                break;
+            }
+            let (mut light, mut dark) = if matches!(style.frame, 3 | 4) {
+                // RAISED é um relevo de dois pixels. A paleta neutra pertence ao tema
+                // do aparelho; cFrame continua sendo a cor do quadro BOX.
+                if layer == 0 {
+                    (Rgb::WHITE, Rgb::BLACK)
+                } else {
+                    (
+                        Rgb {
+                            r: 192,
+                            g: 192,
+                            b: 192,
+                        },
+                        Rgb {
+                            r: 128,
+                            g: 128,
+                            b: 128,
+                        },
+                    )
+                }
+            } else {
+                let color = Rgb::from_rgbval(frame_color);
+                (color, color)
+            };
+            if style.frame == 4 {
+                std::mem::swap(&mut light, &mut dark);
+            }
+            let edges = [
+                (Rect { height: 1, ..inner }, light),
+                (Rect { width: 1, ..inner }, light),
+                (
+                    Rect {
+                        y: inner.y.saturating_add(inner.height - 1),
+                        height: 1,
+                        ..inner
+                    },
+                    dark,
+                ),
+                (
+                    Rect {
+                        x: inner.x.saturating_add(inner.width - 1),
+                        width: 1,
+                        ..inner
+                    },
+                    dark,
+                ),
+            ];
+            // Recortar cada aresta preserva o relevo quando o item atravessa o clip.
+            for (edge, color) in edges {
+                if let (Some(area), Some(fb)) =
+                    (self.clip_rect(edge), self.bitmaps.get_mut(&target))
+                {
+                    fb.fill_rect(area, color);
+                }
+            }
+        }
+    }
+
+    fn legacy_or_image(&mut self, image: u32, x: i32, y: i32) -> Result<(), CpuError> {
+        let target = self.target()?;
+        let Some(info) = self.images.get(&image) else {
+            return Ok(());
+        };
+        let crop = self
+            .recortes_de_imagem
+            .get(&image)
+            .copied()
+            .unwrap_or_default();
+        let frame_width = if info.frame_width > 0 {
+            i32::from(info.frame_width)
+        } else {
+            info.width as i32
+        };
+        let (source_x, source_y) = (crop.x.max(0), crop.y.max(0));
+        let (width, height) = crop.tamanho.unwrap_or((i32::MAX, i32::MAX));
+        let (mut first_x, mut last_x) = (0, width.min(frame_width - source_x));
+        let (mut first_y, mut last_y) = (0, height.min(info.height as i32 - source_y));
+        if let Some(clip) = self.clip {
+            first_x = first_x.max(i32::from(clip.x) - x);
+            last_x = last_x.min(i32::from(clip.x) + i32::from(clip.width) - x);
+            first_y = first_y.max(i32::from(clip.y) - y);
+            last_y = last_y.min(i32::from(clip.y) + i32::from(clip.height) - y);
+        }
+        if first_x >= last_x || first_y >= last_y {
+            return Ok(());
+        }
+        let Some(surface) = self.bitmaps.get_mut(&target) else {
+            // Um IBitmap do guest recebe o ROP verdadeiro no callback, como DrawFrame.
+            self.pending_blits.push(PendingBlit {
+                image,
+                target,
+                x: x + first_x,
+                y: y + first_y,
+                src_x: source_x + first_x,
+                src_y: source_y + first_y,
+                width: (last_x - first_x) as u32,
+                height: (last_y - first_y) as u32,
+                rop: 0,
+                frame: Some(0),
+            });
+            return Ok(());
+        };
+        first_x = first_x.max(-x).max(0);
+        first_y = first_y.max(-y).max(0);
+        last_x = last_x.min(surface.width() as i32 - x);
+        last_y = last_y.min(surface.height() as i32 - y);
+        for row in first_y..last_y {
+            for column in first_x..last_x {
+                let source =
+                    ((row + source_y) as u32 * info.width + (column + source_x) as u32) as usize;
+                let Some(&pixel) = info.pixels.get(source) else {
+                    continue;
+                };
+                let background = surface.get_pixel(x + column, y + row);
+                let result = background | pixel;
+                match info.alfa.get(source).copied() {
+                    Some(0) => {}
+                    Some(alpha) => surface.set_pixel_native(
+                        x + column,
+                        y + row,
+                        mistura_rgb565(background, result, alpha),
+                    ),
+                    None if info.opaque.get(source).copied().unwrap_or(true) => {
+                        surface.set_pixel_native(x + column, y + row, result);
+                    }
+                    None => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn legacy_icon_cell(&self, state: &LegacyControl) -> (usize, i32, i32) {
+        let mut images = state
+            .items
+            .iter()
+            .filter_map(|item| self.images.get(&item.image));
+        let first = images.next();
+        let (mut width, mut height) = first.map_or((FONT_SIZE as i32, FONT_SIZE as i32), |image| {
+            (
+                if image.frame_width > 0 {
+                    i32::from(image.frame_width)
+                } else {
+                    image.width.min(i16::MAX as u32) as i32
+                },
+                image.height.min(i16::MAX as u32) as i32,
+            )
+        });
+        for image in images {
+            width = width.max(if image.frame_width > 0 {
+                i32::from(image.frame_width)
+            } else {
+                image.width.min(i16::MAX as u32) as i32
+            });
+            height = height.max(image.height.min(i16::MAX as u32) as i32);
+        }
+        let padding_x = [state.normal_style, state.selected_style]
+            .into_iter()
+            .map(|style| style.frame_width().unwrap_or(0) + i32::from(style.x_offset))
+            .max()
+            .unwrap_or(0);
+        let padding_y = [state.normal_style, state.selected_style]
+            .into_iter()
+            .map(|style| style.frame_width().unwrap_or(0) + i32::from(style.y_offset))
+            .max()
+            .unwrap_or(0);
+        let cell_width = (width + 2 * padding_x).max(1);
+        let cell_height = (height + 2 * padding_y).max(1);
+        let columns = (i32::from(state.rect[2]).max(0) / cell_width).max(1) as usize;
+        (columns, cell_width, cell_height)
+    }
+
+    fn legacy_icon_redraw(
+        &mut self,
+        state: &LegacyControl,
+        target: u32,
+        top: i32,
+    ) -> Result<(), CpuError> {
+        let (columns, cell_width, cell_height) = self.legacy_icon_cell(state);
+        let rect = state.rect();
+        let label_height = FONT_SIZE as i32 + 4;
+        let label_at_top = state.properties & MP_ICON_TEXT_TOP != 0;
+        let label_y = if label_at_top {
+            top
+        } else {
+            (i32::from(rect.y) + i32::from(rect.height) - label_height).max(top)
+        };
+        let grid_top = top + if label_at_top { label_height } else { 0 };
+        let grid_height = (i32::from(rect.y) + i32::from(rect.height)
+            - grid_top
+            - if label_at_top { 0 } else { label_height })
+        .max(0);
+        let visible_rows = (grid_height / cell_height).max(1) as usize;
+        let total_rows = state.items.len().div_ceil(columns);
+        let selected_row = state.selected.unwrap_or(0) / columns;
+        let offset = if state.properties & MP_ICON_NO_CENTERSEL == 0 {
+            visible_rows / 2
+        } else {
+            visible_rows - 1
+        };
+        let first_row = selected_row
+            .saturating_sub(offset)
+            .min(total_rows.saturating_sub(visible_rows));
+        let origin_x =
+            i32::from(rect.x) + (i32::from(rect.width) - columns as i32 * cell_width).max(0) / 2;
+        let grid = Rect {
+            x: rect.x,
+            y: grid_top.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            width: rect.width,
+            height: grid_height.min(i32::from(i16::MAX)) as i16,
+        };
+        let previous_clip = self.clip;
+        if let Some(clip) = self.clip_rect(grid) {
+            self.clip = Some(clip);
+            let result: Result<(), CpuError> = (|| {
+                for (index, item) in state.items.iter().enumerate().skip(first_row * columns) {
+                    let row = index / columns - first_row;
+                    if row >= visible_rows {
+                        break;
+                    }
+                    let x = origin_x + (index % columns) as i32 * cell_width;
+                    let y = grid_top + row as i32 * cell_height;
+                    let selected = state.active && state.selected == Some(index);
+                    let style = if selected {
+                        state.selected_style
+                    } else {
+                        state.normal_style
+                    };
+                    let cell = Rect {
+                        x: x.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                        y: y.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                        width: cell_width.min(i32::from(i16::MAX)) as i16,
+                        height: cell_height.min(i32::from(i16::MAX)) as i16,
+                    };
+                    if selected {
+                        if let (Some(area), Some(fb)) =
+                            (self.clip_rect(cell), self.bitmaps.get_mut(&target))
+                        {
+                            fb.fill_rect(area, Rgb::from_rgbval(state.colors[2]));
+                        }
+                    }
+                    self.legacy_menu_frame(target, cell, style, state.colors[4]);
+                    if item.image != 0 {
+                        let x = x + style.frame_width().unwrap_or(0) + i32::from(style.x_offset);
+                        let y = y + style.frame_width().unwrap_or(0) + i32::from(style.y_offset);
+                        let old_crop = self.recortes_de_imagem.get(&item.image).copied();
+                        self.recortes_de_imagem
+                            .entry(item.image)
+                            .or_default()
+                            .transparente = u32::from(style.image_rop) == AEE_RO_TRANSPARENT;
+                        let drawn = if style.image_rop == 0 {
+                            self.legacy_or_image(item.image, x, y)
+                        } else {
+                            self.draw_image(item.image, x, y, Some(0))
+                        };
+                        match old_crop {
+                            Some(crop) => {
+                                self.recortes_de_imagem.insert(item.image, crop);
+                            }
+                            None => {
+                                self.recortes_de_imagem.remove(&item.image);
+                            }
+                        }
+                        drawn?;
+                    }
+                }
+                Ok(())
+            })();
+            self.clip = previous_clip;
+            result?;
+        }
+        if let Some(item) = state.selected.and_then(|index| state.items.get(index)) {
+            let label = Rect {
+                x: rect.x,
+                y: label_y.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                width: rect.width,
+                height: label_height as i16,
+            };
+            if let Some(clip) = self.clip_rect(label) {
+                self.clip = Some(clip);
+                if let Some(fb) = self.bitmaps.get_mut(&target) {
+                    fb.fill_rect(
+                        clip,
+                        Rgb::from_rgbval(state.colors[if state.active { 2 } else { 0 }]),
+                    );
+                }
+                let text_width = self.font.as_ref().map_or(0, |font| {
+                    font.width(&String::from_utf16_lossy(&item.text), FONT_SIZE) as i32
+                });
+                let x = i32::from(rect.x) + (i32::from(rect.width) - text_width).max(0) / 2;
+                let result = self.legacy_draw_text(
+                    &item.text,
+                    x,
+                    label_y + 2,
+                    state.colors[if state.active { 3 } else { 1 }],
+                );
+                self.clip = previous_clip;
+                result?;
+            }
+        }
+        Ok(())
+    }
+
     fn legacy_redraw(&mut self, this: u32) -> Result<(), CpuError> {
         let Some(mut state) = self.legacy_controls.get(&this).cloned() else {
             return Ok(());
@@ -1086,7 +1681,14 @@ impl<C: CpuBackend> Machine<C> {
             if let Some(fb) = self.bitmaps.get_mut(&target) {
                 fb.fill_rect(clip, Rgb::from_rgbval(state.colors[0]));
             }
-            let row_height = if state.kind.is_menu() {
+            let row_height = if state.kind == LegacyControlKind::IconView {
+                FONT_SIZE as i32 + 4
+            } else if state.kind == LegacyControlKind::List {
+                state
+                    .normal_style
+                    .row_height()
+                    .max(state.selected_style.row_height())
+            } else if state.kind.is_menu() {
                 let image_height = state
                     .items
                     .iter()
@@ -1106,11 +1708,47 @@ impl<C: CpuBackend> Machine<C> {
             if !state.title.is_empty() {
                 let x = self.legacy_static_text_x(&state, &state.title, ST_CENTERTITLE);
                 self.legacy_draw_text(&state.title, x, y, state.colors[8])?;
-                y += row_height;
+                let underlined = state.kind == LegacyControlKind::Menu
+                    && state.properties & MP_UNDERLINE_TITLE != 0;
+                if underlined {
+                    // MP_UNDERLINE_TITLE é uma decoração do título do menu comum.
+                    // A cor e a largura acompanham o texto; clip_rect conserva tanto
+                    // o retângulo do controle quanto um clip menor imposto pelo guest.
+                    let width = self.font.as_ref().map_or(0, |font| {
+                        font.width(&String::from_utf16_lossy(&state.title), FONT_SIZE)
+                            .min(i16::MAX as u32) as i32
+                    });
+                    let rule = Rect {
+                        x: x.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                        y: (y + FONT_SIZE.ceil() as i32 + 1)
+                            .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                            as i16,
+                        width: width.clamp(0, i32::from(i16::MAX)) as i16,
+                        height: 1,
+                    };
+                    if let (Some(area), Some(fb)) =
+                        (self.clip_rect(rule), self.bitmaps.get_mut(&target))
+                    {
+                        fb.fill_rect(area, Rgb::from_rgbval(state.colors[8]));
+                    }
+                }
+                y += if underlined {
+                    row_height.max(FONT_SIZE.ceil() as i32 + 2)
+                } else {
+                    row_height
+                };
             }
-            if state.kind.is_menu() {
-                let visible = ((i32::from(rect.height) - (y - i32::from(rect.y))) / row_height)
-                    .max(1) as usize;
+            if state.kind == LegacyControlKind::IconView {
+                self.legacy_icon_redraw(&state, target, y)?;
+            } else if state.kind.is_menu() {
+                // AEEMenu: LISTCTL exibe somente o texto do item selecionado,
+                // mesmo quando seu retângulo comporta várias linhas de menu.
+                let visible = if state.kind == LegacyControlKind::List {
+                    1
+                } else {
+                    ((i32::from(rect.height) - (y - i32::from(rect.y))) / row_height).max(1)
+                        as usize
+                };
                 let first = if state.kind == LegacyControlKind::Softkey {
                     0
                 } else {
@@ -1160,46 +1798,21 @@ impl<C: CpuBackend> Machine<C> {
                             }
                         }
                     }
-                    if style.frame == 5 && item_rect.width > 0 && item_rect.height > 0 {
-                        // Recortar cada aresta separadamente não inventa uma moldura no clip.
-                        let edges = [
-                            Rect {
-                                height: 1,
-                                ..item_rect
-                            },
-                            Rect {
-                                y: item_rect.y.saturating_add(item_rect.height - 1),
-                                height: 1,
-                                ..item_rect
-                            },
-                            Rect {
-                                width: 1,
-                                ..item_rect
-                            },
-                            Rect {
-                                x: item_rect.x.saturating_add(item_rect.width - 1),
-                                width: 1,
-                                ..item_rect
-                            },
-                        ];
-                        for edge in edges {
-                            if let (Some(area), Some(fb)) =
-                                (self.clip_rect(edge), self.bitmaps.get_mut(&target))
-                            {
-                                fb.fill_rect(area, Rgb::from_rgbval(state.colors[4]));
-                            }
-                        }
-                    }
+                    self.legacy_menu_frame(target, item_rect, style, state.colors[4]);
                     let content_x = x + border + i32::from(style.x_offset);
                     let content_y = item_y + border + i32::from(style.y_offset);
                     let mut text_x = content_x;
-                    if item.image != 0 {
+                    if item.image != 0 && state.kind != LegacyControlKind::List {
                         let old_crop = self.recortes_de_imagem.get(&item.image).copied();
                         self.recortes_de_imagem
                             .entry(item.image)
                             .or_default()
                             .transparente = u32::from(style.image_rop) == AEE_RO_TRANSPARENT;
-                        let drawn = self.draw_image(item.image, content_x, content_y, Some(0));
+                        let drawn = if style.image_rop == 0 {
+                            self.legacy_or_image(item.image, content_x, content_y)
+                        } else {
+                            self.draw_image(item.image, content_x, content_y, Some(0))
+                        };
                         match old_crop {
                             Some(crop) => {
                                 self.recortes_de_imagem.insert(item.image, crop);
@@ -1249,6 +1862,9 @@ impl<C: CpuBackend> Machine<C> {
         for (_, state) in &mut controls {
             if let Ok(text) = self.legacy_current_text(state) {
                 state.text = text;
+                if !state.valid_multitap() {
+                    state.multitap = None;
+                }
             }
         }
         sections.poe(
@@ -1301,10 +1917,13 @@ impl<C: CpuBackend> Machine<C> {
                 || state.text.len() > state.max_size
                 || state.text_capacity > MAX_TEXT + 1
                 || state.cursor > state.max_size
+                || !TEXT_MODES.contains(&state.input_mode)
+                || state.mode_enum_index > TEXT_MODES.len()
+                || !state.valid_multitap()
                 || state.normal_style.frame_width().is_none()
                 || state.selected_style.frame_width().is_none()
-                || ![2, 7].contains(&state.normal_style.image_rop)
-                || ![2, 7].contains(&state.selected_style.image_rop)
+                || ![0, 2, 7].contains(&state.normal_style.image_rop)
+                || ![0, 2, 7].contains(&state.selected_style.image_rop)
                 || state.items.iter().any(|item| {
                     item.text.len() > MAX_MENU_TEXT
                         || (item.image != 0

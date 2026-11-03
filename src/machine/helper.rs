@@ -131,25 +131,35 @@ impl<C: CpuBackend> Machine<C> {
     /// Existe separada da versão em `String` porque `wstrchr` e as comparações trabalham em
     /// cima de `AECHAR`, e converter para `String` perderia a posição de cada caractere.
     pub(super) fn read_aechar_units(&self, addr: u32) -> Result<Vec<u16>, CpuError> {
+        self.read_aechar_units_limited(addr, MAX_STRING)
+    }
+
+    fn read_aechar_units_limited(&self, addr: u32, limit: usize) -> Result<Vec<u16>, CpuError> {
         if addr == 0 {
             return Ok(Vec::new());
         }
+        let limit = limit.min(MAX_STRING);
         /// Quantas unidades por leitura. Mesmo motivo do `read_cbytes`: cada leitura
         /// atravessa o backend de CPU, que procura a região antes de copiar — 57 ns para
         /// trazer dois bytes. Sessenta e quatro unidades cobrem a string típica de uma vez.
         const BLOCO: usize = 64;
 
         let mut units = Vec::new();
-        while units.len() < MAX_STRING {
-            let quer = BLOCO.min(MAX_STRING - units.len());
-            let base = addr + units.len() as u32 * 2;
+        while units.len() < limit {
+            let quer = BLOCO.min(limit - units.len());
+            let Some(base) = addr.checked_add(units.len() as u32 * 2) else {
+                return Ok(units);
+            };
             let mut bytes = vec![0u8; quer * 2];
             if self.cpu.read_mem(base, &mut bytes).is_err() {
                 // O bloco pode cruzar o fim da região mapeada, e aí a leitura inteira falha
                 // mesmo havendo unidades válidas antes. Duas em duas só neste caso.
                 for i in 0..quer {
                     let mut par = [0u8; 2];
-                    if self.cpu.read_mem(base + i as u32 * 2, &mut par).is_err() {
+                    let Some(at) = base.checked_add(i as u32 * 2) else {
+                        return Ok(units);
+                    };
+                    if self.cpu.read_mem(at, &mut par).is_err() {
                         return Ok(units);
                     }
                     match u16::from_le_bytes(par) {
@@ -194,7 +204,8 @@ impl<C: CpuBackend> Machine<C> {
                 if a0 > 1 {
                     return Ok(None);
                 }
-                let ponteiros = self.ponteiros_estaticos
+                let ponteiros = self
+                    .ponteiros_estaticos
                     .entry(self.current_thread.unwrap_or(0))
                     .or_default();
                 std::mem::replace(&mut ponteiros[a0 as usize], a1)
@@ -212,10 +223,10 @@ impl<C: CpuBackend> Machine<C> {
             }
             "free" => {
                 self.solta_bitmap_nativo(a0);
-                self.heap.free(a0);
+                self.free_guest_allocation(a0);
                 SUCCESS
             }
-            "realloc" => self.realloc(a0, a1 & !ALLOC_NO_ZMEM)?,
+            "realloc" => self.realloc(a0, a1)?,
             "memmove" => {
                 self.copy_guest(a0, a1, a2)?;
                 a0
@@ -283,15 +294,22 @@ impl<C: CpuBackend> Machine<C> {
                     let limit = capacity as usize;
                     let mut output = Vec::new();
                     for index in 0..(a1 as i32).max(0).min(MAX_STRING as i32) as usize {
-                        if output.len() + 1 >= limit { break; }
-                        let address = a0.checked_add(index as u32 * 2)
-                            .ok_or_else(|| CpuError("WSTRCOMPRESS source address overflow".into()))?;
+                        if output.len() + 1 >= limit {
+                            break;
+                        }
+                        let address = a0.checked_add(index as u32 * 2).ok_or_else(|| {
+                            CpuError("WSTRCOMPRESS source address overflow".into())
+                        })?;
                         let mut pair = [0; 2];
                         self.cpu.read_mem(address, &mut pair)?;
                         let unit = u16::from_le_bytes(pair);
-                        if unit == 0 { break; }
+                        if unit == 0 {
+                            break;
+                        }
                         let bytes = if unit <= 127 { &pair[..1] } else { &pair[..] };
-                        if output.len() + bytes.len() >= limit { break; }
+                        if output.len() + bytes.len() >= limit {
+                            break;
+                        }
                         output.extend_from_slice(bytes);
                     }
                     output.push(0);
@@ -300,25 +318,32 @@ impl<C: CpuBackend> Machine<C> {
                 0
             }
             "wstrcpy" => {
-                let text = self.read_aechar(a1)?;
-                self.write_aechar(a0, &text, usize::MAX)?;
+                let units = self.read_aechar_units(a1)?;
+                self.write_raw_aechar_units(a0, &units)?;
                 a0
             }
             "wstrcat" => {
-                let base = self.read_aechar(a0)?;
-                let extra = self.read_aechar(a1)?;
-                let offset = base.encode_utf16().count() as u32 * 2;
-                self.write_aechar(a0 + offset, &extra, usize::MAX)?;
+                let existing = self.read_aechar_units(a0)?.len();
+                let extra = self.read_aechar_units(a1)?;
+                let destination = a0
+                    .checked_add(existing as u32 * 2)
+                    .ok_or_else(|| CpuError("WSTRCAT: destino fora da memória".into()))?;
+                self.write_raw_aechar_units(destination, &extra)?;
                 a0
             }
             "wstrcmp" => {
-                let (left, right) = (self.read_aechar(a0)?, self.read_aechar(a1)?);
+                // O SDK compara AECHAR, inclusive unidades nativas e surrogates.
+                // Decodificar antes pode tornar unidades distintas iguais a FFFD.
+                let (left, right) = (self.read_aechar_units(a0)?, self.read_aechar_units(a1)?);
                 cmp_to_int(left.cmp(&right))
             }
             "wstrncmp" => {
                 let take = a2 as usize;
-                let (left, right) = (self.read_aechar(a0)?, self.read_aechar(a1)?);
-                cmp_to_int(left.get(..take).cmp(&right.get(..take)))
+                // length conta unidades de 16 bits. A leitura também respeita esse
+                // limite: um prefixo não precisa ter terminador e zero não acessa src.
+                let left = self.read_aechar_units_limited(a0, take)?;
+                let right = self.read_aechar_units_limited(a1, take)?;
+                cmp_to_int(left.cmp(&right))
             }
             // char *strncpy(char *dst, const char *src, size_t n) — sem terminador se `src`
             // não couber, como manda a função original.
@@ -440,15 +465,24 @@ impl<C: CpuBackend> Machine<C> {
             // versões BSD, que devolvem o tamanho que a origem *teria* ocupado. `nSize` conta
             // caracteres, não bytes.
             "wstrlcpy" | "wstrlcat" => {
-                let source = self.read_aechar(a1)?;
-                let existing = if name == "wstrlcat" {
-                    self.read_aechar_units(a0)?.len()
+                // O retorno BSD exige contar toda a origem, mesmo com nSize zero.
+                let source = self.read_aechar_units(a1)?;
+                let capacity = a2 as usize;
+                let existing = if name == "wstrlcat" && capacity != 0 {
+                    // Sem NUL dentro de nSize não há escrita: o retorno é
+                    // nSize + strlen(src), não o tamanho encontrado fora do buffer.
+                    self.read_aechar_units_limited(a0, capacity)?.len()
                 } else {
                     0
                 };
-                let room = (a2 as usize).saturating_sub(existing);
-                self.write_aechar(a0 + existing as u32 * 2, &source, room)?;
-                (existing + source.encode_utf16().count()) as u32
+                if capacity > existing {
+                    let count = source.len().min(capacity - existing - 1);
+                    let destination = a0
+                        .checked_add(existing as u32 * 2)
+                        .ok_or_else(|| CpuError("WSTRLCPY/CAT: destino fora da memória".into()))?;
+                    self.write_raw_aechar_units(destination, &source[..count])?;
+                }
+                (existing + source.len()) as u32
             }
             // `AECHAR *wwritelong(AECHAR *pszBuf, long n)` — escreve o número e devolve o
             // ponteiro para o terminador, para o chamador continuar dali.
@@ -457,19 +491,45 @@ impl<C: CpuBackend> Machine<C> {
                 self.write_aechar(a0, &text, usize::MAX)?;
                 a0 + text.len() as u32 * 2
             }
+            "wwritelongex" => {
+                let a3 = self.cpu.read_reg(Reg::R3);
+                if a0 == 0 || a3 == 0 {
+                    0
+                } else {
+                    let remaining = self.cpu.read_u32(a3)? as i32;
+                    if remaining <= 0 {
+                        0
+                    } else {
+                        let width = if a2 < 12 { a2 as usize } else { 0 };
+                        let text = format!("{:0width$}", a1 as i32);
+                        let count = text.len().min(remaining as usize - 1);
+                        self.write_aechar(a0, &text, remaining as usize)?;
+                        self.cpu.write_u32(a3, remaining as u32 - count as u32)?;
+                        a0 + count as u32 * 2
+                    }
+                }
+            }
             // `int wstrncopyn(AECHAR *dst, int cbDest, const AECHAR *src, int lenSource)`:
             // `cbDest` conta caracteres e `lenSource` limita a origem (-1 = até o terminador).
             "wstrncopyn" => {
-                let mut units = self.read_aechar_units(a2)?;
-                let limit = self.cpu.read_reg(Reg::R3) as i32;
-                if limit >= 0 {
-                    units.truncate(limit as usize);
+                let capacity = (a1 as i32).max(0) as usize;
+                if a0 == 0 || capacity == 0 {
+                    0
+                } else {
+                    let source_limit = self.cpu.read_reg(Reg::R3) as i32;
+                    let limit = if source_limit >= 0 {
+                        (capacity - 1).min(source_limit as usize)
+                    } else {
+                        capacity - 1
+                    };
+                    // WSTRNCOPYN copia AECHAR, não texto Unicode normalizado. D9B4
+                    // pode ser uma unidade nativa legítima; nem ela nem um surrogate
+                    // isolado devem virar FFFD durante uma operação de memória.
+                    let units = self.read_aechar_units_limited(a2, limit)?;
+                    let copied = units.len() as u32;
+                    self.write_raw_aechar_units(a0, &units)?;
+                    copied
                 }
-                let text = String::from_utf16_lossy(&units);
-                self.write_aechar(a0, &text, a1 as usize)?;
-                text.encode_utf16()
-                    .count()
-                    .min((a1 as usize).saturating_sub(1)) as u32
             }
             // `void wsprintf(AECHAR *dst, int nSize, const AECHAR *fmt, ...)` — mesma
             // gramática do `snprintf`, com origem e destino em UTF-16.
@@ -481,10 +541,42 @@ impl<C: CpuBackend> Machine<C> {
             }
             // `void strexpand(const byte *pSrc, int nCount, AECHAR *pDest, int nSize)`
             "strexpand" => {
-                let bytes = self.read_bytes(a0, a1)?;
-                let text: String = bytes.iter().map(|&b| b as char).collect();
-                let limit = self.cpu.read_reg(Reg::R3) as usize / 2;
-                self.write_aechar(a2, &text, limit)?;
+                if self.native_text_encoding() == NativeTextEncoding::EucKr {
+                    // AEEStdLib.h: STREXPAND dobra somente ASCII; os pares nativos
+                    // acima de 127 são copiados. Rainbow Six passa strlen=12 para
+                    // nove caracteres KSC5601, com nSize=100 bytes (não AECHARs).
+                    let capacity = (self.cpu.read_reg(Reg::R3) as i32).max(0) as usize / 2;
+                    if a2 != 0 && capacity != 0 {
+                        // A cópia anterior à escrita também suporta buffers sobrepostos.
+                        // O SDK não promete essa propriedade. Entrada truncada para antes
+                        // do par incompleto; nunca sai metade de AECHAR ou fora de nSize.
+                        let bytes = self.read_bytes(a0, (a1 as i32).max(0) as u32)?;
+                        let mut units = Vec::new();
+                        let mut index = 0;
+                        while index < bytes.len() && units.len() < capacity - 1 {
+                            let first = bytes[index];
+                            if first == 0 {
+                                break;
+                            }
+                            if first <= 127 {
+                                units.push(u16::from(first));
+                                index += 1;
+                            } else {
+                                let Some(&second) = bytes.get(index + 1).filter(|&&b| b != 0) else {
+                                    break;
+                                };
+                                units.push(u16::from_le_bytes([first, second]));
+                                index += 2;
+                            }
+                        }
+                        self.write_raw_aechar_units(a2, &units)?;
+                    }
+                } else {
+                    let bytes = self.read_bytes(a0, a1)?;
+                    let text: String = bytes.iter().map(|&b| b as char).collect();
+                    let limit = self.cpu.read_reg(Reg::R3) as usize / 2;
+                    self.write_aechar(a2, &text, limit)?;
+                }
                 SUCCESS
             }
             "wstrtofloat" => {
@@ -725,7 +817,7 @@ impl<C: CpuBackend> Machine<C> {
             // --- Memória, versão e depuração ------------------------------------------
             "sysfree" => {
                 self.solta_bitmap_nativo(a0);
-                self.heap.free(a0);
+                self.free_guest_allocation(a0);
                 SUCCESS
             }
             "err_strdup" => {
@@ -745,7 +837,7 @@ impl<C: CpuBackend> Machine<C> {
             "err_realloc" => {
                 let current = self.cpu.read_u32(a1)?;
                 let ptr = self.realloc(current, a0)?;
-                if ptr == 0 && a0 != 0 {
+                if ptr == 0 && a0 & !ALLOC_NO_ZMEM != 0 {
                     ENOMEMORY
                 } else {
                     self.cpu.write_u32(a1, ptr)?;
@@ -922,6 +1014,38 @@ impl<C: CpuBackend> Machine<C> {
             // dia" a partir daí e ficava girando — quinze milhões de voltas em dois métodos.
             "aee_GetTimeMS" | "aee_GetUpTimeMS" => self.elapsed_ms(),
             "aee_GetSeconds" => self.brew_seconds(),
+            "inet_aton" => {
+                let text = self.cpu.read_cstring(a0, MAX_STRING);
+                // O SDK aceita os delimitadores de host de URL, sem resolver DNS ou abrir rede.
+                let host = text.split([':', '/', ',']).next().unwrap_or("");
+                match host.parse::<std::net::Ipv4Addr>() {
+                    Ok(address) if a0 != 0 && a1 != 0 => {
+                        // InetAddr fica em ordem de rede na memória ARM, não em ordem do host.
+                        self.cpu.write_mem(a1, &address.octets())?;
+                        TRUE
+                    }
+                    _ => FALSE,
+                }
+            }
+            "inet_ntoa" => {
+                if a1 != 0 && a2 != 0 {
+                    let text = std::net::Ipv4Addr::from(a0.to_le_bytes()).to_string();
+                    self.write_cstring_limited(a1, &text, a2 as usize)?;
+                }
+                SUCCESS
+            }
+            "aee_JulianToSeconds" => {
+                if a0 == 0 {
+                    0
+                } else {
+                    let mut bytes = [0u8; 14];
+                    self.cpu.read_mem(a0, &mut bytes)?;
+                    let data = std::array::from_fn(|i| {
+                        u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]])
+                    });
+                    julian_seconds(data)
+                }
+            }
             // void GETJULIANDATE(uint32 dwSecs, JulianType *pDate)
             //
             // `dwSecs` é o relógio do BREW: segundos desde 6 de janeiro de 1980, GMT. Zero quer
@@ -1035,6 +1159,23 @@ impl<C: CpuBackend> Machine<C> {
         Ok(())
     }
 
+    // Helpers de cópia preservam unidades de 16 bits; apenas fronteiras de texto
+    // decodificam o contexto Unicode/nativo. O terminador não integra a contagem.
+    fn write_raw_aechar_units(&mut self, addr: u32, units: &[u16]) -> Result<(), CpuError> {
+        if addr == 0 {
+            return Ok(());
+        }
+        let bytes = units
+            .iter()
+            .copied()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        addr.checked_add(bytes.len() as u32)
+            .ok_or_else(|| CpuError("cópia AECHAR: destino fora da memória".into()))?;
+        self.cpu.write_mem(addr, &bytes)
+    }
+
     /// Escreve uma string `AECHAR` (UTF-16 little-endian, terminada em zero).
     ///
     /// `max_units` limita quantos `AECHAR` cabem no destino, terminador incluído.
@@ -1120,7 +1261,9 @@ fn atoi_de_c(texto: &str) -> i32 {
     let valor = resto
         .bytes()
         .take_while(u8::is_ascii_digit)
-        .fold(0i32, |acc, d| acc.wrapping_mul(10).wrapping_add(i32::from(d - b'0')));
+        .fold(0i32, |acc, d| {
+            acc.wrapping_mul(10).wrapping_add(i32::from(d - b'0'))
+        });
     match negativo {
         true => valor.wrapping_neg(),
         false => valor,
@@ -1147,7 +1290,10 @@ mod testes_do_makepath {
 
     #[test]
     fn junta_com_uma_barra_so() {
-        assert_eq!(junta_caminho("fs:/mod/274755", "tectoy.cfg"), "fs:/mod/274755/tectoy.cfg");
+        assert_eq!(
+            junta_caminho("fs:/mod/274755", "tectoy.cfg"),
+            "fs:/mod/274755/tectoy.cfg"
+        );
         assert_eq!(junta_caminho("fs:/mod/", "a.db"), "fs:/mod/a.db");
         assert_eq!(junta_caminho("", "a.db"), "a.db");
     }
@@ -1161,7 +1307,8 @@ mod testes_dos_ponteiros_estaticos {
     fn maquina() -> Machine<BackendPadrao> {
         let imagem = crate::loader::modfile::ModImage::parse(
             [0xe3a0_0000u32.to_le_bytes(), 0xe12f_ff1eu32.to_le_bytes()].concat(),
-        ).unwrap();
+        )
+        .unwrap();
         let modulo = crate::loader::load(&imagem).unwrap();
         let mut maquina = Machine::new(BackendPadrao::new().unwrap(), modulo, ".");
         maquina.cpu.reset(&maquina.module.mem).unwrap();
@@ -1171,7 +1318,10 @@ mod testes_dos_ponteiros_estaticos {
     fn troca(maquina: &mut Machine<BackendPadrao>, id: u32, novo: u32) -> u32 {
         maquina.cpu.write_reg(Reg::R0, id);
         maquina.cpu.write_reg(Reg::R1, novo);
-        maquina.helper_call(87).unwrap().expect("SETSTATICPTR foi atendido")
+        maquina
+            .helper_call(87)
+            .unwrap()
+            .expect("SETSTATICPTR foi atendido")
     }
 
     // O GETTLS do SDK lê com SETTLS(0) e restaura o valor com outra troca: retornar sempre
@@ -1189,7 +1339,11 @@ mod testes_dos_ponteiros_estaticos {
         assert_eq!(troca(&mut maquina, 0, 0), 0x2000_1000);
         maquina.cpu.write_reg(Reg::R0, 2);
         maquina.cpu.write_reg(Reg::R1, 0xffff_ffff);
-        assert_eq!(maquina.helper_call(87).unwrap(), None, "id não definido não é aceito");
+        assert_eq!(
+            maquina.helper_call(87).unwrap(),
+            None,
+            "id não definido não é aceito"
+        );
         assert_eq!(troca(&mut maquina, 1, 0), 0);
     }
 
@@ -1241,7 +1395,9 @@ mod testes_dos_ponteiros_estaticos {
         assert_eq!(troca(&mut depois, 1, 0), 0x1000_8000);
         depois.current_thread = None;
         let leitor = crate::save_state::Leitor::abre(&arquivo).unwrap();
-        let secoes: Vec<_> = leitor.nomes().into_iter()
+        let secoes: Vec<_> = leitor
+            .nomes()
+            .into_iter()
             .filter(|nome| *nome != "tab.ponteiros_estaticos")
             .map(|nome| (nome.to_string(), leitor.secao(nome).unwrap().to_vec()))
             .collect();

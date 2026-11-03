@@ -4635,6 +4635,7 @@ dependencies = [
  "discord-rich-presence",
  "dynarmic",
  "egui",
+ "encoding_rs",
  "flate2",
  "gilrs",
  "glow",

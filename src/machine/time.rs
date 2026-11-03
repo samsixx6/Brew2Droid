@@ -64,6 +64,7 @@ impl<C: CpuBackend> Machine<C> {
     pub(super) fn skip_idle_time(&mut self) {
         if self.handset_clock.is_some() { return; }
         let busy = !self.teclas.is_empty()
+            || !self.http_bodies.is_empty()
             || !self.pending_calls.is_empty()
             || !self.posted_calls.is_empty()
             || !self.pending_threads.is_empty()
@@ -75,6 +76,7 @@ impl<C: CpuBackend> Machine<C> {
             || self.media.values().any(|state| state.pendente.1 != 0)
             || !self.pending_signals.is_empty()
             || !self.deferred_callbacks.is_empty()
+            || self.legacy_socket_callbacks_pending()
             || self.rsa_pending();
         if busy {
             return;
@@ -186,6 +188,8 @@ impl<C: CpuBackend> Machine<C> {
             && self.avisos_de_imagem.is_empty()
             && self.pending_signals.is_empty()
             && self.deferred_callbacks.is_empty()
+            && self.http_bodies.is_empty()
+            && !self.legacy_socket_callbacks_pending()
             // **Um jogo que registrou interesse em entrada está esperando o jogador.** Chamar isso
             // de ocioso encerrava a sessão no meio da tela de título: o Crash Nitro Kart parava
             // aos 19,6 s, exatamente quando o intro acaba e o jogo passa a esperar "aperte start"
@@ -204,6 +208,7 @@ impl<C: CpuBackend> Machine<C> {
     /// antes se chegar entrada; uma continuação/fila pronta nunca pode dormir até um timer.
     pub fn next_guest_work_delay(&self) -> Option<std::time::Duration> {
         let ready = self.trecho_interrompido.is_some()
+            || self.http_bodies.keys().any(|&r|self.web_body_ready(r))
             || !self.quadros_do_update.is_empty()
             || !self.teclas.is_empty()
             || !self.pending_calls.is_empty()
@@ -216,7 +221,12 @@ impl<C: CpuBackend> Machine<C> {
             || !self.avisos_de_midia.is_empty()
             || self.media.values().any(|state| state.pendente.1 != 0)
             || !self.pending_signals.is_empty()
-            || !self.deferred_callbacks.is_empty()
+            || self.deferred_callbacks.iter().any(|&(pcb,owner)|
+                self.web_event_ready(owner) || !self.http_requests.contains_key(&owner)&&!self.http_bodies.contains_key(&owner)
+                || self.web_body_ready(owner)
+                || self.cpu.read_u32(pcb+8).ok()!=Some(callback::CANCEL_STUB)
+                || self.cpu.read_u32(pcb+12).ok()!=Some(pcb))
+            || self.legacy_socket_callbacks_pending()
             || self.rsa_pending();
         if ready { return Some(std::time::Duration::ZERO); }
         let now = self.now_ms();
@@ -229,7 +239,8 @@ impl<C: CpuBackend> Machine<C> {
             .map(|state| std::time::Duration::from_micros(state.ends_us.saturating_sub(now_us)))
             .min();
         let decode = (!self.cargas_em_decodificacao.is_empty()).then_some(std::time::Duration::from_millis(5));
-        timer.into_iter().chain(media).chain(decode).min()
+        let http = (!self.http_requests.is_empty()||!self.http_bodies.is_empty()).then_some(std::time::Duration::from_millis(10));
+        timer.into_iter().chain(media).chain(decode).chain(http).min()
     }
 
     /// O calendário do guest, em segundos desde 6 de janeiro de 1980 GMT.

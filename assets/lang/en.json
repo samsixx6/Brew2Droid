@@ -375,6 +375,7 @@
   "native.rescan_hint": "The library refreshes when you return.",
   "native.imported": "Imported games",
   "native.storage": "Storage access",
+  "native.internal_storage": "Internal storage",
   "native.choose_folder": "Choose this folder",
   "native.error": "Could not complete action",
   "handset.controls.enabled": "Enable on-screen buttons",

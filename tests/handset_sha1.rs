@@ -22,7 +22,7 @@ impl Harness {
             "sha1-hash-test-{}-{}", std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
-        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir(&work).unwrap();
         let storage = StoragePaths::from_root(work.join("runtime"));
         storage.create_dirs().unwrap();
         let image = ModImage::parse([0xe3a0_0000u32, 0xe12f_ff1e].into_iter()

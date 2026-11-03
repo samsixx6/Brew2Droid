@@ -50,7 +50,14 @@ pub fn parse_module(bytes: Vec<u8>) -> Result<ModImage, ParseError> {
         return Err(ParseError::InvalidEntry);
     }
     if let Some(header) = module.header() {
-        if header.version != 1 || header.code_offset != 0x40 || entry < 0x40 {
+        // Vlingo usa o cabeçalho v2 com dois campos extras, mantendo os branches
+        // ARM e a ABI de AEEMod_Load. Não tratar sua entrada válida 0x48 como v1.
+        let minimum = match (header.version, header.code_offset) {
+            (1, 0x40) => 0x40,
+            (2, 0x48) => 0x48,
+            _ => return Err(ParseError::InvalidEntry),
+        };
+        if entry < minimum {
             return Err(ParseError::InvalidEntry);
         }
     }
@@ -113,7 +120,7 @@ impl From<ParseError> for PackageError {
     }
 }
 
-fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, PackageError> {
+pub(super) fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, PackageError> {
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > limit {
@@ -191,6 +198,8 @@ pub struct InspectedPackage {
     pub report: PackageReport,
     pub image: ModImage,
     pub mif: MifFile,
+    /// Bytes realmente validados; o launcher não relê um manifesto que pode mudar.
+    pub mif_bytes: Vec<u8>,
 }
 
 /// A abertura precisa só do módulo e manifesto. Arquivos vizinhos podem ser outros jogos.
@@ -238,6 +247,7 @@ pub fn read_module_pair(source: &Path, mif: &Path) -> Result<InspectedPackage, P
         report,
         image,
         mif: parsed_mif,
+        mif_bytes,
     })
 }
 

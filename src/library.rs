@@ -25,6 +25,11 @@ const MAX_DEPTH: usize = 8;
 /// Teto de jogos por varredura, para uma pasta escolhida sem querer não travar a interface.
 const MAX_GAMES: usize = 2000;
 
+// A busca conta arquivos de dados além dos módulos. 4000 entradas não cobriam nem
+// os 674 módulos/5581 arquivos da coleção auditada, escondendo motores no fim da ordem.
+// O teto continua global e a profundidade permanece três, sem subir de coleção.
+const MAX_SHARED_EXTENSION_ENTRIES: usize = 65_536;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Game {
     /// Como o jogo aparece na lista.
@@ -211,8 +216,14 @@ pub fn detecta_z_wheel(roms: Option<&Path>, jogos: &[Game]) -> Option<PathBuf> {
 fn describe(path: PathBuf, index:&crate::handset::mif_lookup::Index) -> Option<Game> {
     let packed = crate::loader::archive::embalado(&path);
     if !packed {
-        let data=manifest_with_index(&path,index);
-        let clsid = data.as_deref().and_then(|data|MifFile::parse(data).ok()).and_then(|mif|mif.main_applet())
+        let executable_class = matching_manifest_with_index(&path,index).is_ok_and(|(mif,_)| mif.is_none())
+            .then(|| crate::handset::launch::executable_class(&path)).flatten();
+        // A abertura auditada já determinou a classe sem manifesto. Um MIF
+        // alheio encontrado pela busca legada não pode trocar a classe nem a arte.
+        let data = if executable_class.is_some() { None } else { manifest_with_index(&path,index) };
+        let clsid = executable_class
+            .or_else(|| data.as_deref().and_then(|data|MifFile::parse(data).ok()).and_then(|mif|mif.main_applet()))
+            .or_else(|| data.as_deref().and_then(|data|crate::handset::launch::opaque_metadata_class(&path,data)))
             .or_else(||if index.shared {None}else{applet_clsid(&path)});
         // O catálogo legado procura outro MIF local quando o primeiro é de extensão.
         // Essa identificação do applet precisa acontecer antes de excluir a linha.
@@ -400,10 +411,13 @@ pub fn applet_clsid(mod_path: &Path) -> Option<u32> {
     match index.find(mod_path) {
         Err(_)=>return None,
         Ok(Some(path))=>{
-            let applet=std::fs::read(path).ok().and_then(|data|MifFile::parse(&data).ok()).and_then(|mif|mif.main_applet());
+            let applet=std::fs::read(path).ok().and_then(|data|MifFile::parse(&data).ok().and_then(|mif|mif.main_applet())
+                .or_else(||crate::handset::launch::opaque_metadata_class(mod_path,&data)));
             if index.shared||applet.is_some(){return applet;}
         },
-        Ok(None)=>{},
+        Ok(None)=>{
+            if let Some(class)=crate::handset::launch::executable_class(mod_path){return Some(class);}
+        },
     }
     if index.shared{return None;}
     manifest_paths(mod_path)
@@ -419,13 +433,20 @@ pub fn resolve_mif(mod_path:&Path)->Result<PathBuf,String>{
     index.find(mod_path)?.ok_or_else(||format!("No matching MIF for {} or its game folder. Place it beside the module or under games/Mif.",mod_path.display()))
 }
 
+fn matching_manifest_with_index(path:&Path,index:&crate::handset::mif_lookup::Index)->Result<(Option<PathBuf>,bool),String>{
+    // O índice da coleção pode não conhecer Game/Mif. A ausência só é final
+    // depois de consultar o mesmo índice local usado na abertura do applet.
+    let selected=index.find(path)?;
+    if selected.is_some()||index.shared{return Ok((selected,index.shared));}
+    let parent=path.parent().ok_or("Module has no game folder")?;
+    let local=crate::handset::mif_lookup::Index::for_root(parent);
+    Ok((local.find(path)?,local.shared))
+}
+
 fn manifest_with_index(path:&Path,index:&crate::handset::mif_lookup::Index)->Option<Vec<u8>>{
-    // Reusar os diretórios já vistos evita reler a coleção para cada pacote local.
-    match index.find(path){Ok(Some(p))=>return std::fs::read(p).ok(),Err(_)=>return None,Ok(None)=>{}}
-    if index.shared {return None;}
-    let local=crate::handset::mif_lookup::Index::for_root(path.parent()?);
-    match local.find(path){Ok(Some(p))=>return std::fs::read(p).ok(),Err(_)=>return None,Ok(None)=>{}}
-    if local.shared{return None;}
+    let (selected,shared)=matching_manifest_with_index(path,index).ok()?;
+    if let Some(selected)=selected{return std::fs::read(selected).ok();}
+    if shared{return None;}
     manifest(path)
 }
 
@@ -461,13 +482,27 @@ pub fn extensoes(mod_path: &Path) -> Vec<(PathBuf, Vec<u32>)> {
 
     // O registro de classe também aparece no MIF de quem depende dela. Só o MIF
     // exato do applet define as importações; um manifesto vizinho não serve aqui.
-    let mif_jogo = mif_da_pasta(mod_path);
-    let mut faltantes: BTreeSet<u32> = mif_jogo.as_deref()
-        .and_then(|mif| le_arquivo_de_extensao(mif, 1024 * 1024))
-        .and_then(|data| crate::handset::package::parse_mif(&data).ok())
+    // A importação deve vir do mesmo manifesto que launch::read selecionou,
+    // inclusive Mod/game/renamed.mod com Mif/renamed.mif compartilhado.
+    let mif_jogo = match crate::handset::mif_lookup::Index::for_root(mod_path.parent().unwrap()).find(mod_path) {
+        Ok(Some(path)) => Some(path),
+        Ok(None) => mif_da_pasta(mod_path),
+        Err(_) => None,
+    };
+    let mif_data = mif_jogo.as_deref()
+        .and_then(|mif| le_arquivo_de_extensao(mif, 1024 * 1024));
+    let mut faltantes: BTreeSet<u32> = mif_data.as_deref()
+        .and_then(|data| crate::handset::package::parse_mif(data).ok())
         .filter(|mif| !mif.applets.is_empty())
         .map(|mif| mif.classes.into_iter().collect())
         .unwrap_or_default();
+    // O consumidor portado importa a classe real do provedor; a exceção exige
+    // ambos os arquivos originais, sem alterar ou interpretar metadados opacos.
+    if let Some(imports) = mif_data.as_deref()
+        .and_then(|data| crate::handset::launch::opaque_metadata_dependencies(mod_path, data))
+    {
+        faltantes.extend(imports.iter().copied());
+    }
     for (_, classes) in &extensoes {
         for class in classes {
             faltantes.remove(class);
@@ -494,9 +529,11 @@ pub fn extensoes(mod_path: &Path) -> Vec<(PathBuf, Vec<u32>)> {
         return extensoes;
     };
     let mut compartilhados = Vec::new();
-    let mut restantes = 4000;
+    let mut restantes = MAX_SHARED_EXTENSION_ENTRIES;
     colhe_modulos_compartilhados(colecao, 3, &mut restantes, &mut compartilhados);
     compartilhados.sort();
+    let mut classes_registradas: BTreeSet<u32> = extensoes.iter()
+        .flat_map(|(_, classes)| classes.iter().copied()).collect();
     for caminho in compartilhados {
         if caminho.starts_with(pacote) {
             continue;
@@ -520,14 +557,15 @@ pub fn extensoes(mod_path: &Path) -> Vec<(PathBuf, Vec<u32>)> {
         {
             continue;
         }
-        // Só o primeiro provedor ordenado recebe cada classe faltante. Nove
-        // cópias do mesmo motor não devem consumir nove regiões de extensão.
-        let classes: Vec<_> = mif
-            .extensao()
-            .iter()
-            .copied()
-            .filter(|class| faltantes.remove(class))
-            .collect();
+        // A importação seleciona o módulo, mas suas fábricas também podem criar
+        // outras classes que ele exporta: bf2gen cria 0x010179c6 internamente.
+        // Registrar apenas as importações do applet apagava essa fábrica real.
+        // Pacotes locais e provedores anteriores continuam donos das classes já vistas.
+        let classes: Vec<_> = mif.extensao().iter().copied()
+            .filter(|class| classes_registradas.insert(*class)).collect();
+        for class in &classes {
+            faltantes.remove(class);
+        }
         if !classes.is_empty() {
             extensoes.push((caminho, classes));
         }

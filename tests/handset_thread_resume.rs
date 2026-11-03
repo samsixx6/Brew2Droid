@@ -24,7 +24,7 @@ impl Harness {
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
-        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir(&work).unwrap();
         let storage = StoragePaths::from_root(work.join("runtime"));
         storage.create_dirs().unwrap();
         let mut code = vec![0u8; 0x100];

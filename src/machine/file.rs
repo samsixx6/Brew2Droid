@@ -2,10 +2,201 @@
 
 use super::*;
 
+const MAX_USAGE_SCAN_ENTRIES: usize = 131_072;
+const MAX_USAGE_NAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_USAGE_DEPTH: usize = 64;
+// AEEError.h, FILE_ERROR. Não confundir EFILENOEXISTS com EFAILED=1.
+const FILE_EXISTS: u32 = 0x100;
+const FILE_NOT_FOUND: u32 = 0x101;
+const DIRECTORY_NOT_EMPTY: u32 = 0x102;
+const BAD_FILE_NAME: u32 = 0x103;
+const BAD_SEEK_POSITION: u32 = 0x104;
+const FILE_EOF: u32 = 0x105;
+const FILE_SYSTEM_FULL: u32 = 0x106;
+const DIRECTORY_NOT_FOUND: u32 = 0x109;
+const INVALID_FILE_OPERATION: u32 = 0x10a;
+const SEEK_START: u32 = 0;
+
 impl<C: CpuBackend> Machine<C> {
     /// Raiz do sistema de arquivos que o jogo enxerga.
     pub fn file_root(&self) -> &std::path::Path {
         self.vfs.root()
+    }
+
+    fn missing_file_error(path: &std::path::Path) -> u32 {
+        match path.parent().map(std::fs::metadata) {
+            Some(Ok(parent)) if parent.is_dir() => FILE_NOT_FOUND,
+            Some(Ok(_)) => DIRECTORY_NOT_FOUND,
+            Some(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                DIRECTORY_NOT_FOUND
+            }
+            _ => EFAILED,
+        }
+    }
+
+    fn file_path_error(&self, guest: &str) -> u32 {
+        if self.vfs.resolve_new(guest).is_none() {
+            return BAD_FILE_NAME;
+        }
+        // O pai pode existir só no overlay. Manter a barra final preserva
+        // raízes como fs:/ e fs:/~/ ao separar o último componente.
+        let normalized = guest.replace('\\', "/");
+        let parent = normalized.rfind('/').map_or("", |at| &normalized[..=at]);
+        let directory = self
+            .vfs
+            .resolve(parent)
+            .or_else(|| self.vfs.overlay_dir(parent))
+            .or_else(|| self.vfs.resolve_dir(parent));
+        match directory.map(std::fs::metadata) {
+            Some(Ok(meta)) if meta.is_dir() => FILE_NOT_FOUND,
+            Some(Ok(_)) => DIRECTORY_NOT_FOUND,
+            Some(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                DIRECTORY_NOT_FOUND
+            }
+            None => BAD_FILE_NAME,
+            _ => EFAILED,
+        }
+    }
+
+    fn file_guest_io_error(
+        &self,
+        error: &std::io::Error,
+        guest: &str,
+        path: Option<&std::path::Path>,
+    ) -> u32 {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            self.file_path_error(guest)
+        } else {
+            Self::file_io_error(error, path)
+        }
+    }
+
+    fn file_io_error(error: &std::io::Error, path: Option<&std::path::Path>) -> u32 {
+        use std::io::ErrorKind;
+        match error.kind() {
+            ErrorKind::NotFound => path.map_or(FILE_NOT_FOUND, Self::missing_file_error),
+            ErrorKind::NotADirectory => DIRECTORY_NOT_FOUND,
+            ErrorKind::AlreadyExists => FILE_EXISTS,
+            ErrorKind::DirectoryNotEmpty => DIRECTORY_NOT_EMPTY,
+            ErrorKind::InvalidInput => BAD_FILE_NAME,
+            ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::WriteZero => {
+                FILE_SYSTEM_FULL
+            }
+            ErrorKind::UnexpectedEof => FILE_EOF,
+            ErrorKind::OutOfMemory => ENOMEMORY,
+            // Permissão do host, falha do dispositivo etc. não provam arquivo ausente.
+            _ => EFAILED,
+        }
+    }
+
+    /// Mede arquivos visíveis do módulo, sem contar duas vezes um seed sombreado
+    /// pelo overlay. Não segue links nem enumera a raiz dos outros aplicativos.
+    fn module_file_usage(&self) -> Option<(u16, u32)> {
+        let root = self.vfs.root().to_path_buf();
+        let mut allowed = vec![root.canonicalize().ok()?];
+        let mut pending = vec![(root.clone(), String::new(), 0usize)];
+        if let Some(overlay) = self.vfs.overlay_dir("") {
+            if overlay != root && overlay.exists() {
+                allowed.push(overlay.canonicalize().ok()?);
+                pending.push((overlay, String::new(), 0));
+            }
+        }
+        let mut names = std::collections::BTreeMap::<String, String>::new();
+        let mut visited = std::collections::BTreeSet::new();
+        let mut scanned = 0usize;
+        let mut name_bytes = 0usize;
+        while let Some((directory, prefix, depth)) = pending.pop() {
+            let canonical = directory.canonicalize().ok()?;
+            if !allowed.iter().any(|base| canonical.starts_with(base))
+                || !visited.insert(canonical.clone())
+            {
+                continue;
+            }
+            for entry in std::fs::read_dir(canonical).ok()? {
+                let entry = entry.ok()?;
+                scanned = scanned.checked_add(1)?;
+                if scanned > MAX_USAGE_SCAN_ENTRIES {
+                    return None;
+                }
+                let os_name = entry.file_name();
+                if os_name == crate::loader::archive::MANIFESTO
+                    || os_name == crate::brew::vfs::DELETIONS_DIR
+                {
+                    continue;
+                }
+                let kind = entry.file_type().ok()?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                let name = os_name.to_str()?;
+                let guest = if prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                name_bytes = name_bytes.checked_add(guest.len())?;
+                if guest.len() >= MAX_STRING || name_bytes > MAX_USAGE_NAME_BYTES {
+                    return None;
+                }
+                if kind.is_dir() {
+                    if depth >= MAX_USAGE_DEPTH {
+                        return None;
+                    }
+                    // Junctions/reparse points nem sempre são marcados como
+                    // links por file_type: conferir antes de entrar na fila.
+                    let canonical = entry.path().canonicalize().ok()?;
+                    if allowed.iter().any(|base| canonical.starts_with(base))
+                        && !visited.contains(&canonical)
+                    {
+                        pending.push((canonical, guest, depth + 1));
+                    }
+                } else if kind.is_file() {
+                    // O namespace do aparelho não diferencia caixa ASCII.
+                    names.entry(guest.to_ascii_lowercase()).or_insert(guest);
+                }
+            }
+        }
+        let mut files = 0u16;
+        let mut used = 0u32;
+        for guest in names.values() {
+            let Some(path) = self.vfs.resolve(guest) else {
+                continue; // Exclusão persistida no overlay.
+            };
+            if std::fs::symlink_metadata(&path)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                continue;
+            }
+            let canonical = path.canonicalize().ok()?;
+            if !allowed.iter().any(|base| canonical.starts_with(base)) {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(canonical).ok()?;
+            if !metadata.is_file() {
+                continue;
+            }
+            files = files.checked_add(1)?;
+            used = used.checked_add(u32::try_from(metadata.len()).ok()?)?;
+            if used > FS_TOTAL_BYTES {
+                return None;
+            }
+        }
+        Some((files, used))
     }
 
     /// Arquivos que o jogo pediu e não foram encontrados.
@@ -51,6 +242,34 @@ impl<C: CpuBackend> Machine<C> {
             }
             maquina.fs_log.push_back(linha);
         };
+        // O erro é do applet, como GETLASTERROR dos helpers e o save existente.
+        // Consultar o erro e mexer nas referências não são operações de arquivo.
+        if matches!(
+            name,
+            "OpenFile"
+                | "GetInfo"
+                | "GetInfoEx"
+                | "Test"
+                | "Remove"
+                | "Rename"
+                | "MkDir"
+                | "RmDir"
+                | "GetFreeSpace"
+                | "GetFreeSpaceEx"
+                | "GetFileUseInfo"
+                | "EnumInit"
+                | "EnumNext"
+                | "ResolvePath"
+                | "Read"
+                | "Write"
+                | "Seek"
+                | "Truncate"
+                | "SetCacheSize"
+                | "Map"
+                | "Cancel"
+        ) {
+            self.file_error = EFAILED;
+        }
         let result = match name {
             "AddRef" => self.objects.add_ref(this),
             "Release" => {
@@ -65,7 +284,12 @@ impl<C: CpuBackend> Machine<C> {
             // Devolve o ponteiro do arquivo, não um código de erro.
             "OpenFile" => {
                 let guest_path = self.cpu.read_cstring(a1, MAX_STRING);
-                self.open_file(&guest_path, a2)?
+                if a1 == 0 {
+                    self.file_error = EBADPARM;
+                    0
+                } else {
+                    self.open_file(&guest_path, a2)?
+                }
             }
             // int GetInfo(IFileMgr *, const char *pszName, FileInfo *pInfo)
             "GetInfo" if iface == Interface::FileMgr => {
@@ -86,12 +310,23 @@ impl<C: CpuBackend> Machine<C> {
                 } else {
                     self.vfs.resolve(&guest_path)
                 };
-                match path.and_then(|p| std::fs::metadata(&p).ok()) {
-                    Some(meta) => {
-                        self.write_file_info(a2, &guest_path, &meta)?;
-                        SUCCESS
+                match path {
+                    Some(path) => match std::fs::metadata(&path) {
+                        Ok(meta) => {
+                            self.file_error = EBADPARM;
+                            self.write_file_info(a2, &guest_path, &meta)?;
+                            SUCCESS
+                        }
+                        Err(error) => {
+                            self.file_error =
+                                self.file_guest_io_error(&error, &guest_path, Some(&path));
+                            EFAILED
+                        }
+                    },
+                    None => {
+                        self.file_error = self.file_path_error(&guest_path);
+                        EFAILED
                     }
-                    None => EFAILED,
                 }
             }
             // int GetInfoEx(IFile *, AEEFileInfoEx *pInfo)
@@ -116,15 +351,19 @@ impl<C: CpuBackend> Machine<C> {
                 /// Quanto da struct preenchemos. Ver acima o porquê de não ser mais.
                 const QUANTO: usize = 0x10;
 
-                let tamanho = self
-                    .open_files
-                    .get(&this)
-                    .and_then(|aberto| aberto.file.metadata().ok())
-                    .map(|meta| meta.len() as u32);
-                let Some(tamanho) = tamanho else {
+                let Some(open) = self.open_files.get(&this) else {
+                    self.file_error = EBADPARM;
                     return Ok(Some(EBADPARM));
                 };
+                let tamanho = match open.file.metadata() {
+                    Ok(meta) => meta.len() as u32,
+                    Err(error) => {
+                        self.file_error = Self::file_io_error(&error, Some(&open.caminho));
+                        return Ok(Some(EFAILED));
+                    }
+                };
                 if a1 != 0 {
+                    self.file_error = EBADPARM;
                     self.cpu.write_mem(a1, &[0u8; QUANTO])?;
                     self.cpu.write_u32(a1 + TAMANHO, tamanho)?;
                 }
@@ -133,16 +372,27 @@ impl<C: CpuBackend> Machine<C> {
             // int GetInfo(IFile *, FileInfo *pInfo)
             "GetInfo" if iface == Interface::File => match self.open_files.get(&this) {
                 Some(open) => {
-                    let (path, meta) = (open.guest_path.clone(), open.file.metadata().ok());
+                    let (path, host_path, meta) = (
+                        open.guest_path.clone(),
+                        open.caminho.clone(),
+                        open.file.metadata(),
+                    );
                     match meta {
-                        Some(meta) => {
+                        Ok(meta) => {
+                            self.file_error = EBADPARM;
                             self.write_file_info(a1, &path, &meta)?;
                             SUCCESS
                         }
-                        None => EFAILED,
+                        Err(error) => {
+                            self.file_error = Self::file_io_error(&error, Some(&host_path));
+                            EFAILED
+                        }
                     }
                 }
-                None => EBADPARM,
+                None => {
+                    self.file_error = EBADPARM;
+                    EBADPARM
+                }
             },
             "Test" => {
                 let guest_path = self.cpu.read_cstring(a1, MAX_STRING);
@@ -150,18 +400,46 @@ impl<C: CpuBackend> Machine<C> {
                 // Z-Wheel testa sua existência antes de abri-lo. O `OpenFile` o materializa no
                 // perfil logo em seguida.
                 if guest_path.eq_ignore_ascii_case("preloaded.cfg") {
+                    self.file_error = SUCCESS;
                     return Ok(Some(SUCCESS));
                 }
-                match self.vfs.resolve(&guest_path) {
-                    Some(path) if path.exists() => SUCCESS,
-                    _ => EFAILED,
+                // Test aceita arquivos e diretórios; "" e "." nomeiam a raiz
+                // do aplicativo. OpenFile mantém a resolução que recusa a raiz.
+                // A alternativa só admite diretórios: um arquivo apagado no
+                // overlay não pode reaparecer a partir do pacote original.
+                let path = self.vfs.resolve(&guest_path).or_else(|| {
+                    self.vfs
+                        .resolve_dir(&guest_path)
+                        .filter(|path| path.is_dir())
+                });
+                match path {
+                    Some(path) => match std::fs::metadata(&path) {
+                        Ok(_) => SUCCESS,
+                        Err(error) => {
+                            self.file_error =
+                                self.file_guest_io_error(&error, &guest_path, Some(&path));
+                            EFAILED
+                        }
+                    },
+                    None => {
+                        self.file_error = self.file_path_error(&guest_path);
+                        EFAILED
+                    }
                 }
             }
             "Remove" => {
                 let guest_path = self.cpu.read_cstring(a1, MAX_STRING);
+                let Some(path) = self.vfs.resolve_new(&guest_path) else {
+                    self.file_error = BAD_FILE_NAME;
+                    return Ok(Some(EFAILED));
+                };
                 match self.vfs.remove_file(&guest_path) {
                     Ok(()) => SUCCESS,
-                    Err(_) => EFAILED,
+                    Err(error) => {
+                        self.file_error =
+                            self.file_guest_io_error(&error, &guest_path, Some(&path));
+                        EFAILED
+                    }
                 }
             }
             // int IFILEMGR_Rename(IFileMgr *, const char *pszSrc, const char *pszDest)
@@ -192,24 +470,60 @@ impl<C: CpuBackend> Machine<C> {
                         };
                         match resultado {
                             Ok(()) => SUCCESS,
-                            Err(_) => EFAILED,
+                            Err(error) => {
+                                self.file_error = Self::file_io_error(&error, Some(&para));
+                                EFAILED
+                            }
                         }
                     }
-                    _ => EFAILED,
+                    _ => {
+                        self.file_error = if self.vfs.resolve_new(&destino).is_none() {
+                            BAD_FILE_NAME
+                        } else {
+                            self.file_path_error(&origem)
+                        };
+                        EFAILED
+                    }
                 }
             }
             "MkDir" => {
                 let guest_path = self.cpu.read_cstring(a1, MAX_STRING);
-                match self.vfs.resolve(&guest_path) {
-                    Some(path) if std::fs::create_dir_all(&path).is_ok() => SUCCESS,
-                    _ => EFAILED,
+                match self.vfs.resolve(&guest_path).or_else(|| {
+                    self.vfs
+                        .resolve_dir(&guest_path)
+                        .filter(|path| path.is_dir())
+                }) {
+                    Some(path) => match std::fs::create_dir_all(&path) {
+                        Ok(()) => SUCCESS,
+                        Err(error) => {
+                            self.file_error = Self::file_io_error(&error, Some(&path));
+                            EFAILED
+                        }
+                    },
+                    None => {
+                        self.file_error = BAD_FILE_NAME;
+                        EFAILED
+                    }
                 }
             }
             "RmDir" => {
                 let guest_path = self.cpu.read_cstring(a1, MAX_STRING);
                 match self.vfs.resolve(&guest_path) {
-                    Some(path) if std::fs::remove_dir(&path).is_ok() => SUCCESS,
-                    _ => EFAILED,
+                    Some(path) => match std::fs::remove_dir(&path) {
+                        Ok(()) => SUCCESS,
+                        Err(error) => {
+                            self.file_error = if error.kind() == std::io::ErrorKind::NotFound {
+                                DIRECTORY_NOT_FOUND
+                            } else {
+                                Self::file_io_error(&error, Some(&path))
+                            };
+                            EFAILED
+                        }
+                    },
+                    None => {
+                        self.file_error = BAD_FILE_NAME;
+                        EFAILED
+                    }
                 }
             }
             // uint32 GetFreeSpace(IFileMgr *, uint32 *pdwTotal)
@@ -217,9 +531,32 @@ impl<C: CpuBackend> Machine<C> {
             // Devolve o **livre** e escreve o **total** no ponteiro, se houver.
             "GetFreeSpace" => {
                 if a1 != 0 {
+                    self.file_error = EBADPARM;
                     self.cpu.write_u32(a1, FS_TOTAL_BYTES)?;
                 }
                 FS_FREE_BYTES
+            }
+            "GetFileUseInfo" => {
+                // AEEFile.h: dois uint16 e dois uint32, sem campo de tamanho.
+                // As cotas são as do aparelho virtual; uso é o do módulo atual,
+                // enquanto GetFreeSpace informa o livre global do sistema.
+                let mut bytes = [0; 12];
+                if a1 == 0
+                    || a1.checked_add(11).is_none()
+                    || self.cpu.read_mem(a1, &mut bytes).is_err()
+                {
+                    self.file_error = EBADPARM;
+                    EFAILED
+                } else if let Some((files, used)) = self.module_file_usage() {
+                    bytes[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+                    bytes[2..4].copy_from_slice(&files.to_le_bytes());
+                    bytes[4..8].copy_from_slice(&FS_TOTAL_BYTES.to_le_bytes());
+                    bytes[8..].copy_from_slice(&used.to_le_bytes());
+                    self.cpu.write_mem(a1, &bytes)?;
+                    SUCCESS
+                } else {
+                    EFAILED
+                }
             }
             // int GetFreeSpaceEx(IFileMgr *, const char *cpszPath, uint32 *pdwTotal,
             //                    uint32 *pdwFree)
@@ -238,12 +575,15 @@ impl<C: CpuBackend> Machine<C> {
                 // `fs:/card0/` é a forma de o jogo perguntar por um. `EUNSUPPORTED` é a resposta
                 // documentada, e é o que faz o jogo usar o sistema principal.
                 if !caminho.is_empty() && !caminho.starts_with("fs:/") {
+                    self.file_error = EUNSUPPORTED;
                     return Ok(Some(EUNSUPPORTED));
                 }
                 if out_total != 0 {
+                    self.file_error = EBADPARM;
                     self.cpu.write_u32(out_total, FS_TOTAL_BYTES)?;
                 }
                 if out_livre != 0 {
+                    self.file_error = EBADPARM;
                     self.cpu.write_u32(out_livre, FS_FREE_BYTES)?;
                 }
                 SUCCESS
@@ -253,8 +593,54 @@ impl<C: CpuBackend> Machine<C> {
             // A listagem inteira sai daqui, de uma vez. O BREW deixa o estado dentro do
             // `IFileMgr`, e é o que fazemos: a fila é do gerenciador, não global.
             "EnumInit" => {
-                let guest_dir = self.cpu.read_cstring(a1, MAX_STRING);
-                let entries = self.list_dir(&guest_dir, a2 != 0);
+                let query = self.cpu.read_cstring(a1, MAX_STRING);
+                // Uma inicialização recusada não pode continuar a fila anterior.
+                self.enumerations.remove(&this);
+                // A biblioteca QX passa `data\\*.qxm` e `data\\*.qxa` aqui,
+                // antes de abrir os recursos que realmente estão no pacote. O
+                // SDK descreve apenas diretórios; esta extensão de compatibilidade
+                // aceita uma máscara de sufixo no último componente, sem expandir
+                // diretórios nem desviar da resolução normal do VFS.
+                let normalized = query.replace('\\', "/");
+                let (parent, leaf) = match normalized.rsplit_once('/') {
+                    Some((_, leaf)) => (&normalized[..normalized.len() - leaf.len()], leaf),
+                    None => ("", normalized.as_str()),
+                };
+                let suffix = leaf.strip_prefix('*').filter(|suffix| {
+                    suffix.is_empty()
+                        || (suffix.starts_with('.')
+                            && suffix.len() > 1
+                            && !suffix.contains(['*', '?']))
+                });
+                let guest_dir = if suffix.is_some() { parent } else { &query };
+                // A raiz absoluta de um módulo é diretório, não arquivo. O save
+                // também pode criar uma pasta que ainda não existe no pacote.
+                let directory = self
+                    .vfs
+                    .overlay_dir(guest_dir)
+                    .or_else(|| self.vfs.resolve_dir(guest_dir));
+                let Some(directory) = directory else {
+                    self.file_error = BAD_FILE_NAME;
+                    return Ok(Some(EFAILED));
+                };
+                if let Err(error) = std::fs::read_dir(&directory) {
+                    self.file_error = if error.kind() == std::io::ErrorKind::NotFound {
+                        DIRECTORY_NOT_FOUND
+                    } else {
+                        Self::file_io_error(&error, Some(&directory))
+                    };
+                    return Ok(Some(EFAILED));
+                }
+                let mut entries = self.list_dir(guest_dir, a2 != 0);
+                if let Some(suffix) = suffix {
+                    entries.retain(|name| {
+                        name.rsplit('/').next().is_some_and(|name| {
+                            name.len() >= suffix.len()
+                                && name.as_bytes()[name.len() - suffix.len()..]
+                                    .eq_ignore_ascii_case(suffix.as_bytes())
+                        })
+                    });
+                }
                 self.enumerations.insert(this, entries);
                 SUCCESS
             }
@@ -282,7 +668,7 @@ impl<C: CpuBackend> Machine<C> {
                         .vfs
                         .resolve(&guest)
                         .filter(|p| p.exists())
-                        .or_else(|| self.vfs.resolve_dir(&guest))
+                        .or_else(|| self.vfs.resolve_dir(&guest).filter(|path| path.is_dir()))
                         .and_then(|p| p.metadata().ok());
                     if let Some(meta) = meta {
                         proxima = Some((guest, meta));
@@ -291,6 +677,7 @@ impl<C: CpuBackend> Machine<C> {
                 }
                 match proxima {
                     Some((guest, meta)) => {
+                        self.file_error = EBADPARM;
                         self.write_file_info(a1, &guest, &meta)?;
                         TRUE
                     }
@@ -303,6 +690,7 @@ impl<C: CpuBackend> Machine<C> {
             "GetLastError" => self.file_error,
             // int ResolvePath(IFileMgr *, const char *cpszIn, char *pszOut, int *pnOutLen)
             "ResolvePath" => {
+                self.file_error = EBADPARM;
                 let guest_path = self.cpu.read_cstring(a1, MAX_STRING);
                 let limit = if a3 != 0 {
                     self.cpu.read_u32(a3)? as usize
@@ -325,15 +713,30 @@ impl<C: CpuBackend> Machine<C> {
             "Read" => {
                 // O tamanho vem do jogo: conferido antes de alocar, ou um pedido absurdo derruba o
                 // processo em vez de virar erro de API.
+                self.file_error = EBADPARM;
                 let count = tamanho_do_guest(a2 as usize)?;
                 let mut buffer = vec![0u8; count];
                 let read = match self.open_files.get_mut(&this) {
                     Some(open) => {
                         let mut lidos = 0;
+                        self.file_error = SUCCESS;
                         while lidos < count {
                             match std::io::Read::read(&mut open.file, &mut buffer[lidos..]) {
-                                Ok(0) | Err(_) => break,
+                                Ok(0) => {
+                                    if lidos == 0 {
+                                        self.file_error = FILE_EOF;
+                                    }
+                                    break;
+                                }
                                 Ok(n) => lidos += n,
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.file_error =
+                                        Self::file_io_error(&error, Some(&open.caminho));
+                                    break;
+                                }
                             }
                         }
                         lidos
@@ -341,7 +744,10 @@ impl<C: CpuBackend> Machine<C> {
                     None => 0,
                 };
                 if read > 0 {
+                    let completed_error = self.file_error;
+                    self.file_error = EBADPARM;
                     self.cpu.write_mem(a1, &buffer[..read])?;
+                    self.file_error = completed_error;
                     // A leitura pode preencher diretamente o raster público de um IDIB.
                     // A escrita feita pelo host precisa acordar a sincronização da tela.
                     self.cpu.marca_sujo(a1, read as u32);
@@ -350,9 +756,27 @@ impl<C: CpuBackend> Machine<C> {
             }
             // uint32 Write(IFile *, const void *pBuffer, uint32 dwCount)
             "Write" => {
+                let Some(open) = self.open_files.get(&this) else {
+                    self.file_error = EBADPARM;
+                    return Ok(Some(0));
+                };
+                if !open.escrita {
+                    self.file_error = INVALID_FILE_OPERATION;
+                    return Ok(Some(0));
+                }
+                self.file_error = EBADPARM;
                 let bytes = self.read_bytes(a1, a2)?;
                 match self.open_files.get_mut(&this) {
-                    Some(open) => std::io::Write::write(&mut open.file, &bytes).unwrap_or(0) as u32,
+                    Some(open) => match std::io::Write::write(&mut open.file, &bytes) {
+                        Ok(written) => {
+                            self.file_error = SUCCESS;
+                            written as u32
+                        }
+                        Err(error) => {
+                            self.file_error = Self::file_io_error(&error, Some(&open.caminho));
+                            0
+                        }
+                    },
                     None => 0,
                 }
             }
@@ -362,30 +786,92 @@ impl<C: CpuBackend> Machine<C> {
                 let from = match a1 {
                     SEEK_END => std::io::SeekFrom::End(position),
                     SEEK_CURRENT => std::io::SeekFrom::Current(position),
-                    _ => std::io::SeekFrom::Start(position.max(0) as u64),
+                    SEEK_START if position >= 0 => std::io::SeekFrom::Start(position as u64),
+                    SEEK_START => {
+                        self.file_error = BAD_SEEK_POSITION;
+                        return Ok(Some(EFAILED));
+                    }
+                    _ => {
+                        self.file_error = EBADPARM;
+                        return Ok(Some(EFAILED));
+                    }
                 };
                 match self.open_files.get_mut(&this) {
                     Some(open) => match std::io::Seek::seek(&mut open.file, from) {
                         // Documentado em `IFILE_Seek.htm`: o retorno é `SUCCESS`, exceto no caso
                         // especial de `_SEEK_CURRENT` com deslocamento zero, que devolve a
                         // posição atual.
-                        Ok(offset) if a1 == SEEK_CURRENT && a2 == 0 => offset as u32,
-                        Ok(_) => SUCCESS,
-                        Err(_) => EFAILED,
+                        Ok(offset) if a1 == SEEK_CURRENT && a2 == 0 => {
+                            self.file_error = SUCCESS;
+                            offset as u32
+                        }
+                        Ok(_) => {
+                            self.file_error = SUCCESS;
+                            SUCCESS
+                        }
+                        Err(error) => {
+                            self.file_error = if error.kind() == std::io::ErrorKind::InvalidInput {
+                                BAD_SEEK_POSITION
+                            } else {
+                                Self::file_io_error(&error, Some(&open.caminho))
+                            };
+                            EFAILED
+                        }
                     },
-                    None => EFAILED,
+                    None => {
+                        self.file_error = EBADPARM;
+                        EFAILED
+                    }
                 }
             }
             "Truncate" => match self.open_files.get_mut(&this) {
-                Some(open) if open.file.set_len(a1 as u64).is_ok() => SUCCESS,
-                _ => EFAILED,
+                Some(open) if !open.escrita => {
+                    self.file_error = INVALID_FILE_OPERATION;
+                    EFAILED
+                }
+                Some(open) => match open.file.set_len(a1 as u64) {
+                    Ok(()) => SUCCESS,
+                    Err(error) => {
+                        self.file_error = Self::file_io_error(&error, Some(&open.caminho));
+                        EFAILED
+                    }
+                },
+                None => {
+                    self.file_error = EBADPARM;
+                    EFAILED
+                }
             },
             // Sem cache próprio e sem mapeamento de arquivo em memória.
             "SetCacheSize" => 0,
-            "Map" => 0,
+            "Map" => {
+                self.file_error = EUNSUPPORTED;
+                0
+            }
             "Cancel" => SUCCESS,
             _ => return Ok(None),
         };
+        if (matches!(
+            name,
+            "GetInfo"
+                | "GetInfoEx"
+                | "Test"
+                | "Remove"
+                | "Rename"
+                | "MkDir"
+                | "RmDir"
+                | "GetFreeSpaceEx"
+                | "GetFileUseInfo"
+                | "EnumInit"
+                | "ResolvePath"
+                | "Truncate"
+                | "Cancel"
+                | "SetCacheSize"
+        ) && result == SUCCESS)
+            || name == "GetFreeSpace"
+            || (name == "EnumNext" && result == TRUE)
+        {
+            self.file_error = SUCCESS;
+        }
         // O caminho entra na linha quando a chamada tem um: `Test`, `OpenFile`, `MkDir`, `Remove`,
         // `Rename` e `EnumInit` são as que decidem onde o jogo escreve.
         let tem_caminho = matches!(
@@ -425,6 +911,17 @@ impl<C: CpuBackend> Machine<C> {
 
     /// Abre um arquivo do jogo, devolvendo o `IFile*` ou zero se não deu.
     pub(super) fn open_file(&mut self, guest_path: &str, mode: u32) -> Result<u32, CpuError> {
+        // CREATE não trunca nem sombreia um nome que já existe no namespace
+        // virtual, inclusive quando o seed ainda só está no pacote.
+        if mode & OFM_CREATE != 0
+            && self
+                .vfs
+                .resolve(guest_path)
+                .is_some_and(|path| path.exists())
+        {
+            self.file_error = FILE_EXISTS;
+            return Ok(0);
+        }
         let preloaded = guest_path.eq_ignore_ascii_case("preloaded.cfg");
         let path = if let Some(cfg) = self.cfg_da_z_wheel(guest_path) {
             Some(cfg)
@@ -448,14 +945,17 @@ impl<C: CpuBackend> Machine<C> {
         }
         // A partir daqui vale a resolução do VFS, que decide entre conteúdo e overlay e diz se
         // o arquivo do pacote precisa ser copiado antes de receber escrita.
-        let intent = match (mode & OFM_CREATE != 0, mode & (OFM_READWRITE | OFM_APPEND) != 0) {
+        let intent = match (
+            mode & OFM_CREATE != 0,
+            mode & (OFM_READWRITE | OFM_APPEND) != 0,
+        ) {
             (true, _) => crate::brew::vfs::OpenIntent::Create,
             (false, true) if mode & OFM_APPEND != 0 => crate::brew::vfs::OpenIntent::Append,
             (false, true) => crate::brew::vfs::OpenIntent::ReadWrite,
             (false, false) => crate::brew::vfs::OpenIntent::Read,
         };
         let Some(alvo) = self.vfs.open_target(guest_path, intent) else {
-            self.file_error = EFAILED;
+            self.file_error = self.file_path_error(guest_path);
             return Ok(0);
         };
         let path = alvo.path;
@@ -479,8 +979,21 @@ impl<C: CpuBackend> Machine<C> {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if std::fs::copy(&origem, &path).is_err() {
-                self.file_error = EFAILED;
+            // fs::copy também copia o atributo read-only do pacote. O save é
+            // um arquivo novo do usuário e precisa das permissões do overlay.
+            let copia = (|| -> std::io::Result<()> {
+                let mut source = std::fs::File::open(&origem)?;
+                let mut destination = std::fs::OpenOptions::new()
+                    .write(true).create_new(true).open(&path)?;
+                if let Err(error) = std::io::copy(&mut source, &mut destination) {
+                    drop(destination);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                Ok(())
+            })();
+            if let Err(error) = copia {
+                self.file_error = self.file_guest_io_error(&error, guest_path, Some(&path));
                 return Ok(0);
             }
         }
@@ -510,7 +1023,7 @@ impl<C: CpuBackend> Machine<C> {
     fn open_options(mode: u32) -> std::fs::OpenOptions {
         let mut options = std::fs::OpenOptions::new();
         if mode & OFM_CREATE != 0 {
-            options.create(true).read(true).write(true);
+            options.create_new(true).read(true).write(true);
         } else if mode & (OFM_READWRITE | OFM_APPEND) != 0 {
             options.read(true).write(true);
         } else {
@@ -530,24 +1043,24 @@ impl<C: CpuBackend> Machine<C> {
         mode: u32,
     ) -> Result<u32, CpuError> {
         let options = Self::open_options(mode);
-        let Ok(file) = options.open(&path) else {
-            // O caminho do host e o erro do sistema entram no registro: "o jogo não conseguiu
-            // abrir o save" não diz se o problema é o caminho resolvido, a permissão ou o modo.
-            let erro = options.open(&path).err().map(|e| e.to_string());
-            if self.fs_log.len() >= MAX_FS_LOG {
-                self.fs_log.pop_front();
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                // O caminho do host e o erro do sistema entram no registro: "o jogo não conseguiu
+                // abrir o save" não diz se o problema é o caminho resolvido, a permissão ou o modo.
+                if self.fs_log.len() >= MAX_FS_LOG {
+                    self.fs_log.pop_front();
+                }
+                self.fs_log
+                    .push_back(format!("open falhou: {} ({})", path.display(), error));
+                self.file_error = self.file_guest_io_error(&error, guest_path, Some(&path));
+                self.missing_files.insert(guest_path.to_string());
+                return Ok(0);
             }
-            self.fs_log.push_back(format!(
-                "open falhou: {} ({})",
-                path.display(),
-                erro.unwrap_or_else(|| "sem motivo".into())
-            ));
-            self.file_error = EFAILED;
-            self.missing_files.insert(guest_path.to_string());
-            return Ok(0);
         };
         let handle = self.new_object(Interface::File)?;
         if handle == 0 {
+            self.file_error = ENOMEMORY;
             return Ok(0);
         }
         self.open_files.insert(

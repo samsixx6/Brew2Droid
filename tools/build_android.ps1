@@ -53,6 +53,10 @@ try {
     $brewLicenses = 'frontends\android\apk\app\src\main\assets\licenses'
     New-Item -ItemType Directory -Path $brewLicenses -Force | Out-Null
     Copy-Item -LiteralPath 'LICENSE','LICENSE-GPL3','THIRD-PARTY-NOTICES.txt' -Destination $brewLicenses
+    Get-ChildItem -LiteralPath 'assets/licenses' -Filter '*.txt' -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $brewLicenses
+    }
+    Copy-Item -LiteralPath 'assets/licenses/font-provenance.json' -Destination $brewLicenses
 
     # O Rust Release é otimizado; o invólucro APK continua de diagnóstico para exportar o relatório via run-as.
     & '.\frontends\android\apk\gradlew.bat' -p 'frontends\android\apk' --no-daemon assembleDebug

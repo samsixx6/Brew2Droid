@@ -120,6 +120,8 @@ impl<C: CpuBackend> Machine<C> {
 
     /// Grava o estado em uma seção por região, mais os registradores e os livros.
     pub fn pode_salvar(&mut self) -> Result<(), String> {
+        if self.history_in_use(){return Err("AppHistory cursor/owner state is not yet serializable".into());}
+
         // **Drena primeiro, recusa depois.** Um lote esperando a vez não é desenho pela metade: é
         // trabalho que ia ser feito no quadro seguinte. Recusar o save por causa dele bloquearia o
         // jogador por algo que o motor resolve sozinho. O que sobra depois de drenar é o desenho
@@ -150,6 +152,9 @@ impl<C: CpuBackend> Machine<C> {
         // A outra parcela do relógio: o tempo ocioso que o emulador pulou. Ver o `relogio.us` no
         // cabeçalho de [`Machine::grava_escalares_e_mapas`].
         secoes.poe("relogio.us", self.clock_us.to_le_bytes().to_vec());
+        if self.handset_clock.is_some() {
+            secoes.poe("relogio.handset_us", self.now_us().to_le_bytes().to_vec());
+        }
         for regiao in self.module.mem.regions() {
             let Some(quanto) =
                 self.quanto_gravar(regiao.name, regiao.base, regiao.bytes.len(), regiao.writable)
@@ -169,6 +174,8 @@ impl<C: CpuBackend> Machine<C> {
         self.grava_tabelas_numericas(&mut secoes);
         self.grava_fontes_e_arquivos(&mut secoes);
         self.grava_rede_legada(&mut secoes);
+        self.grava_legacy_sockets(&mut secoes);
+        self.grava_temporal_controls(&mut secoes);
         self.grava_conteudo(&mut secoes);
         self.grava_superficies_e_imagens(&mut secoes);
         self.grava_escalares_e_mapas(&mut secoes);
@@ -180,9 +187,12 @@ impl<C: CpuBackend> Machine<C> {
         self.grava_db_legado(&mut secoes);
         self.grava_controles_legados(&mut secoes);
         self.grava_tapi_legado(&mut secoes);
+        self.grava_sprites_legados(&mut secoes);
+        self.grava_texto_nativo(&mut secoes);
         self.grava_copyright(&mut secoes);
         self.grava_ultimos(&mut secoes);
         self.grava_rsa(&mut secoes);
+        secoes.poe("tab.registry", self.registry.encode());
         // O rasterizador e estado do guest. Sem ele, CPU e memoria voltam mas texturas,
         // matrizes, luzes e buffers 3D ficam no instante errado.
         self.gl.grava_estado(&mut secoes);
@@ -194,6 +204,43 @@ impl<C: CpuBackend> Machine<C> {
 
     pub fn restaura_estado(&mut self, arquivo: &[u8]) -> Result<(), Erro> {
         let leitor = Leitor::abre(arquivo)?;
+        // Conferir antes de qualquer aplicação, inclusive texto nativo.
+        let tempo_handset = match leitor.secao("relogio.handset_us") {
+            None => None,
+            Some(bytes) => Some(u64::from_le_bytes(bytes.try_into().map_err(|_| Erro::Secao {
+                nome: "relogio.handset_us".into(),
+                motivo: format!("esperava 8 bytes e tem {}", bytes.len()),
+            })?)),
+        };
+        // Validar a nova seção antes de aplicar qualquer parte do estado.
+        let window_start = Self::validate_window_start_state(&leitor)?;
+        // Validar os dois livros antes de callbacks, memória ou outros estados mudarem.
+        // A seção lógica é opcional para conservar estados produzidos antes dela.
+        let mut heap = self.heap.clone();
+        heap.restaura_com_prefixo("heap", &leitor)?;
+        let mut superficies = self.superficies.clone();
+        superficies.restaura_com_prefixo("surfaces", &leitor)?;
+        // O handle emprestado de AEEAppStart deve continuar pertencendo ao ObjectStore.
+        if leitor.secao("esc.applet_display").is_some(){
+            let display=leitor.u32("esc.applet_display")?;
+            if display!=0&&(!leitor.pares("objects.kinds")?.iter().any(|&(at,kind)|at==display&&kind==crate::brew::aee::codigo(Interface::Display))||!leitor.pares("objects.refs")?.iter().any(|&(at,refs)|at==display&&refs>0)){
+                return Err(Erro::Secao{nome:"esc.applet_display".into(),motivo:"default display is not a live IDisplay".into()});
+            }
+        }
+
+        let registry_state = super::registry::RegistryState::decode(leitor.secao("tab.registry"), leitor.secao("mem.heap"))?;
+        // Estados antigos nunca honravam o pedido de background no STOP.
+        let applet_em_background = if leitor.secao("esc.applet_em_background").is_some() {
+            match leitor.u32("esc.applet_em_background")? {
+                0 => false,
+                1 => true,
+                _ => return Err(Erro::Secao {
+                    nome: "esc.applet_em_background".to_string(),
+                    motivo: "o valor deve ser booleano".to_string(),
+                }),
+            }
+        } else { false };
+        self.restaura_texto_nativo(&leitor)?;
 
         let registradores = leitor.u32s("cpu.regs")?;
         if registradores.len() != REGISTRADORES.len() {
@@ -253,17 +300,33 @@ impl<C: CpuBackend> Machine<C> {
                     ),
                 });
             }
-            regioes.push((regiao.base, bytes.to_vec()));
+            let mut prepared = bytes.to_vec();
+            self.prepare_pocket_god_font_restore(regiao.name, regiao.base, &mut prepared)?;
+            self.prepare_penoa_palette_restore(regiao.name, regiao.base, &mut prepared)?;
+            self.prepare_three_kingdoms_background_restore(regiao.name, regiao.base, &mut prepared)?;
+            self.prepare_jumong_public_framebuffer_restore(regiao.name, regiao.base, &mut prepared)?;
+            self.prepare_jjayo_graphics_restore(regiao.name, regiao.base, &mut prepared, &registradores)?;
+            self.prepare_mini_resource_layout_restore(regiao.name, regiao.base, &mut prepared, &registradores)?;
+            self.prepare_kingdom_swerve_restore(regiao.name, regiao.base, &mut prepared, &registradores)?;
+            self.prepare_epic_public_framebuffer_restore(regiao.name, regiao.base, &mut prepared, &leitor, &registradores)?;
+            regioes.push((regiao.base, prepared));
         }
 
+        let vigias_dib_anteriores: Vec<u32> = self.dib_buffers.keys().copied()
+            .filter(|&bitmap| bitmap != 0).collect();
+
         // Daqui para baixo é aplicação: ou tudo, ou nada.
+        // Não repetir POSTs nem aceitar resultados da sessão substituída. Responses
+        // em voo guardam -EFAILED e callback no guest; restore entrega essa falha local.
+        self.http_requests.clear();
+        self.http_bodies.clear();
         self.restaura_entrada_e_tempo(&leitor)?;
         self.restaura_tabelas_numericas(&leitor)?;
         self.restaura_fontes_e_arquivos(&leitor)?;
         self.restaura_rede_legada(&leitor)?;
         self.restaura_conteudo(&leitor)?;
         self.restaura_superficies_e_imagens(&leitor)?;
-        self.restaura_escalares_e_mapas(&leitor)?;
+        self.restaura_escalares_e_mapas(&leitor, applet_em_background)?;
         self.restaura_listas_e_parada(&leitor)?;
         self.restaura_resto_das_tabelas(&leitor)?;
         self.restaura_o_resto(&leitor)?;
@@ -276,18 +339,39 @@ impl<C: CpuBackend> Machine<C> {
         if leitor.secao("gl.matrizes").is_some() {
             self.gl.restaura_estado(&leitor)?;
         }
-        self.heap.restaura_com_prefixo("heap", &leitor)?;
+        self.heap = heap;
         self.objects.restaura(&leitor)?;
-        self.superficies
-            .restaura_com_prefixo("surfaces", &leitor)?;
+        self.superficies = superficies;
         for (base, bytes) in regioes {
             self.cpu.write_mem(base, &bytes).map_err(|erro| Erro::Secao {
                 nome: format!("mem.{base:#010x}"),
                 motivo: format!("não deu para escrever: {erro}"),
             })?;
         }
+        // As vigias pertencem à CPU da sessão, não ao arquivo. Sem reconstruí-las,
+        // chamadas aninhadas importam pixels obsoletos como se o guest os tivesse escrito.
+        // Só ids de DIB são substituídos: o color buffer EGL conserva sua própria vigia.
+        for bitmap in vigias_dib_anteriores {
+            self.cpu.unwatch_dirty(bitmap);
+        }
+        for (&bitmap, &buffer) in &self.dib_buffers {
+            if bitmap == 0 { continue; }
+            let Some(superficie) = self.bitmaps.get(&bitmap) else { continue; };
+            // O pitch nativo inclui padding por linha; capacidade e prefixo não são pixels.
+            let tamanho = superficie.passo_do_dib().checked_mul(superficie.height() as usize)
+                .and_then(|n| u32::try_from(n).ok()).ok_or_else(|| Erro::Secao {
+                    nome: "tab.dib_buffers".into(), motivo: "raster restaurado excede u32".into(),
+                })?;
+            self.cpu.watch_dirty(bitmap, buffer, tamanho).map_err(|erro| Erro::Secao {
+                nome: "tab.dib_buffers".into(),
+                motivo: format!("não deu para reconstruir a vigia de {bitmap:#010x}: {erro}"),
+            })?;
+        }
         // Os livros e os buffers apontam para objetos e heap do estado carregado.
         self.restaura_db_legado(&leitor)?;
+        self.restaura_sprites_legados(&leitor)?;
+        self.restaura_legacy_sockets(&leitor)?;
+        self.restaura_temporal_controls(&leitor)?;
         self.restaura_controles_legados(&leitor)?;
         self.restaura_tapi_legado(&leitor)?;
         self.restaura_rsa(&leitor)?;
@@ -299,8 +383,14 @@ impl<C: CpuBackend> Machine<C> {
         // núcleos, e o valor que veio do estado é o que manda.
         self.cpu.set_cpsr(cpsr);
         self.cpu.set_instructions(relogio);
+        self.window_start = window_start;
         if let Some(tempo_pulado) = tempo_pulado {
             self.clock_us = tempo_pulado;
+        }
+        // O modo pertence ao lançamento atual; o snapshot só restaura a base.
+        // Estados legados sem a seção conservam a âncora anterior.
+        if let (Some(clock), Some(tempo_handset)) = (&mut self.handset_clock, tempo_handset) {
+            clock.rebase(std::time::Instant::now(), tempo_handset);
         }
         let now = self.now_us();
         for state in self.media.values_mut().filter(|state| state.paused_at_us == u64::MAX) {
@@ -312,6 +402,12 @@ impl<C: CpuBackend> Machine<C> {
         // da tela restaurada. Ver [`Machine::quadro_na_placa`].
         self.placa_sem_o_quadro = true;
         self.gl_quadro_pendente = false;
+        // Todas as validações terminaram. Gerações são identidade local do registro,
+        // não dados do save; nenhum snapshot de entrega atravessa uma restauração.
+        self.registry = registry_state;
+        self.system_callback_generations = self.system_callbacks.keys().enumerate()
+            .map(|(i, pcb)| (*pcb, i as u64 + 1)).collect();
+        self.next_system_callback_generation = self.system_callbacks.len() as u64;
         Ok(())
     }
 }
@@ -386,6 +482,7 @@ impl<C: CpuBackend> Machine<C> {
             }),
         );
         secoes.poe_u32s("agenda.callbacks", self.deferred_callbacks.iter().flat_map(|(pcb, owner)| [*pcb, *owner]));
+        secoes.poe_mapa("agenda.systemcallbacks", self.system_callbacks.iter().map(|(pcb, event)| (*pcb, *event)));
         secoes.poe_trios("agenda.timers", self.timers.iter().map(|t| {
             (t.deadline_ms, t.callback.function, t.callback.context)
         }));
@@ -413,6 +510,15 @@ impl<C: CpuBackend> Machine<C> {
         let signals = leitor.trios("agenda.sinais")?;
         let pendentes = leitor.pares_em_ordem("agenda.pendentes")?;
         let callbacks = if leitor.secao("agenda.callbacks").is_some() { leitor.pares_em_ordem("agenda.callbacks")? } else { Vec::new() };
+        let system_callbacks = if leitor.secao("agenda.systemcallbacks").is_some() {
+            leitor.pares_em_ordem("agenda.systemcallbacks")?
+        } else { Vec::new() };
+        let mut system_seen = std::collections::BTreeSet::new();
+        if system_callbacks.len() > super::callback::MAX_SYSTEM_CALLBACKS
+            || system_callbacks.iter().any(|(pcb, event)| *pcb == 0 || pcb.checked_add(super::CALLBACK_SIZE).is_none()
+                || !matches!(*event, 2 | 3 | 4 | 7) || !system_seen.insert(*pcb)) {
+            return Err(Erro::Secao { nome: "agenda.systemcallbacks".into(), motivo: "registro de callback de sistema inválido".into() });
+        }
         let mut seen = std::collections::BTreeSet::new();
         if callbacks.iter().any(|(pcb, _)| *pcb == 0 || pcb.checked_add(super::CALLBACK_SIZE).is_none() || !seen.insert(*pcb)) {
             return Err(Erro::Secao { nome: "agenda.callbacks".into(), motivo: "identidade de callback inválida".into() });
@@ -476,6 +582,11 @@ impl<C: CpuBackend> Machine<C> {
             .map(|(id, function, context)| (id, Callback { function, context }))
             .collect();
         self.deferred_callbacks = callbacks;
+        self.system_callbacks = system_callbacks.into_iter().collect();
+        // Uma falha nas validações seguintes não pode associar gerações antigas
+        // aos PCBs recém-lidos; a reconstrução ocorre só no sucesso completo.
+        self.system_callback_generations.clear();
+        self.low_ram_dispatching = false;
         self.pending_signals = pendentes
             .into_iter()
             .map(|(function, context)| Callback { function, context })
@@ -726,6 +837,8 @@ impl<C: CpuBackend> Machine<C> {
 ///   carregar, o estado carrega o arquivo de agora — e isso vai dito aqui, para não virar surpresa.
 impl<C: CpuBackend> Machine<C> {
     fn grava_rede_legada(&self, secoes: &mut Secoes) {
+        secoes.poe_registros("tab.net_legacy.linger",
+            self.net_legacy_linger.iter().map(|(&object, &seconds)| vec![object, u32::from(seconds)]).collect::<Vec<_>>());
         secoes.poe_registros(
             "tab.net_legacy.callbacks",
             self.net_legacy_callbacks.iter().map(|&(function, context)| vec![function, context])
@@ -753,8 +866,20 @@ impl<C: CpuBackend> Machine<C> {
             });
         }
         let errors = registros("tab.net_legacy.errors")?;
+        let linger = registros("tab.net_legacy.linger")?;
+        let mut restored_linger = std::collections::BTreeMap::new();
+        for row in linger {
+            if row[1] > u16::MAX as u32
+                || self.objects.kind_of(row[0]) != Some(Interface::NetLegacy)
+                || self.objects.contagem(row[0]) == 0
+                || restored_linger.insert(row[0], row[1] as u16).is_some()
+            {
+                return Err(Erro::Secao { nome: "tab.net_legacy.linger".into(), motivo: "tempo de rede ou proprietário inválido".into() });
+            }
+        }
         self.net_legacy_callbacks = callbacks.into_iter().map(|row| (row[0], row[1])).collect();
         self.net_legacy_errors = errors.into_iter().map(|row| (row[0], row[1])).collect();
+        self.net_legacy_linger = restored_linger;
         Ok(())
     }
 
@@ -1258,6 +1383,8 @@ fn bytes_em_pixels(bytes: &[u8]) -> Vec<u16> {
 /// - `z_wheel` é caminho de conteúdo, e quem o conhece é o core.
 impl<C: CpuBackend> Machine<C> {
     fn grava_escalares_e_mapas(&self, secoes: &mut Secoes) {
+        secoes.poe_u32("esc.applet_display",if self.objects.kind_of(self.applet_display)==Some(Interface::Display){self.applet_display}else{0});
+
         let mut numeros: Vec<u32> = vec![
             self.epoch_seconds,
             self.random_state,
@@ -1302,6 +1429,12 @@ impl<C: CpuBackend> Machine<C> {
         numeros.push(self.ativacao_pendente.unwrap_or((0, 0)).0);
         numeros.push(self.ativacao_pendente.unwrap_or((0, 0)).1);
         secoes.poe_u32s("esc.numeros", numeros);
+        // Seção opcional: estados antigos não conhecem a terminação síncrona
+        // por privilégio negado e devem voltar a executar normalmente.
+        secoes.poe_u32("esc.privilege_denied", u32::from(self.applet_privilege_denied));
+        secoes.poe_u32("esc.applet_em_background", u32::from(self.applet_em_background));
+        secoes.poe_u32s("esc.window_start", self.window_start.into_iter()
+            .flat_map(|start| [1, start.block, start.stack, start.applet]));
         secoes.poe_u32s("esc.nomes_de_textura", self.nomes_de_textura.em_uso());
         secoes.poe_u32s("esc.nomes_de_buffer", self.nomes_de_buffer.em_uso());
 
@@ -1398,7 +1531,18 @@ impl<C: CpuBackend> Machine<C> {
 const ESCALARES: usize = 35;
 
 impl<C: CpuBackend> Machine<C> {
-    fn restaura_escalares_e_mapas(&mut self, leitor: &Leitor<'_>) -> Result<(), Erro> {
+    fn restaura_escalares_e_mapas(&mut self, leitor: &Leitor<'_>, applet_em_background: bool) -> Result<(), Erro> {
+
+        let privilege_denied = if leitor.secao("esc.privilege_denied").is_some() {
+            match leitor.u32("esc.privilege_denied")? {
+                0 => false,
+                1 => true,
+                _ => return Err(Erro::Secao {
+                    nome: "esc.privilege_denied".to_string(),
+                    motivo: "o valor deve ser booleano".to_string(),
+                }),
+            }
+        } else { false };
         let numeros = leitor.u32s("esc.numeros")?;
         if numeros.len() != ESCALARES {
             return Err(Erro::Secao {
@@ -1478,9 +1622,19 @@ impl<C: CpuBackend> Machine<C> {
             let kinds: std::collections::HashMap<u32,u32> = leitor.pares("objects.kinds")?.into_iter().collect();
             let buffers: std::collections::HashMap<u32,u32> = leitor.pares("tab.dib_buffers")?.into_iter().collect();
             for ptr in leitor.u32s("esc.converted_bitmap_blocks")? {
-                if !owned.get(&ptr).is_some_and(|n| *n >= 64)
+                // O IDIB público tem 36 bytes; o provedor OEM pode pôr pixels em 52,
+                // e estados antigos usavam 64. O raster inteiro precisa continuar
+                // dentro da mesma alocação, não só seu primeiro endereço.
+                let prefix = buffers.get(&ptr).and_then(|pixels| pixels.checked_sub(ptr));
+                let surface = leitor.u32s(&format!("sup.{ptr}.meta"))?;
+                let raster = if surface.len() == 11 && surface[0] != 0 && surface[1] != 0 {
+                    surface[0].checked_mul(2).and_then(|n| n.checked_add(3))
+                        .map(|n| n & !3).and_then(|pitch| pitch.checked_mul(surface[1]))
+                } else { None };
+                if !prefix.is_some_and(|prefix| matches!(prefix, 36 | 52 | 64)
+                    && raster.and_then(|n| prefix.checked_add(n))
+                        .is_some_and(|required| owned.get(&ptr).is_some_and(|n| *n >= required)))
                     || kinds.get(&ptr) != Some(&(crate::brew::aee::Interface::Bitmap as u32))
-                    || ptr.checked_add(64) != buffers.get(&ptr).copied()
                     || !converted_bitmap_blocks.insert(ptr) {
                     return Err(Erro::Secao { nome: "esc.converted_bitmap_blocks".into(), motivo: "bitmap sem alocação própria ou raster contíguo".into() });
                 }
@@ -1538,6 +1692,7 @@ impl<C: CpuBackend> Machine<C> {
         self.modo_do_sistema = modo_do_sistema;
         self.device_bitmap = device_bitmap;
         self.display_target = display_target;
+        self.applet_display=if leitor.secao("esc.applet_display").is_some(){leitor.u32("esc.applet_display")?}else{0};
         self.current_applet = current_applet;
         self.applet_class = applet_class;
         self.egl_next_handle = egl_next_handle;
@@ -1548,6 +1703,8 @@ impl<C: CpuBackend> Machine<C> {
         self.unpack_alignment = unpack_alignment;
         self.updates_na_volta = updates_na_volta;
         self.applet_fechado = applet_fechado;
+        self.applet_em_background = applet_em_background;
+        self.applet_privilege_denied = privilege_denied;
         self.wheel_boot_skipped = wheel_boot_skipped;
         self.pending_launch = pending_launch;
         self.escritas_do_quadro_gl = escritas_do_quadro_gl;
@@ -2719,6 +2876,7 @@ impl<C: CpuBackend> Machine<C> {
         self.teclas_da_rolagem = teclas_da_rolagem;
         self.recursos_lidos = recursos_lidos;
         self.avisos_de_midia = avisos_de_midia;
+        self.media_batch_tail_contexts = None;
         self.avisos_de_imagem = avisos_de_imagem;
         self.gl_buffers = gl_buffers;
         self.egl_color_bytes = egl_color_bytes;
@@ -2955,6 +3113,10 @@ impl<C: CpuBackend> Machine<C> {
         let mut numeros = vec![tem, endereco];
         numeros.extend(registradores);
         secoes.poe_u32s("ult.trecho", numeros);
+        secoes.poe_u32("ult.web_callback_pin", self.http_callback_pin);
+        secoes.poe_u32("ult.web_body_pin", self.http_body_pin);
+        let mut body_owners=self.http_bodies.keys().copied().collect::<Vec<_>>();body_owners.sort_unstable();
+        secoes.poe_u32s("ult.web_body_owners",body_owners);
         secoes.poe_u32s("ult.trecho_thread", [self.trecho_thread.unwrap_or(0)]);
         let pcm = self.leitura_pcm.map(|read| vec![read.media, read.fonte, read.pedido,
             read.inicio_us as u32, (read.inicio_us >> 32) as u32,
@@ -3136,6 +3298,16 @@ impl<C: CpuBackend> Machine<C> {
         let ultima_pcm = if leitor.secao("ult.pcm_last").is_some() { leitor.u32("ult.pcm_last")? } else { 0 };
         self.leitura_pcm = leitura_pcm;
         self.ultima_pcm = ultima_pcm;
+        let web_pin=if leitor.secao("ult.web_callback_pin").is_some(){leitor.u32("ult.web_callback_pin")?}else{0};
+        if web_pin!=0&&(trecho_interrompido.is_none()||self.objects.kind_of(web_pin)!=Some(Interface::WebResp)){
+            return Err(Erro::Secao{nome:"ult.web_callback_pin".into(),motivo:"pin sem continuação IWebResp".into()});
+        }
+        self.http_callback_pin=web_pin;
+        let body_pin=if leitor.secao("ult.web_body_pin").is_some(){leitor.u32("ult.web_body_pin")?}else{0};
+        let body_owners=if leitor.secao("ult.web_body_owners").is_some(){leitor.u32s("ult.web_body_owners")?}else{Vec::new()};
+        if body_owners.len()>4||body_pin!=0&&(trecho_interrompido.is_none()||!body_owners.contains(&body_pin)){return Err(Erro::Secao{nome:"ult.web_body_pin".into(),motivo:"continuacao BODY sem provedor".into()});}
+        self.http_bodies=body_owners.into_iter().map(|response|(response,super::web::http_body::Builder::retired())).collect();
+        self.http_body_pin=body_pin;
         self.trecho_interrompido = trecho_interrompido;
         self.trecho_thread = trecho_thread;
         self.pending_calls = pending_calls;

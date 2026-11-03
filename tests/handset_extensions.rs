@@ -254,3 +254,18 @@ fn invalid_first_sibling_module_does_not_hide_a_valid_provider() {
     assert_eq!(library::extensoes(&game), vec![(valid, vec![MICRO3D])]);
     assert_eq!(zeebx::session::extensoes_de(&game).len(), 1);
 }
+
+#[test]
+fn collection_assets_do_not_hide_a_late_shared_dependency() {
+    let collection = Collection::new();
+    let game = collection.module("Unknown Resolution/Game/game/game.mod", Some(GAME), &[MICRO3D]);
+    let assets = collection.0.join("Unknown Resolution/AAA asset-heavy game/data");
+    std::fs::create_dir_all(&assets).unwrap();
+    // A coleção fornecida tem mais de 5500 arquivos. O antigo teto de 4000 esgotava
+    // a busca antes dos motores compartilhados ordenados no fim da pasta.
+    for i in 0..4100 {
+        std::fs::write(assets.join(format!("resource-{i:04}.dat")), []).unwrap();
+    }
+    let engine = collection.module("Unknown Resolution/ZZZ engine/engine/engine.mod", None, &[MICRO3D]);
+    assert_eq!(library::extensoes(&game), vec![(engine, vec![MICRO3D])]);
+}

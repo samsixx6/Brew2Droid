@@ -22,39 +22,73 @@ pub fn from_inventory(
     files: &BTreeMap<PathBuf, serde_json::Value>,
 ) -> Metadata {
     let dir = module.parent().unwrap_or(root);
-    let scope = dir.parent().filter(|p| {
-        p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("mod"))
-    }).and_then(Path::parent).filter(|p| {
-        p.starts_with(root) && !collection_name(p) && (*p != root || organized_name(p).is_some())
-    });
-    let package = scope.filter(|p| organized_name(p).is_some() || manifest.is_some_and(|m|m.starts_with(p)));
+    let scope = dir
+        .parent()
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("mod"))
+        })
+        .and_then(Path::parent)
+        .filter(|p| {
+            p.starts_with(root)
+                && !collection_name(p)
+                && (*p != root || organized_name(p).is_some())
+        });
+    let package =
+        scope.filter(|p| organized_name(p).is_some() || manifest.is_some_and(|m| m.starts_with(p)));
     let paired = manifest.and_then(Path::parent).filter(|p| {
         Some(*p) == dir.parent() && *p != root && p.starts_with(root) && !collection_name(p)
     });
-    let organized = dir.ancestors().take(2).take_while(|p|p.starts_with(root))
-        .find_map(|p|organized_name(p).map(|(t,v)|(p.to_path_buf(),t,v)))
-        .or_else(||package.and_then(|p| {
-            let (title, version) = organized_name(p).or_else(||Some((p.file_name()?.to_str()?.into(),None)))?;
-            Some((p.to_path_buf(),title,version))
-        }))
-        .or_else(||paired.and_then(|p|Some((p.to_path_buf(),p.file_name()?.to_str()?.into(),None))));
+    let organized = dir
+        .ancestors()
+        .take(2)
+        .take_while(|p| p.starts_with(root))
+        .find_map(|p| organized_name(p).map(|(t, v)| (p.to_path_buf(), t, v)))
+        .or_else(|| {
+            package.and_then(|p| {
+                let (title, version) =
+                    organized_name(p).or_else(|| Some((p.file_name()?.to_str()?.into(), None)))?;
+                Some((p.to_path_buf(), title, version))
+            })
+        })
+        .or_else(|| {
+            paired.and_then(|p| Some((p.to_path_buf(), p.file_name()?.to_str()?.into(), None)))
+        });
     let (folder, title, version, recognized) = match organized {
-        Some((folder,title,version)) => (folder,Some(title),version,true),
-        None => (dir.to_path_buf(),None,None,dir != root && !collection_name(dir) && scope.is_none()),
+        Some((folder, title, version)) => (folder, Some(title), version, true),
+        None => (
+            dir.to_path_buf(),
+            None,
+            None,
+            dir != root && !collection_name(dir) && scope.is_none(),
+        ),
     };
-    let size = recognized.then(|| {
-        let mut total = 0u64;
-        for (path, stamp) in files.range(folder.clone()..) {
-            if !path.starts_with(&folder) { break; }
-            if stamp["kind"] == "link" || stamp["kind"] == "other" { return None; }
-            if stamp["kind"] == "file" { total = total.checked_add(stamp["length"].as_u64()?)?; }
-        }
-        if let Some(manifest) = manifest.filter(|p|!p.starts_with(&folder)) {
-            total = total.checked_add(files.get(manifest)?["length"].as_u64()?)?;
-        }
-        Some(total)
-    }).flatten();
-    Metadata { folder, size, title, version }
+    let size = recognized
+        .then(|| {
+            let mut total = 0u64;
+            for (path, stamp) in files.range(folder.clone()..) {
+                if !path.starts_with(&folder) {
+                    break;
+                }
+                if stamp["kind"] == "link" || stamp["kind"] == "other" {
+                    return None;
+                }
+                if stamp["kind"] == "file" {
+                    total = total.checked_add(stamp["length"].as_u64()?)?;
+                }
+            }
+            if let Some(manifest) = manifest.filter(|p| !p.starts_with(&folder)) {
+                total = total.checked_add(files.get(manifest)?["length"].as_u64()?)?;
+            }
+            Some(total)
+        })
+        .flatten();
+    Metadata {
+        folder,
+        size,
+        title,
+        version,
+    }
 }
 
 /// Só seções textuais de um MIF válido participam; imagens e strings do MOD
@@ -64,30 +98,65 @@ pub fn company(data: &[u8]) -> Option<String> {
     let mut text = String::new();
     for (offset, length) in mif.sections {
         let bytes = data.get(offset as usize..offset.checked_add(length)? as usize)?;
-        if bytes.get(2..).is_some_and(|s|s.starts_with(b"image/")) { continue; }
+        if bytes.get(2..).is_some_and(|s| s.starts_with(b"image/")) {
+            continue;
+        }
         text.push(' ');
-        text.extend(bytes.iter().map(|b|if b.is_ascii_graphic() || *b == b' ' { *b as char } else { ' ' }));
+        text.extend(bytes.iter().map(|b| {
+            if b.is_ascii_graphic() || *b == b' ' {
+                *b as char
+            } else {
+                ' '
+            }
+        }));
         for shift in 0..2 {
-            let words: Vec<u16> = bytes.get(shift..).unwrap_or_default().chunks_exact(2)
-                .map(|b|u16::from_le_bytes([b[0],b[1]])).collect();
-            text.push(' '); text.push_str(&String::from_utf16_lossy(&words));
+            let words: Vec<u16> = bytes
+                .get(shift..)
+                .unwrap_or_default()
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            text.push(' ');
+            text.push_str(&String::from_utf16_lossy(&words));
         }
     }
-    let normalized: String = text.to_lowercase().chars().map(|c|if c.is_alphanumeric() { c } else { ' ' }).collect();
-    let normalized = format!(" {} ", normalized.split_whitespace().collect::<Vec<_>>().join(" "));
-    let companies: &[(&str,&[&str])] = &[
-        ("Gameloft", &["gameloft"]), ("Electronic Arts", &["electronic arts","ea mobile"]),
-        ("Glu", &["glu mobile","glu games"]), ("JAMDAT", &["jamdat"]),
-        ("Namco", &["namco","bandai namco"]), ("Digital Chocolate", &["digital chocolate"]),
-        ("THQ", &["thq"]), ("Konami", &["konami"]), ("Capcom", &["capcom"]),
-        ("SEGA", &["sega"]), ("Ubisoft", &["ubisoft"]), ("Disney", &["disney"]),
-        ("Taito", &["taito"]), ("Hudson", &["hudson soft"]), ("Square Enix", &["square enix"]),
-        ("PopCap", &["popcap"]), ("HandyGames", &["handygames","handy games"]),
-        ("Sony Pictures", &["sony pictures"]), ("I-play", &["i play"]),
+    let normalized: String = text
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    let normalized = format!(
+        " {} ",
+        normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    let companies: &[(&str, &[&str])] = &[
+        ("Gameloft", &["gameloft"]),
+        ("Electronic Arts", &["electronic arts", "ea mobile"]),
+        ("Glu", &["glu mobile", "glu games"]),
+        ("JAMDAT", &["jamdat"]),
+        ("Namco", &["namco", "bandai namco"]),
+        ("Digital Chocolate", &["digital chocolate"]),
+        ("THQ", &["thq"]),
+        ("Konami", &["konami"]),
+        ("Capcom", &["capcom"]),
+        ("SEGA", &["sega"]),
+        ("Ubisoft", &["ubisoft"]),
+        ("Disney", &["disney"]),
+        ("Taito", &["taito"]),
+        ("Hudson", &["hudson soft"]),
+        ("Square Enix", &["square enix"]),
+        ("PopCap", &["popcap"]),
+        ("HandyGames", &["handygames", "handy games"]),
+        ("Sony Pictures", &["sony pictures"]),
+        ("I-play", &["i play"]),
     ];
-    let mut matches = companies.iter().filter(|(_,aliases)|aliases.iter().any(|alias|normalized.contains(&format!(" {alias} "))));
+    let mut matches = companies.iter().filter(|(_, aliases)| {
+        aliases
+            .iter()
+            .any(|alias| normalized.contains(&format!(" {alias} ")))
+    });
     let first = matches.next()?;
-    matches.next().is_none().then(||first.0.to_string())
+    matches.next().is_none().then(|| first.0.to_string())
 }
 
 pub struct Scan<'a> {

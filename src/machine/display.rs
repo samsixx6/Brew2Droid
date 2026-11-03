@@ -7,6 +7,10 @@ impl<C: CpuBackend> Machine<C> {
     /// nomes vem dos headers do SDK, então um método fora de ordem viraria erro de compilação
     /// aqui em vez de desenho errado lá.
     pub(super) fn display_call(&mut self, slot: u32) -> Result<Option<u32>, CpuError> {
+        self.window_bound_display_call(slot)
+    }
+
+    pub(super) fn display_call_unwrapped(&mut self, slot: u32) -> Result<Option<u32>, CpuError> {
         // **O quadro do OpenGL vem antes do 2D.** Um HUD desenhado por cima de uma tela que
         // ainda não recebeu a cena apagaria a cena — ver [`Machine::materializa_quadro_gl`].
         self.materializa_quadro_gl();
@@ -43,12 +47,12 @@ impl<C: CpuBackend> Machine<C> {
             }
             "DrawFrame" => {
                 let estilo = self.arg(2);
-                // DRIV3R usa BOX para a seleção dos menus. Os estilos 3D e de
-                // abas continuam explícitos como não implementados.
+                // Molduras legadas: a margem devolvida independe do recorte.
+                // Os estilos de abas continuam explicitamente sem suporte.
                 let margem: i16 = match estilo {
-                    0 => 0,     // NONE
-                    1 | 5 => 1, // EMPTY / BOX
-                    2 => 2,     // 3D_EMPTY
+                    0 => 0,         // NONE
+                    1 | 5 => 1,     // EMPTY / BOX
+                    2 | 3 | 4 => 2, // 3D_EMPTY / RAISED / SUNKEN
                     _ => return Ok(None),
                 };
                 let endereco = self.arg(1);
@@ -78,6 +82,66 @@ impl<C: CpuBackend> Machine<C> {
                             (self.clip_rect(interno), self.bitmaps.get_mut(&target))
                         {
                             fb.fill_rect(area, Rgb::from_rgbval(fill));
+                        }
+                    }
+                    if matches!(estilo, 3 | 4) && rect.width > 0 && rect.height > 0 {
+                        for camada in 0..2i16 {
+                            let r = Rect {
+                                x: rect.x.saturating_add(camada),
+                                y: rect.y.saturating_add(camada),
+                                width: rect.width.saturating_sub(2 * camada),
+                                height: rect.height.saturating_sub(2 * camada),
+                            };
+                            if r.width <= 0 || r.height <= 0 {
+                                continue;
+                            }
+                            let (clara, escura) = if camada == 0 {
+                                (Rgb::WHITE, Rgb::BLACK)
+                            } else {
+                                (
+                                    Rgb {
+                                        r: 192,
+                                        g: 192,
+                                        b: 192,
+                                    },
+                                    Rgb {
+                                        r: 128,
+                                        g: 128,
+                                        b: 128,
+                                    },
+                                )
+                            };
+                            let (superior, inferior) = if estilo == 3 {
+                                (clara, escura)
+                            } else {
+                                (escura, clara)
+                            };
+                            for (aresta, cor) in [
+                                (Rect { height: 1, ..r }, superior),
+                                (Rect { width: 1, ..r }, superior),
+                                (
+                                    Rect {
+                                        y: r.y.saturating_add(r.height - 1),
+                                        height: 1,
+                                        ..r
+                                    },
+                                    inferior,
+                                ),
+                                (
+                                    Rect {
+                                        x: r.x.saturating_add(r.width - 1),
+                                        width: 1,
+                                        ..r
+                                    },
+                                    inferior,
+                                ),
+                            ] {
+                                if let (Some(area), Some(fb)) =
+                                    (self.clip_rect(aresta), self.bitmaps.get_mut(&target))
+                                {
+                                    fb.fill_rect(area, cor);
+                                }
+                            }
                         }
                     }
                     if estilo == 5 && rect.width > 0 && rect.height > 0 {
@@ -235,6 +299,14 @@ impl<C: CpuBackend> Machine<C> {
             // objeto seguinte — o widget do roller — nascia por cima da tela.
             "GetDestination" => {
                 let alvo = self.target()?;
+                // O destino de software já entrega IDIB público, como GetDeviceBitmap.
+                // Snowboarding lê tamanho/pitch/pBmp diretamente, sem QueryInterface.
+                // Superfícies estrangeiras conservam seu próprio contrato e seus campos.
+                if self.objects.kind_of(alvo) == Some(Interface::Bitmap)
+                    && self.bitmaps.contains_key(&alvo)
+                {
+                    self.expose_dib(alvo)?;
+                }
                 if alvo != 0 {
                     self.objects.add_ref(alvo);
                 }
@@ -247,11 +319,23 @@ impl<C: CpuBackend> Machine<C> {
                     self.cpu.read_reg(Reg::R1) as i32,
                     self.cpu.read_reg(Reg::R2) as i32,
                 );
-                let size = (self.cpu.read_reg(Reg::R3) as i32, self.stack_arg(0)? as i32);
+                let mut size = (self.cpu.read_reg(Reg::R3) as i32, self.stack_arg(0)? as i32);
                 let src = self.stack_arg(1)?;
                 let origin = (self.stack_arg(2)? as i32, self.stack_arg(3)? as i32);
                 let rop = self.stack_arg(4)?;
                 let target = self.target()?;
+                // Resolver antes do recorte: -1 não é uma dimensão geométrica.
+                // Metadados próprios evitam sondar um ponteiro inválido do guest.
+                if self.native_image_full_blit
+                    && size == (-1, -1)
+                    && origin == (0, 0)
+                    && rop == AEE_RO_TRANSPARENT
+                    && self.converted_bitmap_blocks.contains(&src)
+                {
+                    if let Some(image) = self.bitmaps.get(&src) {
+                        size = (image.width() as i32, image.height() as i32);
+                    }
+                }
                 if let Some((dst_pos, size, origin)) = self.clip_blit(dst_pos, size, origin) {
                     self.blit_display(target, dst_pos, size, src, origin, rop)?;
                 }
@@ -268,12 +352,13 @@ impl<C: CpuBackend> Machine<C> {
             // retângulo de 214 pixels; ignorar isso encostava tudo à esquerda e jogava o rótulo
             // anterior para fora da barra.
             "DrawText" => {
-                let mut units = self.read_aechar_units(self.cpu.read_reg(Reg::R2))?;
+                let font_size = self.display_font_size(self.cpu.read_reg(Reg::R1));
+                let cells = self.display_font_cells(self.cpu.read_reg(Reg::R1));
                 let chars = self.cpu.read_reg(Reg::R3) as i32;
-                if chars >= 0 {
-                    units.truncate(chars as usize);
-                }
-                let text = String::from_utf16_lossy(&units);
+                let units = self.read_display_text_units(self.cpu.read_reg(Reg::R2), chars)?;
+                let Some(text) = self.decode_guest_aechar_units(&units) else {
+                    return Ok(Some(14));
+                };
                 let (x, y) = (self.stack_arg(0)? as i32, self.stack_arg(1)? as i32);
                 let fundo = self.read_rect(self.stack_arg(2)?)?;
                 let flags = self.stack_arg(3)?;
@@ -292,8 +377,8 @@ impl<C: CpuBackend> Machine<C> {
                 }
                 let medida = self.font.as_ref().map(|fonte| {
                     (
-                        fonte.width(&text, FONT_SIZE) as i32,
-                        (fonte.ascent(FONT_SIZE) + fonte.descent(FONT_SIZE)) as i32,
+                        fonte.width_with_cells(&text, font_size, cells) as i32,
+                        (fonte.ascent(font_size) + fonte.descent(font_size)) as i32,
                     )
                 });
                 let (x, y) = match (fundo, medida) {
@@ -314,7 +399,7 @@ impl<C: CpuBackend> Machine<C> {
                     None => true,
                 };
                 let desenhou = match visivel {
-                    true => self.draw_text(&text, x, y),
+                    true => self.draw_text_with_cells(&text, x, y, font_size, cells),
                     false => Ok(true),
                 };
                 self.clip = recorte_anterior;
@@ -376,25 +461,57 @@ impl<C: CpuBackend> Machine<C> {
             // número plausível o deixa seguir — sem nenhum, o Pac-Mania para na escolha do
             // idioma.
             "MeasureTextEx" => {
-                let text = self.read_aechar_units(self.cpu.read_reg(Reg::R2))?;
+                let font_size = self.display_font_size(self.cpu.read_reg(Reg::R1));
+                let cells = self.display_font_cells(self.cpu.read_reg(Reg::R1));
                 let chars = self.cpu.read_reg(Reg::R3) as i32;
+                let text = self.read_display_text_units(self.cpu.read_reg(Reg::R2), chars)?;
                 let count = match chars < 0 {
                     true => text.len(),
                     false => (chars as usize).min(text.len()),
                 };
                 let max_width = self.stack_arg(0)? as i32;
+                let out = self.stack_arg(1)?;
+                let native = matches!(
+                    self.native_text_encoding(),
+                    NativeTextEncoding::EucKr | NativeTextEncoding::PackedEucKr
+                );
+                let complete_native = if native {
+                    match self.decode_guest_aechar_units(&text[..count]) {
+                        Some(text) => Some(text),
+                        None => {
+                            if out != 0 {
+                                self.cpu.write_u32(out, 0)?;
+                            }
+                            return Ok(Some(0));
+                        }
+                    }
+                } else {
+                    None
+                };
                 // Com fonte, a largura é medida caractere a caractere até estourar o limite;
                 // sem ela sobra a largura fixa, que é chute honesto mas chute.
                 let (fits, largura) = match &self.font {
+                    Some(fonte) if native && max_width < 0 => (
+                        count,
+                        fonte.width_with_cells(
+                            complete_native.as_deref().unwrap(),
+                            font_size,
+                            cells,
+                        ),
+                    ),
                     Some(fonte) => {
                         let mut cabem = 0;
                         let mut largura = 0;
                         for fim in 1..=count {
-                            let trecho: String = text[..fim]
-                                .iter()
-                                .filter_map(|u| char::from_u32(u32::from(*u)))
-                                .collect();
-                            let candidata = fonte.width(&trecho, FONT_SIZE) as i32;
+                            let trecho = match self.decode_guest_aechar_units(&text[..fim]) {
+                                Some(text) => text,
+                                // A string selecionada já foi validada: um prefixo de
+                                // palavras pode acabar no meio de um par KSC5601.
+                                None if native => continue,
+                                None => return Ok(Some(14)),
+                            };
+                            let candidata =
+                                fonte.width_with_cells(&trecho, font_size, cells) as i32;
                             if max_width >= 0 && candidata > max_width {
                                 break;
                             }
@@ -410,17 +527,17 @@ impl<C: CpuBackend> Machine<C> {
                         (cabem, (cabem as i32 * FONT_ADVANCE) as u32)
                     }
                 };
-                let out = self.stack_arg(1)?;
                 if out != 0 {
                     self.cpu.write_u32(out, fits as u32)?;
                 }
                 largura
             }
             "GetFontMetrics" => {
+                let font_size = self.display_font_size(self.cpu.read_reg(Reg::R1));
                 // Com fonte de verdade, a medida é dela: um menu que centraliza pela altura da
                 // linha fica torto se a altura for chute.
                 let (ascent, descent) = match &self.font {
-                    Some(fonte) => (fonte.ascent(FONT_SIZE), fonte.descent(FONT_SIZE)),
+                    Some(fonte) => (fonte.ascent(font_size), fonte.descent(font_size)),
                     None => (FONT_ASCENT, FONT_DESCENT),
                 };
                 self.write_at(self.cpu.read_reg(Reg::R2), ascent)?;
@@ -879,10 +996,41 @@ impl<C: CpuBackend> Machine<C> {
             // Com contagem, pela mesma razão do `IDisplay` — ver o `GetDestination` de lá.
             "GetDestination" => {
                 let alvo = self.target()?;
+                // O mesmo destino público do IDisplay; a exposição repetida reaproveita
+                // o buffer sem apagar pixels que o guest ainda não apresentou.
+                if self.objects.kind_of(alvo) == Some(Interface::Bitmap)
+                    && self.bitmaps.contains_key(&alvo)
+                {
+                    self.expose_dib(alvo)?;
+                }
                 if alvo != 0 {
                     self.objects.add_ref(alvo);
                 }
                 alvo
+            }
+            "GetViewport" => {
+                if a1 == 0 {
+                    FALSE
+                } else {
+                    // O caminho atual desenha no destino inteiro; o clip é independente.
+                    // AEERect tem quatro int16 e o boolean de saída ocupa só um byte.
+                    let alvo = self.target()?;
+                    let tela = self.bitmaps.get(&alvo).unwrap_or_else(|| self.screen());
+                    let bytes: Vec<_> = [
+                        0i16,
+                        0,
+                        tela.width().min(i16::MAX as u32) as i16,
+                        tela.height().min(i16::MAX as u32) as i16,
+                    ]
+                    .into_iter()
+                    .flat_map(i16::to_le_bytes)
+                    .collect();
+                    self.cpu.write_mem(a1, &bytes)?;
+                    if a2 != 0 {
+                        self.cpu.write_mem(a2, &[0])?;
+                    }
+                    TRUE
+                }
             }
             "SetClip" => {
                 // O Bejeweled Twist passa uma estrutura de 16 bytes: um campo de estado seguido
@@ -1060,6 +1208,21 @@ impl<C: CpuBackend> Machine<C> {
     /// A cor é a do `CLR_USER_TEXT`, que é o que o `IDISPLAY_SetColor` ajusta, e o recorte vale
     /// aqui como em qualquer outro desenho.
     pub(super) fn draw_text(&mut self, text: &str, x: i32, y: i32) -> Result<bool, CpuError> {
+        self.draw_text_sized(text, x, y, FONT_SIZE)
+    }
+
+    fn draw_text_sized(&mut self, text: &str, x: i32, y: i32, size: f32) -> Result<bool, CpuError> {
+        self.draw_text_with_cells(text, x, y, size, None)
+    }
+
+    fn draw_text_with_cells(
+        &mut self,
+        text: &str,
+        x: i32,
+        y: i32,
+        size: f32,
+        cells: Option<(u32, u32)>,
+    ) -> Result<bool, CpuError> {
         // O registro é do que **foi** desenhado, e não do que faltou: um jogo que mostra várias
         // telas de aviso ao longo da execução precisa que o relatório diga qual delas veio quando.
         if text.chars().any(|c| !c.is_whitespace()) {
@@ -1072,7 +1235,7 @@ impl<C: CpuBackend> Machine<C> {
         let Some(fonte) = self.font.as_ref() else {
             return Ok(false);
         };
-        let glifos = fonte.layout(text, FONT_SIZE);
+        let glifos = fonte.layout_with_cells(text, size, cells);
         if glifos.is_empty() {
             return Ok(true);
         }
@@ -1081,7 +1244,7 @@ impl<C: CpuBackend> Machine<C> {
             .get(CLR_USER_TEXT)
             .copied()
             .unwrap_or(Rgb::BLACK);
-        self.escreve(text, x, y, cor)
+        self.escreve_with_cells(text, x, y, cor, size, cells)
     }
 
     /// O texto desenhado, em ordem, com o instante virtual e a posição.
@@ -1098,10 +1261,33 @@ impl<C: CpuBackend> Machine<C> {
         y: i32,
         cor: Rgb,
     ) -> Result<bool, CpuError> {
+        self.escreve_sized(text, x, y, cor, FONT_SIZE)
+    }
+
+    fn escreve_sized(
+        &mut self,
+        text: &str,
+        x: i32,
+        y: i32,
+        cor: Rgb,
+        size: f32,
+    ) -> Result<bool, CpuError> {
+        self.escreve_with_cells(text, x, y, cor, size, None)
+    }
+
+    fn escreve_with_cells(
+        &mut self,
+        text: &str,
+        x: i32,
+        y: i32,
+        cor: Rgb,
+        size: f32,
+        cells: Option<(u32, u32)>,
+    ) -> Result<bool, CpuError> {
         let Some(fonte) = self.font.as_ref() else {
             return Ok(false);
         };
-        let glifos = fonte.layout(text, FONT_SIZE);
+        let glifos = fonte.layout_with_cells(text, size, cells);
         if glifos.is_empty() {
             return Ok(true);
         }

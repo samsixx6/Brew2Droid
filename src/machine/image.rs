@@ -2,6 +2,11 @@
 
 use super::*;
 
+// Campo privado do nosso IImage: a origem pertence à imagem até ser retirada.
+// O consumidor de City ID descobre o campo por identidade no BltIn, zera-o e
+// solta a imagem; não depende de um deslocamento de um provedor específico.
+const BITMAP_MEMBER: u32 = 4;
+
 impl<C: CpuBackend> Machine<C> {
     /// `IImageDecoder` e o `IForceFeed` que o alimenta.
     ///
@@ -390,7 +395,17 @@ impl<C: CpuBackend> Machine<C> {
                 .write_mem(pixels + bitmap::PREFIXO_NATIVO_565, &fb.to_rgb565_bytes())?;
             pixels
         } else {
-            let Some(size) = (fb.passo_do_dib() as u32).checked_mul(height).and_then(|n| n.checked_add(64)) else {
+            // O IDIB público ocupa 36 bytes. O enchimento até 64 criava uma sequência
+            // falsa de pixels pretos antes do raster: Penoa mede a profundidade com
+            // uma linha de 32 zeros e passava a identificar RGB565 como três bytes.
+            const CABECALHO_DIB: u32 = 36;
+            // O provedor selecionado pode reservar bytes privados depois do IDIB.
+            // O ponteiro público acompanha o deslocamento real; o par NOM2
+            // também soma esse deslocamento guardado no seu cache de dispositivo.
+            let Some(pixel_offset) = CABECALHO_DIB.checked_add(self.native_image_padding) else {
+                return Ok(0);
+            };
+            let Some(size) = (fb.passo_do_dib() as u32).checked_mul(height).and_then(|n| n.checked_add(pixel_offset)) else {
                 return Ok(0);
             };
             let bitmap = self.malloc(size)?;
@@ -401,8 +416,8 @@ impl<C: CpuBackend> Machine<C> {
             self.objects.adopt(bitmap, Interface::Bitmap);
             self.cpu.write_u32(bitmap, loader::vtable_addr(Interface::Bitmap))?;
             self.converted_bitmap_blocks.insert(bitmap);
-            self.dib_buffers.insert(bitmap, bitmap + 64);
-            self.cpu.watch_dirty(bitmap, bitmap + 64, size - 64)?;
+            self.dib_buffers.insert(bitmap, bitmap + pixel_offset);
+            self.cpu.watch_dirty(bitmap, bitmap + pixel_offset, size - pixel_offset)?;
             bitmap
         };
         self.bitmaps.insert(addr, fb);
@@ -467,11 +482,36 @@ impl<C: CpuBackend> Machine<C> {
         Ok((size > 0 && size <= MAX_NATIVE_IMAGE).then_some(size))
     }
 
+    fn release_image_bitmap(&mut self, image: u32) {
+        if let Some(bitmap) = self.image_bitmaps.remove(&image) {
+            // Só zero transfere a referência. Um valor estranho não é um objeto
+            // adotável e não pode deixar o bitmap realmente possuído vazar.
+            if self.cpu.read_u32(image + BITMAP_MEMBER).ok() != Some(0)
+                && self.objects.release(bitmap) == 0
+            {
+                self.solta_dib(bitmap);
+                self.bitmaps.remove(&bitmap);
+                self.transparency.remove(&bitmap);
+                self.cpu.unwatch_dirty(bitmap);
+            }
+        }
+    }
+
+    /// A imagem pronta já possui seu bitmap, inclusive antes do primeiro Draw.
+    /// Substituir o stream cria outra origem: referências externas à antiga
+    /// continuam vendo seus pixels, em vez de uma atualização silenciosa.
+    pub(super) fn install_decoded_image(&mut self, image: u32, decoded: DecodedImage) -> Result<(), CpuError> {
+        self.release_image_bitmap(image);
+        self.images.insert(image, std::rc::Rc::new(decoded));
+        self.bitmap_from_image(image)?;
+        Ok(())
+    }
+
     pub(super) fn release_image(&mut self, image: u32) -> u32 {
         let remaining = self.objects.release(image);
         if remaining == 0 {
             self.images.remove(&image);
-            self.image_bitmaps.remove(&image);
+            self.release_image_bitmap(image);
             self.recortes_de_imagem.remove(&image);
             // O endereço volta a ser de outro objeto, que não pode herdar o callback.
             self.image_notify.remove(&image);
@@ -539,9 +579,12 @@ impl<C: CpuBackend> Machine<C> {
                 self.draw_image(this, a2 as i32, a3 as i32, Some(a1))?;
                 SUCCESS
             }
-            // Sem animação, `Start` é um `Draw` e `Stop` não tem o que parar.
+            // A tira guarda todos os quadros, mas Start mostra só o primeiro.
+            // O avanço por tempo ainda não é emulado; desenhar a tira inteira
+            // colocaria os quadros seguintes ao lado da imagem pedida.
             "Start" => {
-                self.draw_image(this, a1 as i32, a2 as i32, None)?;
+                let frame = self.images.get(&this).is_some_and(|image| image.frame_width > 0).then_some(0);
+                self.draw_image(this, a1 as i32, a2 as i32, frame)?;
                 SUCCESS
             }
             "Stop" | "HandleEvent" => SUCCESS,
@@ -582,7 +625,7 @@ impl<C: CpuBackend> Machine<C> {
         let bytes = self.read_bytes(source.buffer, source.size)?;
         match decodifica_imagem(&bytes) {
             Some(decoded) => {
-                self.images.insert(image, std::rc::Rc::new(decoded));
+                self.install_decoded_image(image, decoded)?;
             }
             None => {
                 self.assumptions
@@ -681,10 +724,12 @@ impl<C: CpuBackend> Machine<C> {
                 recorte.y = p2 as i32;
             }
             IPARM_ROP => {
+                // OLDMASK é o pedido de transparência do IImage anterior ao BREW 1.2.
+                // Nemesis ainda o usa no preview BMP; ignorá-lo copiava o fundo magenta.
                 self.recortes_de_imagem
                     .entry(image)
                     .or_default()
-                    .transparente = p1 == AEE_RO_TRANSPARENT;
+                    .transparente = matches!(p1, 4 | AEE_RO_TRANSPARENT);
             }
             IPARM_CXFRAME => {
                 if let Some(info) = self.images.get_mut(&image) {
@@ -703,6 +748,9 @@ impl<C: CpuBackend> Machine<C> {
                 let bitmap = self.bitmap_from_image(image)?;
                 if p1 != 0 {
                     self.cpu.write_u32(p1, bitmap)?;
+                    if bitmap != 0 {
+                        self.objects.add_ref(bitmap);
+                    }
                 }
                 if p2 != 0 {
                     self.cpu
@@ -741,6 +789,7 @@ impl<C: CpuBackend> Machine<C> {
             surface.set_pixel_native(x as i32, y as i32, *pixel);
         }
         self.bitmaps.insert(addr, surface);
+        self.cpu.write_u32(image + BITMAP_MEMBER, addr)?;
         self.image_bitmaps.insert(image, addr);
         Ok(addr)
     }

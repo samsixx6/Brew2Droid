@@ -174,7 +174,9 @@ fn decode(bytes: &[u8], settings: &DecodeSettings) -> Result<(Sound, bool), Stri
         let _ = (&settings, &mut used_bank);
         super::midi::decode(midi)
     };
-    let result = if bytes.starts_with(b"cmid") {
+    let result = if bytes.starts_with(b"MMMD") {
+        super::smaf::decode(bytes)
+    } else if bytes.starts_with(b"cmid") {
         super::cmf::decode_with(bytes, &mut music)
     } else if bytes.get(8..12) == Some(b"QLCM") {
         super::qcp::decode(bytes)

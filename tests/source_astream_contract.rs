@@ -472,3 +472,123 @@ fn adapter_rejects_saved_callback_with_wrong_owner() {
     let mut restored = Fixture::new();
     assert!(restored.machine.restaura_estado(&broken.fecha()).is_err());
 }
+
+// AEESource.h: GetLine tem ponteiro, comprimento e dois booleanos; os códigos
+// 4/3 descrevem CRLF/LF, e 0 pode acompanhar uma última linha sem terminador.
+impl Fixture {
+    fn lines(&mut self, bytes: &[u8], capacity: u32) -> u32 {
+        let (util, source) = self.source(bytes);
+        assert_eq!(self.call(Interface::SourceUtil, "GetLineFromSource",
+            [util, source, capacity, BUFFER + 128]), 0);
+        self.machine.cpu().read_u32(BUFFER + 128).unwrap()
+    }
+
+    fn line(&mut self, reader: u32, mode: u32, expected: &[u8], code: u32,
+        leftover: bool, truncated: bool) -> u32 {
+        let output = BUFFER + 2048;
+        self.machine.cpu_mut().write_mem(output - 4, &[0xa5; 20]).unwrap();
+        assert_eq!(self.call(Interface::Peek, "LerLinha", [reader, output, mode, 0]), code);
+        let mut structure = [0; 20];
+        self.machine.cpu().read_mem(output - 4, &mut structure).unwrap();
+        assert_eq!(&structure[..4], &[0xa5; 4]);
+        assert_eq!(&structure[16..], &[0xa5; 4]);
+        assert_eq!(&structure[12..14], &[u8::from(leftover), u8::from(truncated)]);
+        assert_eq!(&structure[14..16], &[0xa5; 2], "padding não é campo da ABI");
+        let pointer = u32::from_le_bytes(structure[4..8].try_into().unwrap());
+        assert_eq!(u32::from_le_bytes(structure[8..12].try_into().unwrap()), expected.len() as u32);
+        let mut actual = vec![0; expected.len() + 1];
+        self.machine.cpu().read_mem(pointer, &mut actual).unwrap();
+        assert_eq!(&actual[..expected.len()], expected);
+        assert_eq!(actual[expected.len()], 0);
+        pointer
+    }
+}
+
+#[test]
+fn getline_sdk_codes_flags_empty_lines_and_final_unterminated_data() {
+    let mut f = Fixture::new();
+    let reader = f.lines(b"hostname=example\r\n\r\nlang=d0\nlast", 128);
+    f.line(reader, 3, b"hostname=example", 4, false, false);
+    f.line(reader, 3, b"", 4, false, false);
+    f.line(reader, 3, b"lang=d0", 3, false, false);
+    f.line(reader, 3, b"last", 0, false, false);
+    f.line(reader, 3, b"", 0, false, false);
+    f.line(reader, 3, b"", 0, false, false);
+}
+
+#[test]
+fn getline_crlf_mode_preserves_lone_lf_cr_and_embedded_nul() {
+    let mut f = Fixture::new();
+    let reader = f.lines(b"a\nb\rc\0d\r\ntail\r", 128);
+    f.line(reader, 4, b"a\nb\rc\0d", 4, false, false);
+    f.line(reader, 4, b"tail\r", 0, false, false);
+    let reader = f.lines(b"a\rb\n", 128);
+    // O SDK documenta modo CR como equivalente a LF, sem quebrar em CR isolado.
+    f.line(reader, 2, b"a\rb", 3, false, false);
+}
+
+#[test]
+fn getline_consumes_eol_and_shares_persistent_cursor_with_read() {
+    let mut f = Fixture::new();
+    let reader = f.lines(b"first\r\nsecond\nlast", 128);
+    f.line(reader, 3, b"first", 4, false, false);
+    assert_eq!(f.call(Interface::Peek, "Read", [reader, BUFFER + 512, 2, 0]), 2);
+    assert_eq!(f.machine.cpu().read_u32(BUFFER + 512).unwrap() & 0xffff, 0x6573);
+    let state = f.machine.grava_estado();
+    let mut restored = Fixture::new();
+    restored.machine.restaura_estado(&state).unwrap();
+    restored.line(reader, 3, b"cond", 3, false, false);
+    restored.line(reader, 3, b"last", 0, false, false);
+}
+
+#[test]
+fn getline_buffer_hint_does_not_truncate_the_bounded_complete_source() {
+    let mut f = Fixture::new();
+    // nBufSize sugere quanto tentar alocar. A estratégia atual guarda a fonte
+    // inteira; FULL não é necessário e seu número não é presumido.
+    let reader = f.lines(b"abcdefghijk\r\nnext\r\n", 1);
+    let pointer = f.line(reader, 3, b"abcdefghijk", 4, false, false);
+    assert_eq!(f.machine.cpu().read_u32(pointer + 12).unwrap() & 0xff, b'\n' as u32);
+    let state = f.machine.grava_estado();
+    let parsed = zeebx::save_state::Leitor::abre(&state).unwrap();
+    assert_eq!(parsed.u32s(&format!("peek.{reader}.meta")).unwrap().len(), 2,
+        "o cursor continua compatível com o formato de estado anterior");
+    let mut restored = Fixture::new();
+    restored.machine.restaura_estado(&state).unwrap();
+    restored.line(reader, 3, b"next", 4, false, false);
+    restored.line(reader, 3, b"", 0, false, false);
+}
+
+#[test]
+fn getline_empty_source_and_peek_eof_fill_outputs_without_touching_canaries() {
+    let mut f = Fixture::new();
+    let reader = f.lines(b"", 1);
+    f.line(reader, 3, b"", 0, false, false);
+    f.machine.cpu_mut().write_mem(BUFFER + 1000, &[0xa5; 12]).unwrap();
+    assert_eq!(f.call(Interface::Peek, "Peek",
+        [reader, 1, BUFFER + 1000, BUFFER + 1004]), 0);
+    assert_eq!(f.machine.cpu().read_u32(BUFFER + 1000).unwrap(), 0);
+    assert_eq!(f.machine.cpu().read_u32(BUFFER + 1004).unwrap(), 0);
+    assert_eq!(f.machine.cpu().read_u32(BUFFER + 1008).unwrap(), 0xa5a5a5a5);
+}
+
+#[test]
+fn getline_rejects_saved_source_larger_than_its_backing_allocation() {
+    let mut f = Fixture::new();
+    let reader = f.lines(b"x", 1);
+    let state = f.machine.grava_estado();
+    let parsed = zeebx::save_state::Leitor::abre(&state).unwrap();
+    let section = format!("peek.{reader}.bytes");
+    let mut broken = zeebx::save_state::Secoes::nova();
+    for name in parsed.nomes() {
+        broken.poe(name, if name == section { vec![b'x'; 1024] }
+            else { parsed.secao(name).unwrap().to_vec() });
+    }
+    let mut restored = Fixture::new();
+    restored.machine.restaura_estado(&broken.fecha()).unwrap();
+    let output = BUFFER + 2048;
+    restored.machine.cpu_mut().write_mem(output, &[0xa5; 12]).unwrap();
+    assert_eq!(restored.call(Interface::Peek, "LerLinha", [reader, output, 3, 0]), 2);
+    assert_eq!(restored.machine.cpu().read_u32(output).unwrap(), 0xa5a5a5a5);
+    assert_eq!(restored.call(Interface::Peek, "Peek", [reader, 1, 0, 0]), 2);
+}

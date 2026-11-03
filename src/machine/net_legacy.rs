@@ -62,6 +62,7 @@ impl<C: CpuBackend> Machine<C> {
                 let remaining = self.objects.release(this);
                 if remaining == 0 {
                     self.net_legacy_errors.remove(&this);
+                    self.net_legacy_linger.remove(&this);
                 }
                 // AEENet.h: liberar o gerenciador não cancela notificações registradas.
                 remaining
@@ -92,11 +93,38 @@ impl<C: CpuBackend> Machine<C> {
                 NET_PPP_CLOSED
             }
             "GetMyIPAddr" => 0,
+            // AEENet.h: uint16, devolve o tempo anterior (padrão de 30 segundos).
+            // Configurar o prazo não abre a conexão nem inventa um endereço IP.
+            "SetLinger" => u32::from(self.net_legacy_linger.insert(this, a1 as u16).unwrap_or(30)),
             "GetLastError" => self.net_legacy_errors.get(&this).copied().unwrap_or(SUCCESS),
-            "OpenSocket" => {
+            "GetHostByName" => {
+                // AEENet.h: void(pNet, pres, host, pcb), erro entregue por pres e
+                // AEECallback. O serviço offline não consulta DNS do anfitrião.
+                if a1 == 0 || a3 == 0 { return Ok(Some(14)); }
+                // Validar antes de registrar a entrega. AEEDNSResult é int + 4 IPv4;
+                // em NFS o próprio AEECallback começa imediatamente após estes 20 bytes.
+                let mut result = [0; 20];
+                self.cpu.read_mem(a1, &mut result)?;
+                // Cancelar o registro anterior antes de publicar o resultado novo.
+                // Owner zero: Release de INetMgr não cancela esta operação no SDK.
+                self.schedule_callback(a3, 0)?;
+                result.fill(0);
+                result[..4].copy_from_slice(&AEE_NET_ENETDOWN.to_le_bytes());
+                self.cpu.write_mem(a1, &result)?;
                 self.net_legacy_errors.insert(this, AEE_NET_ENETDOWN);
-                // O retorno é ISocket*, não um código de erro convertido em ponteiro.
-                0
+                SUCCESS
+            }
+            "OpenSocket" => {
+                // AEENet.h: o invólucro nasce sem precisar de conexão; recursos
+                // OEM só são pedidos por Connect/Bind/SendTo/Realize.
+                if a1 > 1 {
+                    self.net_legacy_errors.insert(this, 0x207); // ESOCKNOSUPPORT.
+                    0
+                } else {
+                    let socket = self.open_legacy_socket(a1)?;
+                    self.net_legacy_errors.insert(this, if socket == 0 { 0x22d } else { SUCCESS });
+                    socket
+                }
             }
             _ => {
                 self.net_legacy_errors.insert(this, EUNSUPPORTED);
@@ -177,9 +205,9 @@ mod tests {
         assert_eq!(chama(&mut machine, object, 7, [0, 0, 0]), 0);
         assert_eq!(chama(&mut machine, object, 11, [999, stats, stats + 32]), 20);
         assert_eq!(machine.cpu.read_u32(stats + 32).unwrap(), 0xa5a5_a5a5);
-        assert_eq!(chama(&mut machine, object, 5, [0, 0, 0]), 0,
+        assert_eq!(chama(&mut machine, object, 5, [2, 0, 0]), 0,
             "uma falha de socket jamais pode parecer ponteiro 20");
-        assert_eq!(chama(&mut machine, object, 4, [0, 0, 0]), 0x216);
+        assert_eq!(chama(&mut machine, object, 4, [0, 0, 0]), 0x207);
     }
 
     #[test]
@@ -189,11 +217,11 @@ mod tests {
         assert_eq!(chama(&mut before, object, 9, [0x12341, 0x45678, 1]), 0);
         assert_eq!(chama(&mut before, object, 1, [0, 0, 0]), 0);
         let live = cria_rede(&mut before);
-        assert_eq!(chama(&mut before, live, 5, [0, 0, 0]), 0);
+        assert_eq!(chama(&mut before, live, 5, [2, 0, 0]), 0);
         let state = before.grava_estado();
         let mut after = maquina();
         after.restaura_estado(&state).unwrap();
-        assert_eq!(chama(&mut after, live, 4, [0, 0, 0]), 0x216);
+        assert_eq!(chama(&mut after, live, 4, [0, 0, 0]), 0x207);
         let object = cria_rede(&mut after);
         assert_eq!(chama(&mut after, object, 9, [0x12341, 0x45678, 1]), 26,
             "AEENet.h exige remoção explícita mesmo depois de Release");

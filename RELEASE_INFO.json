@@ -1,70 +1,72 @@
 {
-  "snapshot_date": "2026-10-29",
+  "snapshot_date": "2026-11-03",
+  "application_id": "com.samsixx.brew2droid",
   "android_version_name": "1.0",
   "android_version_code": 2,
-  "suggested_tag": "v1.0",
-  "apk_sha256": "d72d06c8e2667088d3f587d7bb08ef24896e8596ce2fe81b13ff0441ed22c44d",
-  "apk_bytes": 18337523,
-  "apk_type": "optimized ARM64 native code; debug-signed development wrapper",
-  "host_tests": {
-    "passed": 1179,
-    "failed": 0,
-    "ignored": 5
-  },
-  "s25_raging_thunder_2_measured_fps": 30.29412894371405,
-  "fallback_covers_included": false,
+  "apk_filename": "Brew2Droid-1.0-latest-arm64.apk",
+  "apk_sha256": "fc12d595169d7e63bc811573efa3c754c5494bf597de7ea9fa66e2fefc8e1bca",
+  "apk_bytes": 35789671,
+  "apk_type": "optimized ARM64 native code; existing debug-signed development wrapper",
   "source_workspace_packages": [
     "zeebx",
     "zeebx-android",
     "brew-probe"
   ],
-  "source_export_tests": {
-    "passed": 1179,
-    "failed": 0,
-    "ignored": 5,
-    "test_programs": 63,
-    "verification_profile_overrides": {
-      "lto": "off",
-      "codegen_units": 16
-    }
+  "fallback_covers_included": false,
+  "compatibility": {
+    "original_opaque_mod_mif_pairs_recognized": 24,
+    "original_game_files_modified": false,
+    "generic_mif_decoder": false,
+    "original_mif_startup_check": {
+      "normal_startup_screens": 16,
+      "separate_runtime_issues": 8,
+      "unsupported_mif_variants": [
+        "orcsandelves"
+      ],
+      "full_gameplay_qualified": false
+    },
+    "tank_raid": "First-level terrain rendering restored by shared REALLOC zero-growth correction; save/restore checked."
   },
-  "host_tests_date": "2026-10-27",
-  "source_export_tests_date": "2026-10-27",
-  "android_editor_validation": {
-    "date": "2026-10-28",
-    "java_contract_suites": [
-      "ButtonLayoutModelTest",
-      "ButtonLayoutPresetTest",
-      "ButtonLayoutResetTest",
-      "ButtonLayoutRevertTest"
-    ],
-    "apk_build": "success",
-    "instrumentation_build": "success",
-    "native_libraries_unchanged": true,
-    "phone_visual_verification": false
-  },
-  "apk_filename": "Brew2Droid-1.0-arm64.apk",
-  "version_build_validation": {
-    "date": "2026-10-29",
-    "optimized_native_build": "success",
+  "working_tree_validation": {
+    "original_mif_update": {
+      "date": "2026-11-03",
+      "targeted_tests_passed": 916,
+      "failed": 0,
+      "default_ignored": 38,
+      "original_package_tests_explicitly_run": 41
+    },
+    "tank_raid_update": {
+      "date": "2026-11-02",
+      "core_tests_passed": 1832,
+      "original_package_checks_passed": 54,
+      "frontend_checks_passed": 55,
+      "failed": 0
+    },
+    "standalone_libretro_abi_verified": true,
+    "android_optimized_native_build": "success",
     "android_packaging": "success",
-    "apk_version_verified": true,
     "signature_verified": true,
     "signing_identity_unchanged": true,
-    "alignment_16k_verified": true,
-    "runtime_assets_and_native_libraries_unchanged": true,
-    "phone_runtime_tested": false
+    "elf_and_zip_16k_alignment_verified": true,
+    "packaged_native_provenance_verified": true,
+    "physical_device_tested_for_this_snapshot": false
   },
-  "application_id": "com.samsixx.brew2droid",
-  "package_identity_validation": {
-    "date": "2026-10-29",
-    "application_id": "com.samsixx.brew2droid",
-    "version_name": "1.0",
-    "version_code": 2,
-    "launcher_class_verified": true,
-    "instrumentation_target_verified": true,
-    "native_bindings_unchanged": true,
-    "packaging_tool_tests_passed": 21,
-    "phone_runtime_tested": false
+  "source_export_tests": {
+    "status": "passed",
+    "date": "2026-11-03",
+    "command": "cargo test --locked --offline --release --no-default-features --features gl -p zeebx -p brew-probe --jobs 16 --no-fail-fast",
+    "rust_tests_passed": 1959,
+    "rust_tests_failed": 0,
+    "rust_tests_ignored": 66,
+    "rust_test_targets": 164,
+    "python_tool_tests_passed": 21,
+    "python_tool_tests_failed": 0,
+    "profile_overrides": {
+      "lto": false,
+      "codegen_units": 16
+    },
+    "apk_profile_overridden": false,
+    "android_dependencies_match_tested_working_tree": true,
+    "host_test_dependencies_match_tested_working_tree": true
   }
 }

@@ -5,12 +5,13 @@ MIT, BSD, Apache, Zlib, OFL e a LGPL do Qt pedem que o aviso de copyright e o te
 acompanhem o binário. O arquivo é versionado e vai em todos os pacotes da release; o
 `release.yml` roda este script com `--confere` e para se ele estiver velho.
 
-Três partes, porque o `cargo about` só enxerga crates:
+Complementos, porque o `cargo about` só enxerga crates:
 
 - as crates, pelo `cargo about` com o `about.toml` da raiz;
 - o C++ que o `dynarmic` compila junto (fmt, mcl, xbyak, zydis…), lido da cópia da crate no
   registro do cargo;
 - o Qt 6, que vai dentro do AppImage, do instalador do Windows e do `.dmg` do frontend Qt.
+- as fontes redistribuíveis incorporadas ao core, com os avisos e licenças originais.
 
     python3 ferramentas/avisos_de_terceiros.py            # reescreve o arquivo
     python3 ferramentas/avisos_de_terceiros.py --confere  # só diz se está em dia
@@ -107,6 +108,38 @@ def dynarmic() -> str:
     return "".join(partes)
 
 
+def fontes() -> str:
+    assets = RAIZ / "assets" / "fonts"
+    licencas = RAIZ / "assets" / "licenses"
+    proveniencia = json.loads((assets / "font-provenance.json").read_text(encoding="utf-8"))
+    partes = [
+        "=" * 80 + "\n"
+        + (licencas / "FONT-NOTICES.txt").read_text(encoding="utf-8").strip() + "\n\n"
+    ]
+    for fonte in proveniencia["fonts"]:
+        # Os caminhos vêm da proveniência versionada, não de arquivos do host ou rede.
+        texto = (assets / fonte["license_file"]).read_text(encoding="utf-8").strip()
+        partes.append(
+            "=" * 80 + f"\n{fonte['family']} {fonte['version']} (bundled fallback font)\n"
+            + f"Source: {fonte['source_url']}\n" + "-" * 80 + f"\n\n{texto}\n\n"
+        )
+    return "".join(partes)
+
+
+def smaf_fm() -> str:
+    origem = RAIZ / "third-party" / "smaf-fm"
+    proveniencia = json.loads((origem / "provenance.json").read_text(encoding="utf-8"))
+    return (
+        "=" * 80 + "\nYamaha SMAF FM DSP / VMA voice decoder (Apache-2.0)\n"
+        "Author: Andreas Wendorf (Akustikrausch)\n"
+        f"Source: {proveniencia['repository']}/tree/{proveniencia['commit']}\n"
+        "The four upstream DSP/VMA files are unchanged; Brew2Droid's bounded C wrapper is separate.\n"
+        "No ringtone, SDK, Yamaha sample ROM, external parser or host audio library is included.\n"
+        "Preset instruments use replacement FM timbres, not historical ROM samples.\n"
+        + "-" * 80 + "\n\n" + (origem / "LICENSE").read_text(encoding="utf-8") + "\n\n"
+    )
+
+
 def gera() -> str:
     lgpl = (LICENCAS / "LGPL-3.0.txt").read_text(encoding="utf-8")
     qcelp = RAIZ / "third-party" / "qcelp"
@@ -116,7 +149,7 @@ def gera() -> str:
                "Source and modifications: third-party/qcelp/README.md\n"
                "https://github.com/FFmpeg/FFmpeg/tree/140fd653aed8cad774f991ba083e2d01e86420c7\n\n"
                + (qcelp / "COPYING.LGPLv2.1").read_text(encoding="utf-8") + "\n\n")
-    return CABECALHO + crates() + dynarmic() + decoder + QT + lgpl
+    return CABECALHO + crates() + dynarmic() + decoder + smaf_fm() + fontes() + QT + lgpl
 
 
 def main() -> None:

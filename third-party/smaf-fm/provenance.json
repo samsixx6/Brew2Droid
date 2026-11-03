@@ -1,0 +1,33 @@
+{
+  "repository": "https://github.com/akustikrausch/yamaha-smaf-player",
+  "commit": "627f7ad8583ce34c5fec0269ef9778167af080d6",
+  "license": "Apache-2.0",
+  "files": [
+    {
+      "path": "src/ma_fm_core.cpp",
+      "size": 19747,
+      "sha256": "d6a26af363e7ffae07372d1a78ed2f8a27e3e9bb33e15665d11feeb247ec9841"
+    },
+    {
+      "path": "src/ma_fm_core.h",
+      "size": 8127,
+      "sha256": "e36884c376395b7e763c0bee628f5ab750fc3bfce914bd4c12135abb50e27aa8"
+    },
+    {
+      "path": "src/smaf_voice.cpp",
+      "size": 10693,
+      "sha256": "c7146e473ad6fe807e25902c0e73cfe007fdee8b84d2d0e3f92c50c455c960bd"
+    },
+    {
+      "path": "src/smaf_voice.h",
+      "size": 2331,
+      "sha256": "bbe9fd67079060e0e7791ad204d8aecbe1949649e1e5bfb0f08971e20bb1e852"
+    },
+    {
+      "path": "LICENSE",
+      "size": 11362,
+      "sha256": "caa5857bded64724d7f5f346e614f5dcdc127306f9686c69e1b114ca20e52d20"
+    }
+  ],
+  "modifications": "None in the four upstream DSP/VMA files. Brew2Droid wrapper is separate. No upstream container parser, player, ringtone, ROM or SDK data is bundled."
+}

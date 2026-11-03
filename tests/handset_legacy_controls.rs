@@ -976,3 +976,59 @@ fn menu_restore_requires_a_retained_reference_for_each_shared_image_owner() {
     }
     cleanup(machine, root);
 }
+
+#[test]
+fn legacy_menu_scoped_underline_title_adds_a_clipped_rule_and_survives_save() {
+    let (mut machine, root) = machine();
+    let menu = create(&mut machine, MENU);
+    let rect = [10i16, 20, 80, 40]
+        .into_iter()
+        .flat_map(i16::to_le_bytes)
+        .collect::<Vec<_>>();
+    machine.cpu_mut().write_mem(RECT, &rect).unwrap();
+    call(&mut machine, menu, 6, &[RECT]);
+    write_wide(&mut machine, WIDE, "Title");
+    assert_eq!(call(&mut machine, menu, 11, &[0, 0, WIDE]), 1);
+    call(&mut machine, menu, 3, &[]);
+    let plain = machine.screen().to_rgb565_bytes();
+    // MP_UNDERLINE_TITLE de AEEMenu.h, também usado pelo menu de Water Margin.
+    call(&mut machine, menu, 8, &[0x0400_0000]);
+    call(&mut machine, menu, 3, &[]);
+    let underlined = machine.screen().to_rgb565_bytes();
+    let changed = plain
+        .chunks_exact(2)
+        .zip(underlined.chunks_exact(2))
+        .enumerate()
+        .filter_map(|(index, (before, after))| {
+            (before != after).then_some((index % 240, index / 240))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !changed.is_empty(),
+        "a propriedade deve desenhar o sublinhado, não só guardar o bit"
+    );
+    assert!(
+        changed
+            .iter()
+            .all(|&(x, y)| (10..90).contains(&x) && (20..60).contains(&y))
+    );
+    assert!(
+        changed.iter().all(|&(_, y)| y == changed[0].1),
+        "sublinhado horizontal de um pixel"
+    );
+    assert!(changed.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1));
+    assert!(
+        changed
+            .iter()
+            .all(|&(x, y)| machine.screen().get_pixel(x as i32, y as i32) == 0)
+    );
+    let saved = machine.grava_estado();
+    call(&mut machine, menu, 8, &[0]);
+    call(&mut machine, menu, 3, &[]);
+    assert_eq!(machine.screen().to_rgb565_bytes(), plain);
+    machine.restaura_estado(&saved).unwrap();
+    assert_eq!(call(&mut machine, menu, 9, &[]), 0x0400_0000);
+    call(&mut machine, menu, 3, &[]);
+    assert_eq!(machine.screen().to_rgb565_bytes(), underlined);
+    cleanup(machine, root);
+}

@@ -3,27 +3,14 @@
 use super::*;
 
 impl<C: CpuBackend> Machine<C> {
-    /// Atende o `ISource` e o `IPeek`. Ver [`Interface::Peek`].
-    ///
-    /// Do `IPeek` só o slot 8 tem corpo, e ele é a razão de tudo isto existir: a Z-Wheel lê o
-    /// `tectoy.cfg` linha a linha por ele. A chamada é `slot8(this, &par, 3)`, com `par` sendo
-    /// `{ponteiro, tamanho}` — o jogo lê os dois e **copia** o texto antes de pedir a próxima
-    /// linha, o que é o que permite reaproveitar um buffer só.
-    ///
-    /// **O valor de retorno é uma hipótese, e ela está medida.** O laço em `0x884fc` continua
-    /// enquanto `-retorno >= 2` e para em `-3`; devolver zero o encerraria na primeira linha,
-    /// inclusive numa linha vazia. Então: `1` enquanto houver linha, `-3` no fim. Que o console
-    /// devolva o mesmo `1` não se sabe — o que se sabe é a condição do laço.
+    /// Atende `ISource`, `IPeek` e o slot GetLine de `IGetLine` (AEESource.h).
+    /// A estrutura GetLine ocupa 12 bytes: ponteiro, comprimento, dois booleanos e padding.
+    /// O leitor mantém toda a fonte limitada em memória; não produz linhas truncadas.
     pub(super) fn source_call(
         &mut self,
         iface: Interface,
         slot: u32,
     ) -> Result<Option<u32>, CpuError> {
-        /// "Acabaram as linhas": o único valor que o laço da `0x88338` aceita como fim.
-        const FIM: u32 = (-3i32) as u32;
-        /// "Veio linha". Ver a nota sobre o retorno, acima.
-        const VEIO: u32 = 1;
-
         let Some(name) = iface.method(slot) else {
             return Ok(None);
         };
@@ -65,6 +52,10 @@ impl<C: CpuBackend> Machine<C> {
                 let Some(peek) = self.peeks.get(&this) else {
                     return Ok(Some(EBADPARM));
                 };
+                if peek.bytes.len() > 32 * 1024 * 1024 || peek.posicao > peek.bytes.len()
+                    || self.heap.size_of(peek.buffer).unwrap_or(0) < peek.bytes.len() as u32 + 1 {
+                    return Ok(Some(EBADPARM));
+                }
                 let remaining = &peek.bytes[peek.posicao..];
                 let buffer = peek.buffer;
                 self.cpu.write_mem(buffer, remaining)?;
@@ -72,8 +63,8 @@ impl<C: CpuBackend> Machine<C> {
                     self.cpu.write_u32(available, remaining.len() as u32)?;
                 }
                 if code != 0 {
-                    self.cpu
-                        .write_u32(code, if remaining.is_empty() { u32::MAX } else { 0 })?;
+                    // Toda a fonte já está disponível; não existem dados além do buffer.
+                    self.cpu.write_u32(code, 0)?;
                 }
                 if remaining.is_empty() { 0 } else { buffer }
             }
@@ -83,20 +74,38 @@ impl<C: CpuBackend> Machine<C> {
             }
             "LerLinha" => {
                 let par = self.cpu.read_reg(Reg::R1);
-                let Some(leitor) = self.peeks.get_mut(&this) else {
+                let modo = self.cpu.read_reg(Reg::R2);
+                if par == 0 || !matches!(modo, 2..=4) {
+                    return Ok(Some(EBADPARM));
+                }
+                let Some(leitor) = self.peeks.get(&this) else {
                     return Ok(Some(EBADPARM));
                 };
-                let Some(linha) = leitor.proxima_linha() else {
-                    return Ok(Some(FIM));
-                };
-                let (buffer, tamanho) = (leitor.buffer, linha.len() as u32);
-                self.cpu.write_mem(buffer, &linha)?;
-                self.cpu.write_mem(buffer + tamanho, &[0])?;
-                if par != 0 {
-                    self.cpu.write_u32(par, buffer)?;
-                    self.cpu.write_u32(par + 4, tamanho)?;
+                if leitor.bytes.len() > 32 * 1024 * 1024 || leitor.posicao > leitor.bytes.len()
+                    || self.heap.size_of(leitor.buffer).unwrap_or(0) < leitor.bytes.len() as u32 + 1 {
+                    return Ok(Some(EBADPARM));
                 }
-                VEIO
+                let resto = &leitor.bytes[leitor.posicao..];
+                // Modo CR (2) é equivalente a LF (3), como documenta o SDK.
+                let fim = resto.iter().enumerate().find(|&(i, b)|
+                    *b == b'\n' && (modo != 4 || (i > 0 && resto[i - 1] == b'\r')));
+                let (tamanho, consumido, resultado) = match fim {
+                    Some((i, _)) if i > 0 && resto[i - 1] == b'\r' => (i - 1, i + 1, 4),
+                    Some((i, _)) => (i, i + 1, 3),
+                    None => (resto.len(), resto.len(), 0),
+                };
+                let buffer = leitor.buffer;
+                self.cpu.write_mem(buffer, &resto[..tamanho])?;
+                self.cpu.write_mem(buffer + tamanho as u32, &[0])?;
+                if resultado == 4 {
+                    // Preserva o segundo byte do CRLF para permitir reconstruir o EOL.
+                    self.cpu.write_mem(buffer + tamanho as u32 + 1, b"\n")?;
+                }
+                self.cpu.write_u32(par, buffer)?;
+                self.cpu.write_u32(par + 4, tamanho as u32)?;
+                self.cpu.write_mem(par + 8, &[0, 0])?;
+                self.peeks.get_mut(&this).unwrap().posicao += consumido;
+                resultado
             }
             _ => SUCCESS,
         };
@@ -145,16 +154,21 @@ impl<C: CpuBackend> Machine<C> {
                 self.objects.add_ref(this);
                 SUCCESS
             }
-            // `int PeekSourceFromSource(ISourceUtil *po, ISource *ps, int nMax, IPeek **ppo)`.
-            //
-            // O `nMax` é o teto do que o leitor pode manter em memória; a Z-Wheel passa o
-            // tamanho do arquivo mais um, ou seja, o arquivo inteiro. Como já temos os bytes
-            // todos, ele não muda nada aqui — mas é o que diz que o jogo espera ler tudo.
+            // `nBufSize` é uma sugestão de alocação, não um limite obrigatório (AEESource.h).
+            // Mantemos a fonte inteira, limitada a 32 MiB, mais um byte para o NUL.
             "GetLineFromSource" | "PeekFromSource" => {
                 let (fonte, saida) = (self.cpu.read_reg(Reg::R1), self.cpu.read_reg(Reg::R3));
-                let Some(bytes) = self.sources.get(&fonte).cloned() else {
+                if saida == 0 {
+                    return Ok(Some(EBADPARM));
+                }
+                self.cpu.write_u32(saida, 0)?;
+                let Some(source) = self.sources.get(&fonte) else {
                     return Ok(Some(EBADPARM));
                 };
+                if source.len() > 32 * 1024 * 1024 {
+                    return Ok(Some(ENOMEMORY));
+                }
+                let bytes = source.clone();
                 let leitor = self.new_object(Interface::Peek)?;
                 if leitor == 0 {
                     return Ok(Some(ENOMEMORY));
@@ -165,6 +179,7 @@ impl<C: CpuBackend> Machine<C> {
                 // possível caiba.
                 let buffer = self.heap.alloc(bytes.len() as u32 + 1).unwrap_or(0);
                 if buffer == 0 {
+                    self.objects.release(leitor);
                     return Ok(Some(ENOMEMORY));
                 }
                 self.peeks.insert(

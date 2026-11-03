@@ -1280,6 +1280,9 @@ pub struct GlState {
     /// triângulos em 1.596 quadros. Sem isto, cada uma dessas leituras reconvertia duzentos e
     /// onze mil pixels de um quadro idêntico ao anterior, 1,46 ms que não produziam nada.
     sujo: bool,
+    /// A conversão pertence ao rasterizador, não ao último vetor do chamador.
+    /// EGL e apresentação leem o mesmo quadro em formatos e ordens diferentes.
+    quadro_565: Option<((usize, usize), (usize, usize), Vec<u8>)>,
 }
 
 impl GlState {
@@ -1347,6 +1350,7 @@ impl GlState {
             pending: Pending::default(),
             transformed: Vec::new(),
             sujo: true,
+            quadro_565: None,
         }
     }
 
@@ -2717,12 +2721,12 @@ impl GlState {
     /// **O caminho sem escala é separado de propósito.** Quando o pedido tem o tamanho da
     /// superfície — que é o caso normal —, as duas divisões por pixel do laço geral somam mais
     /// de quatrocentas mil divisões inteiras por chamada, e elas custavam mais que a conversão.
-    pub fn frame_rgb565(&mut self, width: usize, height: usize, out: &mut Vec<u8>) {
+    fn prepara_quadro_565(&mut self, width: usize, height: usize) {
         self.flush();
-        // Quadro igual ao que já está em `out`: não há o que reconverter. Ver [`GlState::sujo`].
-        if !self.sujo && out.len() == width * height * 2 {
+        if !self.sujo && self.quadro_565.as_ref().is_some_and(|(out, source, _)| *out == (width, height) && *source == self.surface()) {
             return;
         }
+        let mut out = self.quadro_565.take().map_or_else(Vec::new, |(_, _, bytes)| bytes);
         let (sw, sh) = self.surface();
         out.clear();
         out.resize(width * height * 2, 0);
@@ -2747,33 +2751,20 @@ impl GlState {
             }
         }
         self.sujo = false;
+        self.quadro_565 = Some(((width, height), (sw, sh), out));
     }
 
-    /// Mesmo quadro da exportação em bytes, mas sem a ida RGB565 -> bytes -> RGB565.
+    pub fn frame_rgb565(&mut self, width: usize, height: usize, out: &mut Vec<u8>) {
+        self.prepara_quadro_565(width, height);
+        out.clone_from(&self.quadro_565.as_ref().expect("quadro convertido").2);
+    }
+
+    /// A mesma conversão já pronta, entregue como palavras ao framebuffer de apresentação.
     pub fn frame_rgb565_words(&mut self, width: usize, height: usize, out: &mut Vec<u16>) {
-        self.flush();
-        if !self.sujo && out.len() == width * height {
-            return;
-        }
-        let (sw, sh) = self.surface();
+        self.prepara_quadro_565(width, height);
         out.clear();
-        out.resize(width * height, 0);
-        let converte = |p: [u8; 4]| {
-            ((p[0] as u16 >> 3) << 11) | ((p[1] as u16 >> 2) << 5) | (p[2] as u16 >> 3)
-        };
-        if sw == width && sh == height {
-            for (saida, &pixel) in out.iter_mut().zip(&self.color) {
-                *saida = converte(pixel);
-            }
-        } else {
-            for y in 0..height {
-                let linha = &self.color[(y * sh / height) * self.width..][..self.width];
-                for x in 0..width {
-                    out[y * width + x] = converte(linha[x * sw / width]);
-                }
-            }
-        }
-        self.sujo = false;
+        out.extend(self.quadro_565.as_ref().expect("quadro convertido").2
+            .chunks_exact(2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])));
     }
 
 #[cfg(test)]
@@ -4341,13 +4332,10 @@ mod tests {
         let vermelho = bytes.clone();
         assert_eq!(bytes.len(), 64 * 64 * 2);
 
-        // Nada mudou: a segunda leitura devolve o mesmo conteúdo, sem reconverter.
+        // O chamador pode reutilizar o vetor; o cache deve conservar o quadro verdadeiro.
         bytes.fill(0xAB);
         state.frame_rgb565(64, 64, &mut bytes);
-        assert!(
-            bytes.iter().all(|&b| b == 0xAB),
-            "sem mudança, o vetor de saída não é tocado"
-        );
+        assert_eq!(bytes, vermelho, "o vetor externo não é o cache do rasterizador");
 
         // Um `clear` mexe no buffer, então a leitura seguinte tem de reconverter.
         state.set_clear_color([0.0, 0.0, 1.0, 1.0]);
@@ -4810,6 +4798,8 @@ impl crate::save_state::Guardavel for GlState {
         self.depth = profundidade;
         self.stencil = stencil;
         self.textures = le_texturas(origem)?;
+        // Derivado dos pixels restaurados; não pertence ao formato do save state.
+        self.quadro_565 = None;
         Ok(())
     }
 }

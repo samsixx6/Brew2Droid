@@ -375,6 +375,7 @@
   "native.rescan_hint": "La biblioteca se actualiza al volver.",
   "native.imported": "Juegos importados",
   "native.storage": "Acceso a archivos",
+  "native.internal_storage": "Almacenamiento interno",
   "native.choose_folder": "Elegir esta carpeta",
   "native.error": "No se pudo completar",
   "handset.controls.enabled": "Activar botones en pantalla",

@@ -46,6 +46,9 @@ cp "$SYSROOT/$TRIPLA/libc++_shared.so" "$JNI/$ZEEBX_ANDROID_ABI/"
 LICENCAS="$AQUI/apk/app/src/main/assets/licenses"
 mkdir -p "$LICENCAS"
 cp "$RAIZ/LICENSE" "$RAIZ/LICENSE-GPL3" "$RAIZ/THIRD-PARTY-NOTICES.txt" "$LICENCAS/"
+for licenca in "$RAIZ"/assets/licenses/*.txt; do
+    [ -f "$licenca" ] && cp "$licenca" "$LICENCAS/"
+done
 
 echo "== .so =="
 ls -lh "$JNI/$ZEEBX_ANDROID_ABI/"

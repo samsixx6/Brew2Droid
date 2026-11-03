@@ -1,4 +1,5 @@
 //! Seleção de tela por jogo; executada ao descobrir/abrir, nunca por quadro.
+mod audited;
 use super::types::DisplayGeometry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -78,6 +79,9 @@ fn automatic_identity(hash: &str,module: &Path) -> Automatic {
             },
             source: Source::Known,
         };
+    }
+    if let Some(geometry) = audited::geometry(hash, module) {
+        return Automatic { geometry, source: Source::Known };
     }
     let mut sizes = std::collections::BTreeSet::new();
     if let Some(stem) = module.file_stem() {
@@ -388,4 +392,88 @@ pub fn set_override(
         }
     }
     resolve_hash(module, profiles, &hash)
+}
+#[cfg(test)]
+mod audited_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // Dados sintéticos: o catálogo de teste injeta este par sem distribuir MIFs de jogos.
+    const MODULE: &[u8] = b"synthetic audited module";
+    const MIF: &[u8] = b"synthetic audited manifest";
+    struct Fixture { root: PathBuf, module: PathBuf, profiles: PathBuf }
+    impl Fixture {
+        fn new() -> Self {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("local-tests").join(format!(
+                "audited-display-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let module = root.join("Games/Edition/game.mod");
+            std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+            std::fs::write(&module, MODULE).unwrap();
+            Self { profiles: root.join("preferences"), root, module }
+        }
+        fn manifest(&self, bytes: &[u8]) { std::fs::write(self.module.with_extension("mif"), bytes).unwrap(); }
+        fn choice(&self) -> Automatic { automatic(&digest(MODULE), &self.module) }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.root); }
+    }
+    fn screen(width: u16, height: u16) -> DisplayGeometry { DisplayGeometry { width, height, depth: 16 } }
+
+    #[test]
+    fn audited_selected_manifest_and_module_must_both_match() {
+        let f = Fixture::new();
+        f.manifest(MIF);
+        assert_eq!(f.choice(), Automatic { geometry: screen(176, 220), source: Source::Known });
+        f.manifest(b"different selected manifest");
+        assert_eq!(f.choice().source, Source::Fallback);
+        f.manifest(MIF);
+        assert_eq!(automatic(&digest(b"another module"), &f.module).source, Source::Fallback);
+        std::fs::remove_file(f.module.with_extension("mif")).unwrap();
+        assert_eq!(f.choice().source, Source::Fallback);
+    }
+
+    #[test]
+    fn audited_uses_launcher_manifest_priority_and_rejects_ambiguity() {
+        let f = Fixture::new();
+        let module = f.root.join("Collection/mod/12345/game.mod");
+        let mif = f.root.join("Collection/Mif");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mif.join("first")).unwrap();
+        std::fs::write(&module, MODULE).unwrap();
+        std::fs::write(mif.join("first/game.mif"), MIF).unwrap();
+        assert_eq!(automatic(&digest(MODULE), &module).geometry, screen(176, 220));
+        std::fs::write(module.with_extension("mif"), b"local selected manifest differs").unwrap();
+        assert_eq!(automatic(&digest(MODULE), &module).source, Source::Fallback,
+            "o MIF local escolhido pelo launcher vence uma cópia compartilhada que teria hash conhecido");
+        std::fs::remove_file(module.with_extension("mif")).unwrap();
+        std::fs::create_dir_all(mif.join("second")).unwrap();
+        std::fs::write(mif.join("second/game.mif"), b"ambiguous shared manifest").unwrap();
+        assert_eq!(automatic(&digest(MODULE), &module).source, Source::Fallback);
+    }
+
+    #[test]
+    fn audited_auto_does_not_replace_manual_resolution_and_returns_after_reset() {
+        let f = Fixture::new();
+        f.manifest(MIF);
+        let chosen = set_override(&f.module, &f.profiles, Some(screen(400, 240))).unwrap();
+        assert_eq!(chosen.geometry, screen(400, 240));
+        assert_eq!(chosen.source, Source::Manual);
+        assert_eq!(chosen.automatic.geometry, screen(176, 220));
+        f.manifest(b"different selected manifest");
+        let still_manual = resolve(&f.module, &f.profiles).unwrap();
+        assert_eq!(still_manual.geometry, screen(400, 240));
+        assert_eq!(still_manual.source, Source::Manual);
+        assert_eq!(still_manual.automatic.source, Source::Fallback);
+        f.manifest(MIF);
+        let reset = set_override(&f.module, &f.profiles, None).unwrap();
+        assert_eq!(reset.geometry, screen(176, 220));
+        assert_eq!(reset.source, Source::Known);
+    }
+
+    #[test]
+    fn audited_oversized_manifest_cannot_choose_known_geometry() {
+        let f = Fixture::new();
+        f.manifest(&vec![0u8; 1024 * 1024 + 1]);
+        assert_eq!(f.choice().source, Source::Fallback);
+    }
 }

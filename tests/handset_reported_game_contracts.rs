@@ -341,7 +341,11 @@ fn async_flag_without_unique_defers_the_applet_event() {
     f.machine.cpu_mut().write_reg(Reg::Sp, sp - 32);
     f.machine.cpu_mut().write_mem(sp - 32, &[0; 8]).unwrap();
     assert_eq!(
-        f.call(Interface::Shell, "SendEvent", [SHELL, 2, 0, 0x7003]),
+        f.call(
+            Interface::Shell,
+            "SendEvent",
+            [SHELL, 2, 0x01012345, 0x7003]
+        ),
         1
     );
     f.machine.cpu_mut().write_reg(Reg::Sp, sp);
@@ -700,7 +704,7 @@ fn query_class_returns_the_selected_manifest_record_and_guest_filename() {
     );
     assert_eq!(f.machine.cpu().read_u32(BUFFER).unwrap(), class);
     let name = f.machine.cpu().read_u32(BUFFER + 4).unwrap();
-    assert_eq!(f.machine.cpu().read_cstring(name, 32), "chosen.mif");
+    assert_eq!(f.machine.cpu().read_cstring(name, 32), "fs:/~/chosen.mif");
     assert_eq!(f.machine.cpu().read_u32(BUFFER + 8).unwrap() & 65535, 1000);
     assert_eq!(f.machine.cpu().read_u32(BUFFER + 16).unwrap() >> 16, 32);
 }
@@ -964,80 +968,277 @@ fn removing_a_packaged_save_uses_a_persistent_overlay_without_modifying_the_pack
     assert_eq!(std::fs::read(original).unwrap(), b"packaged seed");
 }
 
-
 #[test]
 fn converted_bitmap_exposes_nearby_editable_pixels_and_releases_its_owned_allocation() {
     let mut f = Fixture::new();
     let input = f.call(Interface::Helpers, "malloc", [58, 0, 0, 0]);
     let mut bmp = vec![0u8; 58];
     bmp[..2].copy_from_slice(b"BM");
-    for (at, value) in [(2,58u32),(10,54),(14,40),(18,1),(22,1)] {
-        bmp[at..at+4].copy_from_slice(&value.to_le_bytes());
+    for (at, value) in [(2, 58u32), (10, 54), (14, 40), (18, 1), (22, 1)] {
+        bmp[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
     bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
     bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
-    bmp[54..58].copy_from_slice(&[0,0,255,0]);
-    f.machine.cpu_mut().write_mem(input,&bmp).unwrap();
-    let bitmap=f.call(Interface::Helpers,"SetupNativeImage",[0x01004001,input,BUFFER,BUFFER+32]);
-    assert_ne!(bitmap,0);
-    assert_eq!(f.call(Interface::Bitmap,"QueryInterface",[bitmap,0x01001045,BUFFER+64,0]),0);
-    let dib=f.machine.cpu().read_u32(BUFFER+64).unwrap();
-    let pixels=f.machine.cpu().read_u32(dib+8).unwrap();
-    assert!(pixels.checked_sub(bitmap).is_some_and(|n|n>0&&n<=u16::MAX as u32),
-        "Blockbreaker guarda o deslocamento do raster em uint16");
-    f.machine.cpu_mut().write_mem(pixels,&0x07e0u16.to_le_bytes()).unwrap();
-    f.machine.cpu_mut().marca_sujo(pixels,2);
-    f.call(Interface::Bitmap,"Release",[dib,0,0,0]);
-    let saved=f.machine.grava_estado();
+    bmp[54..58].copy_from_slice(&[0, 0, 255, 0]);
+    f.machine.cpu_mut().write_mem(input, &bmp).unwrap();
+    let bitmap = f.call(
+        Interface::Helpers,
+        "SetupNativeImage",
+        [0x01004001, input, BUFFER, BUFFER + 32],
+    );
+    assert_ne!(bitmap, 0);
+    assert_eq!(
+        f.call(
+            Interface::Bitmap,
+            "QueryInterface",
+            [bitmap, 0x01001045, BUFFER + 64, 0]
+        ),
+        0
+    );
+    let dib = f.machine.cpu().read_u32(BUFFER + 64).unwrap();
+    let pixels = f.machine.cpu().read_u32(dib + 8).unwrap();
+    assert!(
+        pixels
+            .checked_sub(bitmap)
+            .is_some_and(|n| n > 0 && n <= u16::MAX as u32),
+        "Blockbreaker guarda o deslocamento do raster em uint16"
+    );
+    f.machine
+        .cpu_mut()
+        .write_mem(pixels, &0x07e0u16.to_le_bytes())
+        .unwrap();
+    f.machine.cpu_mut().marca_sujo(pixels, 2);
+    f.call(Interface::Bitmap, "Release", [dib, 0, 0, 0]);
+    let saved = f.machine.grava_estado();
     f.machine.restaura_estado(&saved).unwrap();
-    let sp=f.machine.cpu().read_reg(Reg::Sp);
-    f.machine.cpu_mut().write_reg(Reg::Sp,sp-32);
-    for (n,value) in [1,bitmap,0,0,2].into_iter().enumerate(){f.machine.cpu_mut().write_u32(sp-32+n as u32*4,value).unwrap();}
-    assert_eq!(f.call(Interface::Display,"BitBlt",[SHELL+16,2,3,1]),0);
-    assert_eq!(f.machine.screen().get_pixel(2,3),0x07e0);
-    f.machine.cpu_mut().write_reg(Reg::Sp,sp);
-    assert_eq!(f.call(Interface::Bitmap,"Release",[bitmap,0,0,0]),0);
-    let next=f.call(Interface::Shell,"CreateInstance",[SHELL,0x01001003,BUFFER+64,0]);
-    assert_eq!(next,0);
-    let object=f.machine.cpu().read_u32(BUFFER+64).unwrap();
-    assert!((loader::OBJECT_BASE..loader::OBJECT_BASE+loader::OBJECT_SIZE as u32).contains(&object),
-        "um bitmap do heap não pode entrar na lista livre de objetos de 64 bytes");
-    let state=f.machine.grava_estado();
-    let reader=zeebx::save_state::Leitor::abre(&state).unwrap();
-    assert!(!reader.pares("heap.live").unwrap().iter().any(|(ptr,_)| *ptr==bitmap));
-    assert!(!reader.pares("objects.kinds").unwrap().iter().any(|(ptr,_)| *ptr==bitmap));
-    let bitmap=f.call(Interface::Helpers,"SetupNativeImage",[0x01004001,input,BUFFER,BUFFER+32]);
-    f.call(Interface::Bitmap,"QueryInterface",[bitmap,0x01001045,BUFFER+64,0]);
-    f.call(Interface::Helpers,"sysfree",[bitmap,0,0,0]);
-    let state=f.machine.grava_estado();
-    let reader=zeebx::save_state::Leitor::abre(&state).unwrap();
-    assert!(!reader.pares("heap.live").unwrap().iter().any(|(ptr,_)| *ptr==bitmap));
-    assert!(!reader.pares("objects.kinds").unwrap().iter().any(|(ptr,_)| *ptr==bitmap));
-    f.call(Interface::Helpers,"free",[input,0,0,0]);
+    let sp = f.machine.cpu().read_reg(Reg::Sp);
+    f.machine.cpu_mut().write_reg(Reg::Sp, sp - 32);
+    for (n, value) in [1, bitmap, 0, 0, 2].into_iter().enumerate() {
+        f.machine
+            .cpu_mut()
+            .write_u32(sp - 32 + n as u32 * 4, value)
+            .unwrap();
+    }
+    assert_eq!(
+        f.call(Interface::Display, "BitBlt", [SHELL + 16, 2, 3, 1]),
+        0
+    );
+    assert_eq!(f.machine.screen().get_pixel(2, 3), 0x07e0);
+    f.machine.cpu_mut().write_reg(Reg::Sp, sp);
+    assert_eq!(f.call(Interface::Bitmap, "Release", [bitmap, 0, 0, 0]), 0);
+    let next = f.call(
+        Interface::Shell,
+        "CreateInstance",
+        [SHELL, 0x01001003, BUFFER + 64, 0],
+    );
+    assert_eq!(next, 0);
+    let object = f.machine.cpu().read_u32(BUFFER + 64).unwrap();
+    assert!(
+        (loader::OBJECT_BASE..loader::OBJECT_BASE + loader::OBJECT_SIZE as u32).contains(&object),
+        "um bitmap do heap não pode entrar na lista livre de objetos de 64 bytes"
+    );
+    let state = f.machine.grava_estado();
+    let reader = zeebx::save_state::Leitor::abre(&state).unwrap();
+    assert!(
+        !reader
+            .pares("heap.live")
+            .unwrap()
+            .iter()
+            .any(|(ptr, _)| *ptr == bitmap)
+    );
+    assert!(
+        !reader
+            .pares("objects.kinds")
+            .unwrap()
+            .iter()
+            .any(|(ptr, _)| *ptr == bitmap)
+    );
+    let bitmap = f.call(
+        Interface::Helpers,
+        "SetupNativeImage",
+        [0x01004001, input, BUFFER, BUFFER + 32],
+    );
+    f.call(
+        Interface::Bitmap,
+        "QueryInterface",
+        [bitmap, 0x01001045, BUFFER + 64, 0],
+    );
+    f.call(Interface::Helpers, "sysfree", [bitmap, 0, 0, 0]);
+    let state = f.machine.grava_estado();
+    let reader = zeebx::save_state::Leitor::abre(&state).unwrap();
+    assert!(
+        !reader
+            .pares("heap.live")
+            .unwrap()
+            .iter()
+            .any(|(ptr, _)| *ptr == bitmap)
+    );
+    assert!(
+        !reader
+            .pares("objects.kinds")
+            .unwrap()
+            .iter()
+            .any(|(ptr, _)| *ptr == bitmap)
+    );
+    f.call(Interface::Helpers, "free", [input, 0, 0, 0]);
 }
-
 
 #[test]
 fn file_read_into_a_published_bitmap_updates_pixels_seen_by_the_display() {
-    let mut f=Fixture::new();
-    std::fs::write(f.work.join("pixel.bin"),0x07e0u16.to_le_bytes()).unwrap();
-    f.machine.cpu_mut().write_mem(BUFFER+128,b"pixel.bin\0").unwrap();
-    let destination=f.call(Interface::Display,"GetDestination",[SHELL+16,0,0,0]);
-    assert_eq!(f.call(Interface::Bitmap,"CreateCompatibleBitmap",[destination,BUFFER,1,1]),0);
-    let bitmap=f.machine.cpu().read_u32(BUFFER).unwrap();
-    f.call(Interface::Bitmap,"DrawPixel",[bitmap,0,0,0x001f]);
-    f.call(Interface::Bitmap,"GetPixel",[bitmap,0,0,BUFFER+64]);
-    let pixels=f.machine.cpu().read_u32(bitmap+8).unwrap();
-    assert_eq!(f.call(Interface::Shell,"CreateInstance",[SHELL,0x01001003,BUFFER+64,0]),0);
-    let mgr=f.machine.cpu().read_u32(BUFFER+64).unwrap();
-    let file=f.call(Interface::FileMgr,"OpenFile",[mgr,BUFFER+128,1,0]);
-    assert_ne!(file,0);
-    assert_eq!(f.call(Interface::File,"Read",[file,pixels,2,0]),2);
-    let sp=f.machine.cpu().read_reg(Reg::Sp);
-    f.machine.cpu_mut().write_reg(Reg::Sp,sp-32);
-    for(n,value)in[1,bitmap,0,0,2].into_iter().enumerate(){f.machine.cpu_mut().write_u32(sp-32+n as u32*4,value).unwrap();}
-    f.call(Interface::Display,"BitBlt",[SHELL+16,0,0,1]);
-    assert_eq!(f.machine.screen().get_pixel(0,0),0x07e0,
-        "IFile::Read é escrita do guest mesmo quando executada no host");
-    f.machine.cpu_mut().write_reg(Reg::Sp,sp);
+    let mut f = Fixture::new();
+    std::fs::write(f.work.join("pixel.bin"), 0x07e0u16.to_le_bytes()).unwrap();
+    f.machine
+        .cpu_mut()
+        .write_mem(BUFFER + 128, b"pixel.bin\0")
+        .unwrap();
+    let destination = f.call(Interface::Display, "GetDestination", [SHELL + 16, 0, 0, 0]);
+    assert_eq!(
+        f.call(
+            Interface::Bitmap,
+            "CreateCompatibleBitmap",
+            [destination, BUFFER, 1, 1]
+        ),
+        0
+    );
+    let bitmap = f.machine.cpu().read_u32(BUFFER).unwrap();
+    f.call(Interface::Bitmap, "DrawPixel", [bitmap, 0, 0, 0x001f]);
+    f.call(Interface::Bitmap, "GetPixel", [bitmap, 0, 0, BUFFER + 64]);
+    let pixels = f.machine.cpu().read_u32(bitmap + 8).unwrap();
+    assert_eq!(
+        f.call(
+            Interface::Shell,
+            "CreateInstance",
+            [SHELL, 0x01001003, BUFFER + 64, 0]
+        ),
+        0
+    );
+    let mgr = f.machine.cpu().read_u32(BUFFER + 64).unwrap();
+    let file = f.call(Interface::FileMgr, "OpenFile", [mgr, BUFFER + 128, 1, 0]);
+    assert_ne!(file, 0);
+    assert_eq!(f.call(Interface::File, "Read", [file, pixels, 2, 0]), 2);
+    let sp = f.machine.cpu().read_reg(Reg::Sp);
+    f.machine.cpu_mut().write_reg(Reg::Sp, sp - 32);
+    for (n, value) in [1, bitmap, 0, 0, 2].into_iter().enumerate() {
+        f.machine
+            .cpu_mut()
+            .write_u32(sp - 32 + n as u32 * 4, value)
+            .unwrap();
+    }
+    f.call(Interface::Display, "BitBlt", [SHELL + 16, 0, 0, 1]);
+    assert_eq!(
+        f.machine.screen().get_pixel(0, 0),
+        0x07e0,
+        "IFile::Read é escrita do guest mesmo quando executada no host"
+    );
+    f.machine.cpu_mut().write_reg(Reg::Sp, sp);
+}
+
+fn install_event_capture(f: &mut Fixture) -> u32 {
+    let code = loader::MODULE_BASE + 0x20;
+    f.machine
+        .cpu_mut()
+        .write_mem(
+            code,
+            &[
+                0xe5801004u32,
+                0xe5802008,
+                0xe580300c,
+                0xe3a00001,
+                0xe12fff1e,
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let app = f.call(Interface::Helpers, "malloc", [256, 0, 0, 0]);
+    f.machine.cpu_mut().write_u32(app, app + 128).unwrap();
+    f.machine.cpu_mut().write_u32(app + 136, code).unwrap();
+    f.machine.start_applet(app, 0x01012345, 1000).unwrap();
+    f.machine.cpu_mut().write_mem(app + 4, &[0; 12]).unwrap();
+    app
+}
+#[test]
+fn review_handle_event_zero_alias_uses_the_modern_sdk_arguments() {
+    let mut f = Fixture::new();
+    let app = install_event_capture(&mut f);
+    let sp = f.machine.cpu().read_reg(Reg::Sp) - 32;
+    f.machine.cpu_mut().write_reg(Reg::Sp, sp);
+    f.machine.cpu_mut().write_u32(sp, 0x5678).unwrap();
+    f.machine.cpu_mut().write_u32(sp + 4, 0xa1b2c3d4).unwrap();
+    assert_eq!(
+        f.call(Interface::Shell, "SendEvent", [SHELL, 0, 0, 0x0200]),
+        1
+    );
+    assert_eq!(
+        f.machine.dump(app + 4, 12).unwrap(),
+        [0x0200u32, 0x5678, 0xa1b2c3d4]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+    assert!(f.machine.deliver_callbacks(1000).unwrap().is_empty());
+}
+#[test]
+fn review_zero_class_cannot_deliver_private_user_events() {
+    let mut f = Fixture::new();
+    let app = install_event_capture(&mut f);
+    let sp = f.machine.cpu().read_reg(Reg::Sp) - 32;
+    f.machine.cpu_mut().write_reg(Reg::Sp, sp);
+    f.machine.cpu_mut().write_mem(sp, &[0; 8]).unwrap();
+    assert_eq!(
+        f.call(Interface::Shell, "SendEvent", [SHELL, 0, 0, 0x7000]),
+        0
+    );
+    assert_eq!(f.machine.dump(app + 4, 12).unwrap(), [0; 12]);
+    assert!(f.machine.deliver_callbacks(1000).unwrap().is_empty());
+}
+#[test]
+fn review_legacy_event_reads_its_only_stacked_argument() {
+    let mut f = Fixture::new();
+    let app = install_event_capture(&mut f);
+    let sp = f.machine.cpu().read_reg(Reg::Sp) - 32;
+    f.machine.cpu_mut().write_reg(Reg::Sp, sp);
+    f.machine.cpu_mut().write_u32(sp, 0x11223344).unwrap();
+    f.machine.cpu_mut().write_u32(sp + 4, 0xaabbccdd).unwrap();
+    assert_eq!(
+        f.call(
+            Interface::Shell,
+            "SendEvent",
+            [SHELL, 0x01012345, 0x7004, 0x1234]
+        ),
+        1
+    );
+    assert_eq!(
+        f.machine.dump(app + 4, 12).unwrap(),
+        [0x7004u32, 0x1234, 0x11223344]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
+}
+#[test]
+fn review_active_alias_async_system_event_is_deferred() {
+    let mut f = Fixture::new();
+    let app = install_event_capture(&mut f);
+    let sp = f.machine.cpu().read_reg(Reg::Sp) - 32;
+    f.machine.cpu_mut().write_reg(Reg::Sp, sp);
+    f.machine.cpu_mut().write_u32(sp, 0x1234).unwrap();
+    f.machine.cpu_mut().write_u32(sp + 4, 0x55667788).unwrap();
+    assert_eq!(
+        f.call(Interface::Shell, "SendEvent", [SHELL, 2, 0, 0x0200]),
+        1
+    );
+    assert_eq!(f.machine.dump(app + 4, 12).unwrap(), [0; 12]);
+    assert_eq!(
+        f.machine.deliver_callbacks(1000).unwrap(),
+        vec![Outcome::Returned { code: 1 }]
+    );
+    assert_eq!(
+        f.machine.dump(app + 4, 12).unwrap(),
+        [0x0200u32, 0x1234, 0x55667788]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    );
 }

@@ -1,12 +1,21 @@
 # Brew2Droid changes
 
-## 1.0 — 2026-10-29
+## Latest development snapshot — 2026-11-03
+
+- Recognize 24 verified original MOD/MIF pairs without replacing the game's MIF files. Shared MIF layouts now use the same metadata selection for launching and dependency lookup. This recognizes specific verified file pairs; it is not a general MIF decoder. In startup-only tests, 16 showed normal startup screens, eight retained separate runtime issues, and the supplied Orcs & Elves variant remained unsupported.
+- Correct shared REALLOC growth and allocation flags. Tracking logical allocation lengths prevents padding from overwriting newly zeroed bytes; this restores Tank Raid's mission/terrain loading. Preserve the metadata across save/restore while continuing to read older saves.
+- Include the current BREW startup, graphics, widget, file/resource, text/encoding, audio and network compatibility changes and regression tests. Add the bounded SMAF FM/VMA DSP integration and licensed fallback fonts; no SoundFont bank, sample ROM or game data is bundled.
+- Update the Android library's removable-storage folder selection and enlarge grid icons.
+
+The Android identity remains `com.samsixx.brew2droid`, version 1.0/code 2. The corresponding optimized ARM64 APK, existing signing identity, 16 KiB alignment and native-library provenance were verified. The original-MIF update passed 916 targeted checks in the working tree, including 41 explicit original-package checks and 55 frontend contracts. Full-gameplay and physical-phone testing of this snapshot remain incomplete. Publication-copy verification is recorded in `RELEASE_INFO.json`.
+
+## 1.0 - 2026-10-29
 
 The Android app version is 1.0, with version code 2 and application ID `com.samsixx.brew2droid`. Earlier development builds with ID `io.github.brew.handset` are separate Android applications. The About screen now displays the installed app version instead of the upstream core version. This build includes the expanded button editor and translucent selected-key size panel.
 
 The optimized native build and Android packaging passed. APK version metadata, signature and 16 KiB alignment were verified; the signing identity, native libraries and runtime assets are unchanged. Phone runtime testing of this package is pending.
 
-## 0.1.0-dev1 — source snapshot, 2026-10-28
+## 0.1.0-dev1 - source snapshot, 2026-10-28
 
 Android fork of Zeebx with a native game library, storage access flow, display profiles, cellphone keypad customization and mapping, and Zeebo on-screen/controller support.
 

@@ -21,6 +21,7 @@
 //! Os tipos são os do `ResType` de `AEEShell.h`: `RESTYPE_STRING = 1`,
 //! `RESTYPE_IMAGE = 6` (dados com cabeçalho `AEEResBlob`) e `RESTYPE_BINARY = 0x5000`.
 
+use encoding_rs::{EUC_KR, Encoding, SHIFT_JIS, UTF_8};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -106,10 +107,7 @@ impl ResFile {
         // Millionaire 07/Music perderam 64 bytes da última seção, mas as imagens que abrem
         // o jogo estão inteiras. A tabela precisa existir e ser crescente; o limite de cada
         // recurso é conferido no get(), que recusa a seção cortada sem inventar sua cauda.
-        let sections: Vec<(u32, u32)> = bounds
-            .windows(2)
-            .map(|w| (w[0], w[1] - w[0]))
-            .collect();
+        let sections: Vec<(u32, u32)> = bounds.windows(2).map(|w| (w[0], w[1] - w[0])).collect();
 
         let mut ranges = Vec::with_capacity(index_count);
         for i in 0..index_count {
@@ -149,14 +147,17 @@ impl ResFile {
         })
     }
 
-    /// O texto de um recurso de string, em UTF-16 como o BREW entrega.
+    /// O texto de um recurso de string, normalizado para UTF-16 pelo núcleo.
     ///
-    /// A seção diz a própria codificação no começo. Duas aparecem nos arquivos que temos:
+    /// A seção diz a própria codificação no começo:
     ///
     /// - **UTF-16**, marcada por um BOM — `FF FE` para menor primeiro, `FE FF` para maior. É a
     ///   do `tectoy_pt.brf` da Z-Wheel, e o texto vem em unidades de dois bytes.
-    /// - **Texto de um byte**, com um marcador conhecido de codificação na frente ou sem
-    ///   marcador nos `.bar` antigos. Sem BOM, mantém a conversão Latin-1 já usada pelo motor.
+    /// - **KSC5601/EUC-KR** (`FE FE`) e **Shift-JIS** (`FD FE`). Os seletores FE/FD
+    ///   são os de AEEShell.h. A marca de dois bytes foi conferida em 14.225 strings
+    ///   coreanas e 153 japonesas dos pacotes; ela não faz parte do texto.
+    /// - **UTF-8**, com o seletor 2; o seletor 3 e os `.bar` antigos sem marca conservam
+    ///   a conversão Latin-1. Não inferir codificação pela faixa dos caracteres.
     ///
     /// Ler tudo como Latin-1 fazia o BOM virar texto e o primeiro byte alto do primeiro
     /// caractere terminar a cadeia no zero seguinte: `"Meus Z-Credits"` saía como `"þM"`, e era
@@ -179,11 +180,18 @@ impl ResFile {
         match raw {
             [0xff, 0xfe, resto @ ..] => Some(largo(resto, false)),
             [0xfe, 0xff, resto @ ..] => Some(largo(resto, true)),
+            [0xfe, 0xfe, resto @ ..] => decode_string_bytes(resto, EUC_KR),
+            [0xfd, 0xfe, resto @ ..] => decode_string_bytes(resto, SHIFT_JIS),
+            [2, resto @ ..] => decode_string_bytes(resto, UTF_8),
             _ => {
                 let (&encoding, rest) = raw.split_first()?;
                 // Só os seletores conhecidos são metadado. DRIV3R guarda "0x0101f0a9"
                 // sem marcador; cortar seu zero fazia o jogo rejeitar o próprio ClassID.
-                let text = if matches!(encoding, 0x01..=0x03) { rest } else { raw };
+                let text = if matches!(encoding, 0x01..=0x03) {
+                    rest
+                } else {
+                    raw
+                };
                 Some(
                     text.iter()
                         .take_while(|&&b| b != 0)
@@ -193,6 +201,17 @@ impl ResFile {
             }
         }
     }
+}
+
+fn decode_string_bytes(bytes: &[u8], encoding: &'static Encoding) -> Option<Vec<u16>> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    // Um pacote truncado não ganha caracteres inventados por substituição do decoder.
+    encoding
+        .decode_without_bom_handling_and_without_replacement(&bytes[..end])
+        .map(|text| text.encode_utf16().collect())
 }
 
 /// Guarda os `.bar` já abertos, para não reler um arquivo de treze megabytes a cada recurso.
@@ -392,7 +411,11 @@ mod tests {
         for &(raw, expected) in casos {
             let bar = build(&[(RESTYPE_STRING, 3, 0, 0)], &[raw]);
             let res = ResFile::parse(bar).unwrap();
-            assert_eq!(res.string(3), Some(expected.encode_utf16().collect()), "{raw:?}");
+            assert_eq!(
+                res.string(3),
+                Some(expected.encode_utf16().collect()),
+                "{raw:?}"
+            );
         }
     }
 

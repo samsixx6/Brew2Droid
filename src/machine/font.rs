@@ -175,12 +175,52 @@ mod testes {
     fn a_standard15b_nao_herda_os_numeros_da_18b() {
         let quinze_b = metricas_da_classe(0x0103_0853);
         let quinze = metricas_da_classe(0x0103_0852);
-        assert_eq!((quinze_b.ascent, quinze_b.descent), (quinze.ascent, quinze.descent));
+        assert_eq!(
+            (quinze_b.ascent, quinze_b.descent),
+            (quinze.ascent, quinze.descent)
+        );
         assert_ne!((quinze_b.ascent, quinze_b.descent), (17, 4));
     }
 }
 
 impl<C: CpuBackend> Machine<C> {
+    /// O NORMAL deste par usa a grade pequena que o próprio app preserva.
+    pub(super) fn display_font_size(&self, font: u32) -> f32 {
+        // Em 0x15b84..0x15b9c Bowling2 limita a base da linha a 12 pixels;
+        // os stats avançam 13 e reservam uma coluna fixa. A fonte substituta
+        // de 16 tinha altura 17 e avanço coreano 16, divergindo dessa grade.
+        // É um perfil lógico compatível, não identificação de LCD ou fonte
+        // histórica. Os outros pares e designadores conservam o padrão.
+        let bowling = self.native_text.matches_identity(
+            "2f89e3126a26eed73a2451621a07636b9cce1db005138c708131919d7024bb64",
+            "e11d8cf13406b75f309fd1345a5879c4ec3f5f077439a4e2d97c2479514e44ea",
+        );
+        // O diálogo original de SSA centra as linhas numa janela lógica de120
+        // e posiciona texto em y+28,+41,+54. A mesma grade de13 exige NORMAL
+        // pequeno; somente o módulo auditado sem MIF recebe esta configuração.
+        let ssa = self.native_text.matches_identity(
+            "74968a7d74d9a5ac19b51e00d157abb5d63fd166961b277943bc21c187d15fcf",
+            "",
+        );
+        if font == 0x8000 && (bowling || ssa || self.display_font_cells(font).is_some()) {
+            12.0
+        } else {
+            FONT_SIZE
+        }
+    }
+
+    pub(super) fn display_font_cells(&self, font: u32) -> Option<(u32, u32)> {
+        // Master of Sword3 soma6/12 por AECHAR em0x454aa..0x454b2 e
+        // multiplica a linha por13 em0x2be42/0x2be9e. O avanço lógico
+        // não é o avanço proporcional do TTF que fornece os contornos.
+        (font == 0x8000
+            && self.native_text.matches_identity(
+                "7eab58a8392c02e8ffce76e1afdb0516f9f4586480dbeaeecc14c7c0c9837358",
+                "1d9893e4c7d54ef7138706b1dc0dac962e6d6442a0aad30033198061b31c798e",
+            ))
+        .then_some((6, 12))
+    }
+
     /// Cria o objeto de uma fonte do sistema, guardando de qual classe ele é.
     pub(super) fn cria_fonte(&mut self, classe: u32, out: u32) -> Result<u32, CpuError> {
         let objeto = self.new_object(Interface::Font)?;
@@ -238,7 +278,8 @@ impl<C: CpuBackend> Machine<C> {
                         if tamanho != 0 && deslocamento + 2 > tamanho {
                             break;
                         }
-                        self.cpu.write_mem(info + deslocamento, &valor.to_le_bytes())?;
+                        self.cpu
+                            .write_mem(info + deslocamento, &valor.to_le_bytes())?;
                     }
                 }
                 SUCCESS
@@ -296,7 +337,9 @@ impl<C: CpuBackend> Machine<C> {
                     if pedidos >= 0 {
                         units.truncate(pedidos as usize);
                     }
-                    let texto = String::from_utf16_lossy(&units);
+                    let Some(texto) = self.decode_guest_aechar_units(&units) else {
+                        return Ok(Some(14));
+                    };
                     self.draw_text(&texto, x, y)?;
                 }
                 SUCCESS

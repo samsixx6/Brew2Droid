@@ -1,0 +1,32 @@
+Portable system-text fallback fonts
+===================================
+
+NeoDunggeunmo 1.601
+Copyright (c) 2017-2021 Eunbin Jeong (Dalgona.)
+License: SIL Open Font License 1.1; full license in NeoDunggeunmo-OFL.txt.
+Upstream: https://github.com/neodgm/neodgm
+Release: https://github.com/neodgm/neodgm/releases/tag/v1.601
+Reserved Font Names: Neo둥근모, Neo둥근모 Code, NeoDunggeunmo,
+NeoDunggeunmo Code. The bundled TTF is unmodified and retains its names.
+
+Misaki Gothic, 2021-05-05
+Copyright (C) 2002-2021 Num Kadoma
+License: the author's permissive font license; the complete original notice
+and manual are in Misaki-LICENSE.txt. It permits commercial and noncommercial
+use, copying, modification, and redistribution, without warranty.
+Upstream: https://littlelimit.net/misaki.htm
+License page: https://littlelimit.net/font.htm
+The bundled TTF is unmodified and retains the MisakiGothic family name.
+
+The .ttf.gz files contain byte-exact upstream TrueType fonts in deterministic
+gzip containers. Source URLs, lengths and SHA-256 fingerprints are recorded
+in font-provenance.json. Compression does not change the decompressed fonts.
+Font files retain their own licenses; they are not relicensed as application code.
+
+Coverage: NeoDunggeunmo supplies all 11,172 modern precomposed Hangul syllables.
+Misaki Gothic supplies the complete 6,879-character JIS X 0208 repertoire,
+including its Hiragana, Katakana and 6,355 kanji. Later Unicode Kana additions
+and supplementary ideographs are outside that Japanese repertoire.
+
+These are portable fallback typefaces, not original handset or game fonts.
+No proprietary firmware or game font data is included in these assets.

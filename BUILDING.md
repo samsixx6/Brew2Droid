@@ -50,6 +50,7 @@ mkdir -p "$jnidir" "$licensedir"
 cp target/aarch64-linux-android/release/libzeebx_android.so "$jnidir/"
 cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$jnidir/"
 cp LICENSE LICENSE-GPL3 THIRD-PARTY-NOTICES.txt "$licensedir/"
+cp assets/licenses/* "$licensedir/"
 bash "$apkdir/gradlew" -p "$apkdir" --no-daemon assembleDebug
 ```
 
@@ -59,7 +60,7 @@ The commands mirror the tested native build flags and packaging steps. The suppl
 
 ## Existing Windows maintainer setup
 
-`tools/build_android.ps1 -Configuration Release` builds optimized native code and a debug-signed APK. It uses `tools/environment.ps1`, an isolated `.tools` installation and a `Q:` alias to avoid paths with spaces. A fresh clone needs those tools installed; they are deliberately excluded from Git. The lockfile lists the exact tool versions. Do not replace an existing `Q:` mapping for another project. This script is retained as the exact build procedure used by the maintainer, rather than a one-click SDK installer.
+`tools/build_android.ps1 -Configuration Release` builds optimized native code and a debug-signed APK. It uses `tools/environment.ps1`, an isolated `.tools` installation and a `Q:` alias to avoid paths with spaces. A fresh clone needs those tools installed; they are deliberately excluded from Git. The lockfile lists the exact tool versions. Do not replace an existing `Q:` mapping for another project. This script preserves the maintainer's build procedure, with an explicit font-provenance JSON copy for clean checkouts; SDK installation remains a separate step.
 
 The installed Android application ID is `com.samsixx.brew2droid`. Its Java namespace and JNI class names remain `io.github.brew.handset`; keeping those internal names preserves the native bridge. Android uses `applicationId` for the installed package identity.
 
@@ -71,7 +72,7 @@ With a C/C++ host compiler, CMake and Ninja available:
 cargo +1.99.1 test --locked --release --no-default-features --features gl -p zeebx -p brew-probe --jobs 4
 ```
 
-The corresponding Windows working tree and this Android-focused publishing copy each passed 1,179 tests, with 0 failures and 5 existing ignored tests, on 2026-10-27. The publishing-copy verification disabled release LTO and used 16 codegen units to shorten test linking; the APK build profile was unchanged. Private game collections and captured states are not required for this automated suite. Live game benchmarks need your own files.
+The publication-copy checks for this snapshot are recorded in `RELEASE_INFO.json`. Verification may disable release LTO and use 16 codegen units to shorten test linking; the APK retains the optimized release profile. The MIF update passed 916 targeted working-tree checks before export. Opt-in tests marked `#[ignore]` require original game files supplied separately; the default automated suite does not require a private game collection. Live benchmarks and complete-gameplay checks need your own files.
 
 ## Signing and releases
 

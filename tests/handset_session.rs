@@ -53,7 +53,8 @@ fn fixture(handler: &[u32]) -> (PathBuf, StoragePaths) {
     }
     std::fs::write(root.join("test.mod"), image).unwrap();
     let mut mif = vec![0u8; 60];
-    mif[0..2].copy_from_slice(&0x11u16.to_le_bytes());
+    // Os testes de quadro usam um manifesto v1 válido, como o launcher exige.
+    mif[..6].copy_from_slice(&[0x11, 0, 1, 0, 1, 0]);
     for (offset, value) in [
         (16, 32u32),
         (20, 1),

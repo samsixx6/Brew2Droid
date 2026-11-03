@@ -27,6 +27,12 @@ impl RealtimeClock {
         })
     }
 
+    /// Reancora o tempo do guest sem alterar a pausa escolhida pelo frontend.
+    pub fn rebase(&mut self, now: Instant, base_us: u64) {
+        self.anchor = now;
+        self.base_us = base_us;
+    }
+
     pub fn set_paused(&mut self, paused: bool, now: Instant) {
         if self.paused != paused {
             self.base_us = self.now_us(now);

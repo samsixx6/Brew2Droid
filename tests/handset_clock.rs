@@ -40,3 +40,22 @@ fn uptime_keeps_precision_past_brew_millisecond_wrap() {
         9
     );
 }
+
+#[test]
+fn rebase_preserves_a_paused_frontend_and_resume_advances_from_the_restored_base() {
+    let start = Instant::now();
+    let mut clock = RealtimeClock::new(start, 123);
+    clock.set_paused(true, start + Duration::from_secs(1));
+    clock.rebase(start + Duration::from_secs(20), 63_000_123);
+    assert_eq!(clock.now_us(start + Duration::from_secs(40)), 63_000_123);
+    clock.set_paused(false, start + Duration::from_secs(40));
+    assert_eq!(clock.now_us(start + Duration::from_secs(42)), 65_000_123);
+}
+
+#[test]
+fn rebase_preserves_a_running_frontend_and_discards_the_old_wall_time_anchor() {
+    let start = Instant::now();
+    let mut clock = RealtimeClock::new(start, 123);
+    clock.rebase(start + Duration::from_secs(20), 63_000_123);
+    assert_eq!(clock.now_us(start + Duration::from_secs(22)), 65_000_123);
+}

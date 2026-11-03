@@ -48,6 +48,30 @@ fn clip(m: &mut Machine<BackendPadrao>, graphics: u32, rect: [i16;4]) {
 }
 
 #[test]
+fn brew_software_graphics_factory_draws_through_the_documented_legacy_abi() {
+    let (mut m, work, _) = setup();
+    // AEEGraphics_BREW.bid declara IGraphics; AEEGraphics.h conserva IBASE
+    // com dois slots, sem inserir QueryInterface antes de SetBackground.
+    assert_eq!(call(&mut m, Interface::Shell, "CreateInstance",
+        [loader::OBJECT_BASE, 0x0102_fb92, OUT, 0]), 0);
+    let g = m.cpu().read_u32(OUT).unwrap();
+    assert_ne!(g, 0);
+    let vtable = m.cpu().read_u32(g).unwrap();
+    let set_color = m.cpu().read_u32(vtable + 4 * 4).unwrap();
+    assert_eq!(m.call_guest(set_color, [g, 255, 0, 0], 1000).unwrap(),
+        Outcome::Returned {code:0});
+    clip(&mut m, g, [3, 3, 4, 4]);
+    words(&mut m, DATA + 32, &[0, 5, 11, 5]);
+    call(&mut m, Interface::Graphics, "DrawLine", [g, DATA + 32, 0, 0]);
+    for y in 0..12 { for x in 0..12 {
+        let want = if y == 5 && (3..7).contains(&x) {0xf800} else {0};
+        assert_eq!(m.screen().get_pixel(x, y), want, "pixel ({x},{y})");
+    }}
+    assert_eq!(call(&mut m, Interface::Graphics, "Release", [g, 0, 0, 0]), 0);
+    drop(m); std::fs::remove_dir_all(work).unwrap();
+}
+
+#[test]
 fn minimap_lines_stay_inside_the_graphics_clip() {
     let (mut m,work,g)=setup();
     clip(&mut m,g,[3,3,4,4]);

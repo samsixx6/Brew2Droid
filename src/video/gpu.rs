@@ -515,6 +515,8 @@ pub struct GpuState {
     pixels: Vec<u8>,
     /// Se alguma coisa foi desenhada desde a última conversão do quadro.
     sujo: bool,
+    /// Conversão compartilhada por EGL e apresentação, independente dos vetores externos.
+    quadro_565: Option<((usize, usize), (usize, usize), Vec<u8>)>,
     /// A resolução interna, em múltiplos do quadro do console. Ver [`Rasterizador::define_escala`].
     escala: usize,
     /// O quadro reduzido ao tamanho do console, de onde saem as leituras quando `escala > 1`.
@@ -690,6 +692,7 @@ impl GpuState {
             vertices: Vec::new(),
             pixels: Vec::new(),
             sujo: true,
+            quadro_565: None,
             escala: 1,
             proporcao: None,
             em_perspectiva: false,
@@ -1187,6 +1190,7 @@ impl GpuState {
         self.soltos.clear();
         self.vertices.clear();
         self.sujo = true;
+        self.quadro_565 = None;
     }
 
     /// Esquece tudo o que o espelho sabia: a próxima [`GpuState::aplica`] reenvia o estado
@@ -1716,6 +1720,61 @@ impl GpuState {
             gl.bind_framebuffer(glow::FRAMEBUFFER, destino);
         }
     }
+
+    fn prepara_quadro_565(&mut self, width: usize, height: usize) -> Option<bool> {
+        self.descarrega();
+        // **A placa morreu no meio do quadro: a leitura não acontece.** `glReadPixels` é uma
+        // chamada como as outras, e depois do aviso as funções que este estado guardou não
+        // existem. Sai um quadro preto do tamanho pedido — um só, até a sessão nascer de novo no
+        // quadro seguinte (ver [`Placa::morreu`] e a nota de corrida em `frontends/libretro`).
+        if self.placa.morreu() {
+            self.quadro_565 = Some(((width, height), (0, 0), vec![0; width * height * 2]));
+            self.sujo = false;
+            return Some(false);
+        }
+        // Uma leitura EGL não atualiza o vetor de apresentação. O cache é nosso,
+        // para que ambos recebam o quadro atual sem repetir a leitura da placa.
+        if !self.sujo && self.quadro_565.as_ref().is_some_and(|(out, source, _)| *out == (width, height) && *source == self.surface()) {
+            return Some(false);
+        }
+        let (sw, sh) = self.surface();
+        if sw == 0 || sh == 0 {
+            return None;
+        }
+        // **A placa entrega o quadro já em RGB565.** Converter RGBA na CPU custava 1,8 ms por
+        // quadro no Need for Speed — seis vezes a leitura em si —, e a 60 quadros por segundo era
+        // a maior fatia do `eglSwapBuffers`. No mesmo tamanho é uma cópia; com reamostragem, o
+        // índice de cada coluna sai uma vez por quadro, e não uma vez por pixel.
+        let mut out = self.quadro_565.take().map_or_else(Vec::new, |(_, _, bytes)| bytes);
+        let em_565 = self.le_quadro_rgb565(sw, sh);
+        out.clear();
+        out.resize(width * height * 2, 0);
+        if em_565 && sw == width && sh == height {
+            out.copy_from_slice(&self.pixels[..width * height * 2]);
+        } else {
+            let (passo, converte): (usize, fn(&[u8]) -> [u8; 2]) = match em_565 {
+                true => (2, |p| [p[0], p[1]]),
+                false => (4, |p| {
+                    (((p[0] as u16 >> 3) << 11) | ((p[1] as u16 >> 2) << 5) | (p[2] as u16 >> 3))
+                        .to_le_bytes()
+                }),
+            };
+            let colunas: Vec<usize> = (0..width)
+                .map(|x| (x * sw / width).min(sw - 1) * passo)
+                .collect();
+            for (y, saida) in out.chunks_exact_mut(width * 2).enumerate() {
+                let inicio = (y * sh / height).min(sh - 1) * sw * passo;
+                let linha = &self.pixels[inicio..inicio + sw * passo];
+                for (par, &coluna) in saida.chunks_exact_mut(2).zip(&colunas) {
+                    par.copy_from_slice(&converte(&linha[coluna..coluna + passo]));
+                }
+            }
+        }
+        self.sujo = false;
+        self.quadro_565 = Some(((width, height), (sw, sh), out));
+        Some(true)
+    }
+
 
     /// Lê o quadro para `self.pixels` em RGB565, dois bytes por pixel na ordem do host, com a
     /// linha 0 no topo. Devolve `false` quando leu em RGBA: no GLES a leitura em 5-6-5 não é
@@ -3033,55 +3092,9 @@ impl Rasterizador for GpuState {
     }
 
     fn frame_rgb565(&mut self, width: usize, height: usize, out: &mut Vec<u8>) {
-        self.descarrega();
-        // **A placa morreu no meio do quadro: a leitura não acontece.** `glReadPixels` é uma
-        // chamada como as outras, e depois do aviso as funções que este estado guardou não
-        // existem. Sai um quadro preto do tamanho pedido — um só, até a sessão nascer de novo no
-        // quadro seguinte (ver [`Placa::morreu`] e a nota de corrida em `frontends/libretro`).
-        if self.placa.morreu() {
-            out.clear();
-            out.resize(width * height * 2, 0);
-            self.sujo = false;
-            return;
+        if self.prepara_quadro_565(width, height).is_some() {
+            out.clone_from(&self.quadro_565.as_ref().expect("quadro convertido").2);
         }
-        // Mesmo atalho do rasterizador de software: quadro igual ao que já está em `out` não tem
-        // o que reconverter. Na placa isso vale ainda mais, porque a leitura é uma ida e volta.
-        if !self.sujo && out.len() == width * height * 2 {
-            return;
-        }
-        let (sw, sh) = self.surface();
-        if sw == 0 || sh == 0 {
-            return;
-        }
-        // **A placa entrega o quadro já em RGB565.** Converter RGBA na CPU custava 1,8 ms por
-        // quadro no Need for Speed — seis vezes a leitura em si —, e a 60 quadros por segundo era
-        // a maior fatia do `eglSwapBuffers`. No mesmo tamanho é uma cópia; com reamostragem, o
-        // índice de cada coluna sai uma vez por quadro, e não uma vez por pixel.
-        let em_565 = self.le_quadro_rgb565(sw, sh);
-        out.clear();
-        out.resize(width * height * 2, 0);
-        if em_565 && sw == width && sh == height {
-            out.copy_from_slice(&self.pixels[..width * height * 2]);
-        } else {
-            let (passo, converte): (usize, fn(&[u8]) -> [u8; 2]) = match em_565 {
-                true => (2, |p| [p[0], p[1]]),
-                false => (4, |p| {
-                    (((p[0] as u16 >> 3) << 11) | ((p[1] as u16 >> 2) << 5) | (p[2] as u16 >> 3))
-                        .to_le_bytes()
-                }),
-            };
-            let colunas: Vec<usize> = (0..width)
-                .map(|x| (x * sw / width).min(sw - 1) * passo)
-                .collect();
-            for (y, saida) in out.chunks_exact_mut(width * 2).enumerate() {
-                let inicio = (y * sh / height).min(sh - 1) * sw * passo;
-                let linha = &self.pixels[inicio..inicio + sw * passo];
-                for (par, &coluna) in saida.chunks_exact_mut(2).zip(&colunas) {
-                    par.copy_from_slice(&converte(&linha[coluna..coluna + passo]));
-                }
-            }
-        }
-        self.sujo = false;
     }
 
     fn define_descarte_de_tiles(&mut self, descartar: bool) {
@@ -3098,43 +3111,10 @@ impl Rasterizador for GpuState {
     }
 
     fn frame_rgb565_words(&mut self, width: usize, height: usize, out: &mut Vec<u16>) {
-        self.descarrega();
-        // Placa morta: nem esta leitura toca nela. Ver [`GpuState::frame_rgb565`].
-        if self.placa.morreu() {
-            out.clear();
-            out.resize(width * height, 0);
-            self.sujo = false;
-            return;
-        }
-        if !self.sujo && out.len() == width * height {
-            return;
-        }
-        let (sw, sh) = self.surface();
-        if sw == 0 || sh == 0 {
-            return;
-        }
-        let em_565 = self.le_quadro_rgb565(sw, sh);
+        let Some(atualizado) = self.prepara_quadro_565(width, height) else { return; };
         out.clear();
-        out.resize(width * height, 0);
-        let pixel = |p: &[u8]| -> u16 {
-            if em_565 {
-                u16::from_le_bytes([p[0], p[1]])
-            } else {
-                ((p[0] as u16 >> 3) << 11) | ((p[1] as u16 >> 2) << 5) | (p[2] as u16 >> 3)
-            }
-        };
-        let passo = if em_565 { 2 } else { 4 };
-        let colunas: Vec<usize> = (0..width)
-            .map(|x| (x * sw / width).min(sw - 1) * passo)
-            .collect();
-        for (y, saida) in out.chunks_exact_mut(width).enumerate() {
-            let inicio = (y * sh / height).min(sh - 1) * sw * passo;
-            let linha = &self.pixels[inicio..inicio + sw * passo];
-            for (destino, &coluna) in saida.iter_mut().zip(&colunas) {
-                *destino = pixel(&linha[coluna..coluna + passo]);
-            }
-        }
-        self.sujo = false;
+        out.extend(self.quadro_565.as_ref().expect("quadro convertido").2
+            .chunks_exact(2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])));
         // **O descarte dos anexos que ninguém vai ler.** O quadro de cor acabou de ser lido para
         // a memória da CPU, e a profundidade e o estêncil deste quadro não são precisos para
         // desenhar o próximo — desde que o jogo os limpe, que é o caso comum.
@@ -3144,7 +3124,7 @@ impl Rasterizador for GpuState {
         // profundidade de lá persiste. Num GPU de tiles, que é o caso do Mali dos portáteis,
         // dizer isto ao driver evita escrever os anexos de volta na memória: rende lá, e não no
         // desktop, que é onde ele não pode ser medido.
-        if self.descarta_tiles && self.fbo_externo.is_none() {
+        if atualizado && self.descarta_tiles && self.fbo_externo.is_none() {
             let gl = &self.gl;
             unsafe {
                 gl.invalidate_framebuffer(

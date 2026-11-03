@@ -6,42 +6,80 @@
 
 use android_activity::AndroidApp;
 
-pub fn menu_do_jogo(app:&AndroidApp,counter:bool,keypad:bool){menu_java(app,Some((counter,keypad)));}
-pub fn fecha_menu_do_jogo(app:&AndroidApp){menu_java(app,None);}
-fn menu_java(app:&AndroidApp,show:Option<(bool,bool)>){
-    let app=app.clone();app.clone().run_on_java_main_thread(Box::new(move||{
-        let result=(||->Result<(),jni::errors::Error>{let vm=unsafe{jni::JavaVM::from_raw(app.vm_as_ptr().cast())}?;let mut env=vm.attach_current_thread()?;let activity=unsafe{jni::objects::JObject::from_raw(app.activity_as_ptr().cast())};
-            let result=if let Some((counter,keypad))=show{env.call_method(activity,"showGameMenu","(ZZ)V",&[jni::objects::JValue::Bool(counter as u8),jni::objects::JValue::Bool(keypad as u8)])}else{env.call_method(activity,"dismissGameMenu","()V",&[])};
-            if result.is_err()&&env.exception_check().unwrap_or(false){let _=env.exception_clear();}result.map(|_|())})();
-        if let Err(error)=result{log::warn!("menu Android: {error}");crate::input_dispatch::queue_menu(0);}
+pub fn menu_do_jogo(app: &AndroidApp, counter: bool, keypad: bool) {
+    menu_java(app, Some((counter, keypad)));
+}
+pub fn fecha_menu_do_jogo(app: &AndroidApp) {
+    menu_java(app, None);
+}
+fn menu_java(app: &AndroidApp, show: Option<(bool, bool)>) {
+    let app = app.clone();
+    app.clone().run_on_java_main_thread(Box::new(move || {
+        let result = (|| -> Result<(), jni::errors::Error> {
+            let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
+            let mut env = vm.attach_current_thread()?;
+            let activity = unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr().cast()) };
+            let result = if let Some((counter, keypad)) = show {
+                env.call_method(
+                    activity,
+                    "showGameMenu",
+                    "(ZZ)V",
+                    &[
+                        jni::objects::JValue::Bool(counter as u8),
+                        jni::objects::JValue::Bool(keypad as u8),
+                    ],
+                )
+            } else {
+                env.call_method(activity, "dismissGameMenu", "()V", &[])
+            };
+            if result.is_err() && env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            result.map(|_| ())
+        })();
+        if let Err(error) = result {
+            log::warn!("menu Android: {error}");
+            crate::input_dispatch::queue_menu(0);
+        }
     }));
 }
 
 /// Só um toque inicial validado chama o serviço; não há consulta ou JNI por quadro.
-pub fn vibra_teclado(app:&AndroidApp) {
-    let result=(|| -> Result<(),jni::errors::Error> {
-        let vm=unsafe{jni::JavaVM::from_raw(app.vm_as_ptr().cast())}?;
-        let mut env=vm.attach_current_thread()?;
-        let activity=unsafe{jni::objects::JObject::from_raw(app.activity_as_ptr().cast())};
-        let result=env.call_method(activity,"vibrateKeypad","()V",&[]);
-        if result.is_err()&&env.exception_check().unwrap_or(false){let _=env.exception_clear();}
-        result.map(|_|())
+pub fn vibra_teclado(app: &AndroidApp) {
+    let result = (|| -> Result<(), jni::errors::Error> {
+        let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
+        let mut env = vm.attach_current_thread()?;
+        let activity = unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr().cast()) };
+        let result = env.call_method(activity, "vibrateKeypad", "()V", &[]);
+        if result.is_err() && env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        result.map(|_| ())
     })();
-    if let Err(error)=result{log::warn!("vibração do teclado: {error}");}
+    if let Err(error) = result {
+        log::warn!("vibração do teclado: {error}");
+    }
 }
 
 /// A orientação só muda ao abrir o jogo; nenhuma chamada JNI é feita por quadro.
 pub fn orientacao(app: &AndroidApp, orientation: i32) {
-    let app=app.clone();
+    let app = app.clone();
     app.clone().run_on_java_main_thread(Box::new(move || {
-        let result=(|| -> Result<(),jni::errors::Error> {
-            let vm=unsafe {jni::JavaVM::from_raw(app.vm_as_ptr().cast())}?;
-            let mut env=vm.attach_current_thread()?;
-            let activity=unsafe {jni::objects::JObject::from_raw(app.activity_as_ptr().cast())};
-            env.call_method(activity,"setRequestedOrientation","(I)V",&[jni::objects::JValue::Int(orientation)])?;
+        let result = (|| -> Result<(), jni::errors::Error> {
+            let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
+            let mut env = vm.attach_current_thread()?;
+            let activity = unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr().cast()) };
+            env.call_method(
+                activity,
+                "setRequestedOrientation",
+                "(I)V",
+                &[jni::objects::JValue::Int(orientation)],
+            )?;
             Ok(())
         })();
-        if let Err(error)=result {log::warn!("orientação do jogo: {error}");}
+        if let Err(error) = result {
+            log::warn!("orientação do jogo: {error}");
+        }
     }));
 }
 
@@ -50,16 +88,30 @@ pub fn pasta_de_dados(app: &AndroidApp) -> Result<std::path::PathBuf, String> {
     let read = || -> Result<std::path::PathBuf, jni::errors::Error> {
         let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
         let mut env = vm.attach_current_thread()?;
-        let directory = env.call_static_method("android/os/Environment", "getExternalStorageDirectory", "()Ljava/io/File;", &[])?.l()?;
-        let path = env.call_method(directory, "getAbsolutePath", "()Ljava/lang/String;", &[])?.l()?;
+        let directory = env
+            .call_static_method(
+                "android/os/Environment",
+                "getExternalStorageDirectory",
+                "()Ljava/io/File;",
+                &[],
+            )?
+            .l()?;
+        let path = env
+            .call_method(directory, "getAbsolutePath", "()Ljava/lang/String;", &[])?
+            .l()?;
         let path: String = env.get_string(&jni::objects::JString::from(path))?.into();
         Ok(std::path::PathBuf::from(path).join("brew2droid/data"))
     };
     read().map_err(|e| format!("Could not locate brew2droid/data: {e}"))
 }
 
-pub fn pasta_de_perfis(app:&AndroidApp)->Result<std::path::PathBuf,String>{
-    let data=pasta_de_dados(app)?;let root=data.parent().and_then(std::path::Path::parent).ok_or("Could not locate public profiles")?;Ok(root.join("brew2droid/profiles"))
+pub fn pasta_de_perfis(app: &AndroidApp) -> Result<std::path::PathBuf, String> {
+    let data = pasta_de_dados(app)?;
+    let root = data
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or("Could not locate public profiles")?;
+    Ok(root.join("brew2droid/profiles"))
 }
 
 /// Liga as teclas de volume ao som do jogo, inclusive quando ele estiver pausado ou sem áudio.
@@ -220,4 +272,54 @@ pub fn esconde_a_barra_de_navegacao(app: &AndroidApp) {
         )?;
         Ok(())
     }
+}
+
+/// Mesmo cache privado usado pela Activity para o índice nativo.
+pub fn pasta_de_cache(app: &AndroidApp) -> Result<std::path::PathBuf, String> {
+    let read = || -> Result<std::path::PathBuf, jni::errors::Error> {
+        let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
+        let mut env = vm.attach_current_thread()?;
+        let activity = unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr().cast()) };
+        let directory = env
+            .call_method(activity, "getCacheDir", "()Ljava/io/File;", &[])?
+            .l()?;
+        let path = env
+            .call_method(directory, "getAbsolutePath", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let path: String = env.get_string(&jni::objects::JString::from(path))?.into();
+        Ok(path.into())
+    };
+    read().map_err(|e| format!("Could not locate native library cache: {e}"))
+}
+
+/// Falha recuperável de launch: mantém a Activity e o proprietário de origem vivos.
+pub fn mostra_erro_de_launch(app: &AndroidApp, message: &str) {
+    log::warn!("{message}");
+    let app = app.clone();
+    let message = message.to_owned();
+    app.clone().run_on_java_main_thread(Box::new(move || {
+        let result = (|| -> Result<(), jni::errors::Error> {
+            let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
+            let mut env = vm.attach_current_thread()?;
+            let activity = unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr().cast()) };
+            let text = jni::objects::JObject::from(env.new_string(message)?);
+            let toast = env
+                .call_static_method(
+                    "android/widget/Toast",
+                    "makeText",
+                    "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;",
+                    &[
+                        jni::objects::JValue::Object(&activity),
+                        jni::objects::JValue::Object(&text),
+                        jni::objects::JValue::Int(1),
+                    ],
+                )?
+                .l()?;
+            env.call_method(toast, "show", "()V", &[])?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            log::warn!("launch message: {error}");
+        }
+    }));
 }
